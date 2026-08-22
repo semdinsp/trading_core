@@ -9,7 +9,7 @@ defmodule TradingCore.PositionSizing do
   fix if a formula ever changes, not two copies that can silently drift
   apart.
 
-  This module is deliberately pure — no RPC, no I/O. `quarantine_vol_target`
+  This module is deliberately pure — no RPC, no I/O. `volatility_target`
   needs a daily volatility figure and a live price, both of which are only
   knowable at the caller's own call site (a real symbol/exchange/price in
   hand at order-placement time, not something this module can pre-compute
@@ -28,7 +28,7 @@ defmodule TradingCore.PositionSizing do
   `config["method"]`:
   - `"fixed_qty"` — returns `config["qty"]` as-is (converted to `Decimal`).
     No context required.
-  - `"quarantine_vol_target"` — `target_dollar_volatility / (daily_vol * price)`.
+  - `"volatility_target"` — `target_dollar_volatility / (daily_vol * price)`.
     Requires `context[:daily_vol]`, `context[:price]`, and
     `context[:target_dollar_volatility]`, all as `Decimal` (or values
     `Decimal.new/1` accepts).
@@ -41,7 +41,7 @@ defmodule TradingCore.PositionSizing do
     with {:ok, qty} <- to_decimal(qty), do: {:ok, qty}
   end
 
-  def calculate_qty(%{"method" => "quarantine_vol_target"}, context) do
+  def calculate_qty(%{"method" => "volatility_target"}, context) do
     with {:ok, daily_vol} <- fetch_context(context, :daily_vol, :daily_vol_required),
          {:ok, price} <- fetch_context(context, :price, :price_required),
          {:ok, target_dollar_volatility} <-
