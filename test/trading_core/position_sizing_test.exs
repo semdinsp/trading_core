@@ -26,9 +26,9 @@ defmodule TradingCore.PositionSizingTest do
     end
   end
 
-  describe "quarantine_vol_target" do
+  describe "volatility_target" do
     test "computes shares = target_dollar_volatility / (daily_vol * price)" do
-      config = %{"method" => "quarantine_vol_target"}
+      config = %{"method" => "volatility_target"}
 
       context = %{
         daily_vol: Decimal.new("0.02"),
@@ -41,7 +41,7 @@ defmodule TradingCore.PositionSizingTest do
     end
 
     test "accepts plain floats/integers for context values, not just Decimal" do
-      config = %{"method" => "quarantine_vol_target"}
+      config = %{"method" => "volatility_target"}
 
       context = %{daily_vol: 0.02, price: 100, target_dollar_volatility: 1000}
 
@@ -50,21 +50,21 @@ defmodule TradingCore.PositionSizingTest do
     end
 
     test "errors when daily_vol is missing from context" do
-      config = %{"method" => "quarantine_vol_target"}
+      config = %{"method" => "volatility_target"}
       context = %{price: Decimal.new("100"), target_dollar_volatility: Decimal.new("1000")}
 
       assert {:error, :daily_vol_required} = PositionSizing.calculate_qty(config, context)
     end
 
     test "errors when price is missing from context" do
-      config = %{"method" => "quarantine_vol_target"}
+      config = %{"method" => "volatility_target"}
       context = %{daily_vol: Decimal.new("0.02"), target_dollar_volatility: Decimal.new("1000")}
 
       assert {:error, :price_required} = PositionSizing.calculate_qty(config, context)
     end
 
     test "errors when target_dollar_volatility is missing from context" do
-      config = %{"method" => "quarantine_vol_target"}
+      config = %{"method" => "volatility_target"}
       context = %{daily_vol: Decimal.new("0.02"), price: Decimal.new("100")}
 
       assert {:error, :target_dollar_volatility_required} =
@@ -72,7 +72,7 @@ defmodule TradingCore.PositionSizingTest do
     end
 
     test "errors when daily_vol is zero" do
-      config = %{"method" => "quarantine_vol_target"}
+      config = %{"method" => "volatility_target"}
 
       context = %{
         daily_vol: Decimal.new("0"),
@@ -85,7 +85,7 @@ defmodule TradingCore.PositionSizingTest do
     end
 
     test "errors when price is zero" do
-      config = %{"method" => "quarantine_vol_target"}
+      config = %{"method" => "volatility_target"}
 
       context = %{
         daily_vol: Decimal.new("0.02"),
