@@ -64,6 +64,65 @@ defmodule TradingCore.PositionSizing do
 
   def calculate_qty(_config, _context), do: {:error, :unknown_sizing_method}
 
+  @doc """
+  Shared glue for the `"volatility_target"` method: resolves `:symbol` and
+  `:price` out of `context`, calls `daily_volatility_fn` (an app's own hub
+  RPC — `trading_system`'s `Bus.get_daily_volatility/2`, `trading_live`'s
+  `Volatility.daily_volatility/2`, etc.) to get `daily_vol`, then delegates
+  to `calculate_qty/2` for the actual arithmetic.
+
+  Extracted here because both callers had identical fetch/delegate control
+  flow around their own RPC — only the RPC itself and its context/error
+  needs (:exchange) differ per app, so both are still supplied by the
+  caller rather than living in this I/O-free module.
+
+  `context` must include `:symbol`, `:price`, and `:target_dollar_volatility`;
+  `:exchange` is optional (passed through to `daily_volatility_fn` as `nil`
+  if absent, same as both existing callers already do via `Map.get/2`).
+  `daily_volatility_fn` must return `{:ok, Decimal.t()} | {:error, term()}`
+  — any error it returns is normalized to `:daily_volatility_unavailable`,
+  matching both callers' prior behavior of not leaking RPC-specific error
+  reasons into the sizing result.
+
+  `opts` lets each caller keep its own pre-existing error atom for a
+  missing price — `trading_system` returns `:price_unavailable` (shared
+  with its other sizing methods' own missing-price case) while
+  `trading_live` returns `:price_required`; both are already covered by
+  each app's own tests, so this helper doesn't force either one to change
+  its public error contract. Defaults to `:price_required`.
+  """
+  @spec resolve_volatility_target(map(), map(), (String.t(), String.t() | nil ->
+          {:ok, Decimal.t()} | {:error, term()}), keyword()) ::
+          {:ok, Decimal.t()} | {:error, atom()}
+  def resolve_volatility_target(config, context, daily_volatility_fn, opts \\ [])
+      when is_function(daily_volatility_fn, 2) do
+    price_error = Keyword.get(opts, :price_error, :price_required)
+
+    with {:ok, symbol} <- fetch_context(context, :symbol, :symbol_required),
+         {:ok, price} <- fetch_context(context, :price, price_error),
+         {:ok, target_dollar_volatility} <-
+           fetch_context(
+             context,
+             :target_dollar_volatility,
+             :target_dollar_volatility_required
+           ),
+         exchange <- Map.get(context, :exchange),
+         {:ok, daily_vol} <- daily_volatility(daily_volatility_fn, symbol, exchange) do
+      calculate_qty(config, %{
+        daily_vol: daily_vol,
+        price: price,
+        target_dollar_volatility: target_dollar_volatility
+      })
+    end
+  end
+
+  defp daily_volatility(daily_volatility_fn, symbol, exchange) do
+    case daily_volatility_fn.(symbol, exchange) do
+      {:ok, daily_vol} -> {:ok, daily_vol}
+      {:error, _reason} -> {:error, :daily_volatility_unavailable}
+    end
+  end
+
   defp fetch_context(context, key, error) do
     case Map.get(context, key) do
       nil -> {:error, error}

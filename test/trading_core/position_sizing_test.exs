@@ -98,6 +98,85 @@ defmodule TradingCore.PositionSizingTest do
     end
   end
 
+  describe "resolve_volatility_target/4" do
+    test "fetches symbol/price, calls daily_volatility_fn, and delegates to calculate_qty/2" do
+      config = %{"method" => "volatility_target"}
+
+      context = %{
+        symbol: "AAPL",
+        exchange: "NASDAQ",
+        price: Decimal.new("100"),
+        target_dollar_volatility: Decimal.new("1000")
+      }
+
+      daily_volatility_fn = fn "AAPL", "NASDAQ" -> {:ok, Decimal.new("0.02")} end
+
+      assert {:ok, qty} = PositionSizing.resolve_volatility_target(config, context, daily_volatility_fn)
+      assert Decimal.equal?(qty, Decimal.new("500"))
+    end
+
+    test "passes exchange through as nil when absent from context" do
+      config = %{"method" => "volatility_target"}
+
+      context = %{
+        symbol: "AAPL",
+        price: Decimal.new("100"),
+        target_dollar_volatility: Decimal.new("1000")
+      }
+
+      daily_volatility_fn = fn "AAPL", nil -> {:ok, Decimal.new("0.02")} end
+
+      assert {:ok, _qty} = PositionSizing.resolve_volatility_target(config, context, daily_volatility_fn)
+    end
+
+    test "errors when symbol is missing from context" do
+      config = %{"method" => "volatility_target"}
+      context = %{price: Decimal.new("100"), target_dollar_volatility: Decimal.new("1000")}
+
+      daily_volatility_fn = fn _symbol, _exchange -> {:ok, Decimal.new("0.02")} end
+
+      assert {:error, :symbol_required} =
+               PositionSizing.resolve_volatility_target(config, context, daily_volatility_fn)
+    end
+
+    test "errors with the default :price_required when price is missing" do
+      config = %{"method" => "volatility_target"}
+      context = %{symbol: "AAPL", target_dollar_volatility: Decimal.new("1000")}
+
+      daily_volatility_fn = fn _symbol, _exchange -> {:ok, Decimal.new("0.02")} end
+
+      assert {:error, :price_required} =
+               PositionSizing.resolve_volatility_target(config, context, daily_volatility_fn)
+    end
+
+    test "errors with a caller-supplied :price_error atom when price is missing" do
+      config = %{"method" => "volatility_target"}
+      context = %{symbol: "AAPL", target_dollar_volatility: Decimal.new("1000")}
+
+      daily_volatility_fn = fn _symbol, _exchange -> {:ok, Decimal.new("0.02")} end
+
+      assert {:error, :price_unavailable} =
+               PositionSizing.resolve_volatility_target(config, context, daily_volatility_fn,
+                 price_error: :price_unavailable
+               )
+    end
+
+    test "normalizes any daily_volatility_fn error to :daily_volatility_unavailable" do
+      config = %{"method" => "volatility_target"}
+
+      context = %{
+        symbol: "AAPL",
+        price: Decimal.new("100"),
+        target_dollar_volatility: Decimal.new("1000")
+      }
+
+      daily_volatility_fn = fn _symbol, _exchange -> {:error, :not_connected} end
+
+      assert {:error, :daily_volatility_unavailable} =
+               PositionSizing.resolve_volatility_target(config, context, daily_volatility_fn)
+    end
+  end
+
   describe "unknown method" do
     test "errors on a missing method" do
       assert {:error, :unknown_sizing_method} = PositionSizing.calculate_qty(%{}, %{})
