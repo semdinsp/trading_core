@@ -295,6 +295,80 @@ defmodule TradingCore.BacktestTest do
     end
   end
 
+  describe "kind: :volume" do
+    test "a :symbol-scoped volume signal reads each bar's own volume field, not close" do
+      strategy = %{
+        "direction" => "long",
+        "rules" => %{
+          "entry" => %{"signal" => "bar_volume", "op" => "gt", "value" => 5000},
+          "exit" => nil
+        },
+        "params" => %{},
+        "position_sizing" => %{"method" => "fixed_qty", "qty" => 1}
+      }
+
+      signal_specs = %{"bar_volume" => %{kind: :volume}}
+
+      bars = [
+        bar(0, 100, 101, 99, 100, 1000),
+        # volume 6000 > 5000 -> entry fires; fills at bar 2's open, despite
+        # close price itself never crossing any threshold.
+        bar(1, 100, 101, 99, 100, 6000),
+        bar(2, 105, 106, 104, 105, 1000),
+        bar(3, 105, 106, 104, 105, 1000),
+        bar(4, 105, 106, 104, 105, 1000)
+      ]
+
+      bars_by_symbol = %{"AAPL" => bars}
+
+      assert {:ok, [run]} = Backtest.run(strategy, bars_by_symbol, signal_specs: signal_specs)
+      assert run.symbol == "AAPL"
+      assert Decimal.equal?(run.entry_price, d("105"))
+    end
+
+    test "a :global-scoped volume signal (one instrument's own volume) is shared across the pool" do
+      strategy = %{
+        "direction" => "long",
+        "rules" => %{
+          "entry" => %{"signal" => "spy_volume", "op" => "gt", "value" => 5000},
+          "exit" => nil
+        },
+        "params" => %{},
+        "position_sizing" => %{"method" => "fixed_qty", "qty" => 1}
+      }
+
+      signal_specs = %{"spy_volume" => %{kind: :volume, scope: :global, symbol: "SPY"}}
+
+      spy_bars = [
+        bar(0, 100, 101, 99, 100, 1000),
+        bar(1, 100, 101, 99, 100, 6000),
+        bar(2, 100, 101, 99, 100, 1000),
+        bar(3, 100, 101, 99, 100, 1000),
+        bar(4, 100, 101, 99, 100, 1000)
+      ]
+
+      aapl_bars = [
+        bar(0, 10, 11, 9, 10),
+        bar(1, 10, 11, 9, 10),
+        bar(2, 20, 21, 19, 20),
+        bar(3, 21, 22, 20, 21),
+        bar(4, 22, 23, 21, 22)
+      ]
+
+      bars_by_symbol = %{"AAPL" => aapl_bars, "SPY" => spy_bars}
+
+      assert {:ok, runs} = Backtest.run(strategy, bars_by_symbol, signal_specs: signal_specs)
+
+      by_symbol = Enum.group_by(runs, & &1.symbol)
+      aapl_run = hd(by_symbol["AAPL"])
+
+      # SPY's own bar-1 volume spike drives AAPL's entry, filled using
+      # AAPL's own bar-2 open (20) -- same "shared :global signal, own
+      # fill price" behavior the analogous :price test above verifies.
+      assert Decimal.equal?(aapl_run.entry_price, d("20"))
+    end
+  end
+
   describe "custom exit rule precedence" do
     test "a non-empty custom exit rule takes precedence over stop/target" do
       strategy = %{

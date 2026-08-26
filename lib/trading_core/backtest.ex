@@ -106,6 +106,19 @@ defmodule TradingCore.Backtest do
   - `kind: :price` — the raw bar `close` itself, scoped `:symbol` always
     (there's no "global raw price" — a base price series is inherently
     about one instrument). No extra keys.
+  - `kind: :volume` — the raw bar `volume` itself, same shape/scoping
+    rules as `kind: :price` (`:symbol`-scoped by default, or `:global` with
+    an explicit `symbol:` override for one fixed instrument's volume used
+    across a pool). No extra keys, no windowing/accumulation of its own —
+    a bar's `volume` field is already that bar's own period total (for a
+    `"day"`-timespan bar, the full session's cumulative volume), matching
+    what `TradingSignal.Signals.Volume`'s live cumulative-since-session-open
+    value means once each trading day closes. See that module's own
+    moduledoc, "Cumulative vs. per-bar volume," for why live tick-by-tick
+    reconstruction needs session-reset bookkeeping this kind deliberately
+    doesn't reproduce — a bars-based replay has no live ticks to
+    reconstruct from in the first place, only the bar's own already-final
+    `volume` value.
   - `kind: :series` — a literal externally-supplied series (e.g. VIX
     level), looked up in `opts[:literal_series][name]`. Always `scope: :global`
     (a literal series isn't derived from any symbol's own bars). Value at
@@ -418,6 +431,8 @@ defmodule TradingCore.Backtest do
   defp global_spec?(%{kind: :series}, _specs), do: true
   defp global_spec?(%{kind: :price, symbol: _explicit}, _specs), do: true
   defp global_spec?(%{kind: :price}, _specs), do: false
+  defp global_spec?(%{kind: :volume, symbol: _explicit}, _specs), do: true
+  defp global_spec?(%{kind: :volume}, _specs), do: false
 
   defp global_spec?(%{parent: parent}, specs),
     do: global_spec?(Map.fetch!(specs, parent), specs)
@@ -436,6 +451,12 @@ defmodule TradingCore.Backtest do
     bars_by_symbol
     |> Map.get(symbol, [])
     |> Enum.map(&{&1.ts, &1.close})
+  end
+
+  defp compute_global_one(_name, %{kind: :volume, symbol: symbol}, _specs, bars_by_symbol, _literal, _acc) do
+    bars_by_symbol
+    |> Map.get(symbol, [])
+    |> Enum.map(&{&1.ts, &1.volume})
   end
 
   defp compute_global_one(name, spec, specs, bars_by_symbol, literal_series, acc) do
@@ -746,6 +767,10 @@ defmodule TradingCore.Backtest do
 
   defp compute_symbol_signal(name, %{kind: :price}, bar, _values, state) do
     {bar.close, Map.fetch!(state, name)}
+  end
+
+  defp compute_symbol_signal(name, %{kind: :volume}, bar, _values, state) do
+    {bar.volume, Map.fetch!(state, name)}
   end
 
   defp compute_symbol_signal(name, %{kind: :derivative} = spec, bar, values, state) do
