@@ -177,6 +177,45 @@ defmodule TradingCore.PositionSizingTest do
     end
   end
 
+  describe "resolve_volatility_target_with_estimate/4" do
+    test "returns qty and the daily_vol used to compute it" do
+      config = %{"method" => "volatility_target"}
+
+      context = %{
+        symbol: "AAPL",
+        exchange: "NASDAQ",
+        price: Decimal.new("100"),
+        target_dollar_volatility: Decimal.new("1000")
+      }
+
+      daily_volatility_fn = fn "AAPL", "NASDAQ" -> {:ok, Decimal.new("0.02")} end
+
+      assert {:ok, qty, daily_vol} =
+               PositionSizing.resolve_volatility_target_with_estimate(
+                 config,
+                 context,
+                 daily_volatility_fn
+               )
+
+      assert Decimal.equal?(qty, Decimal.new("500"))
+      assert Decimal.equal?(daily_vol, Decimal.new("0.02"))
+    end
+
+    test "errors the same way resolve_volatility_target/4 does" do
+      config = %{"method" => "volatility_target"}
+      context = %{price: Decimal.new("100"), target_dollar_volatility: Decimal.new("1000")}
+
+      daily_volatility_fn = fn _symbol, _exchange -> {:ok, Decimal.new("0.02")} end
+
+      assert {:error, :symbol_required} =
+               PositionSizing.resolve_volatility_target_with_estimate(
+                 config,
+                 context,
+                 daily_volatility_fn
+               )
+    end
+  end
+
   describe "unknown method" do
     test "errors on a missing method" do
       assert {:error, :unknown_sizing_method} = PositionSizing.calculate_qty(%{}, %{})

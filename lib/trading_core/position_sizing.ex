@@ -123,6 +123,48 @@ defmodule TradingCore.PositionSizing do
     end
   end
 
+  @doc """
+  Same as `resolve_volatility_target/4`, but also returns the
+  `daily_vol` figure used to compute `qty` — `{:ok, qty, daily_vol}`
+  instead of `{:ok, qty}`. Added for `trading_system`'s entry-reporting
+  fields (`StrategyRun.entry_vol_estimate`), which need to persist the
+  vol estimate a sizing decision was actually made against, not just the
+  resulting quantity — see that field's own doc for why this can't be
+  reconstructed after the fact. A strictly additive function, not a
+  replacement: `resolve_volatility_target/4` itself is unchanged, so
+  `trading_live`'s existing caller (`TradingLive.PositionSizing`) is
+  unaffected by this addition.
+  """
+  @spec resolve_volatility_target_with_estimate(
+          map(),
+          map(),
+          (String.t(), String.t() | nil -> {:ok, Decimal.t()} | {:error, term()}),
+          keyword()
+        ) :: {:ok, Decimal.t(), Decimal.t()} | {:error, atom()}
+  def resolve_volatility_target_with_estimate(config, context, daily_volatility_fn, opts \\ [])
+      when is_function(daily_volatility_fn, 2) do
+    price_error = Keyword.get(opts, :price_error, :price_required)
+
+    with {:ok, symbol} <- fetch_context(context, :symbol, :symbol_required),
+         {:ok, price} <- fetch_context(context, :price, price_error),
+         {:ok, target_dollar_volatility} <-
+           fetch_context(
+             context,
+             :target_dollar_volatility,
+             :target_dollar_volatility_required
+           ),
+         exchange <- Map.get(context, :exchange),
+         {:ok, daily_vol} <- daily_volatility(daily_volatility_fn, symbol, exchange),
+         {:ok, qty} <-
+           calculate_qty(config, %{
+             daily_vol: daily_vol,
+             price: price,
+             target_dollar_volatility: target_dollar_volatility
+           }) do
+      {:ok, qty, daily_vol}
+    end
+  end
+
   defp fetch_context(context, key, error) do
     case Map.get(context, key) do
       nil -> {:error, error}
