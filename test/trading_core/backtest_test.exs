@@ -369,6 +369,102 @@ defmodule TradingCore.BacktestTest do
     end
   end
 
+  describe "kind: :vwap" do
+    defp bar_with_vwap(offset_minutes, close, vwap) do
+      offset_minutes
+      |> bar(close, close, close, close)
+      |> Map.put(:vwap, d(vwap))
+    end
+
+    test "a :symbol-scoped vwap signal reads each bar's own vwap field, not close" do
+      strategy = %{
+        "direction" => "long",
+        "rules" => %{
+          "entry" => %{"signal" => "bar_vwap", "op" => "gt", "value" => 102},
+          "exit" => nil
+        },
+        "params" => %{},
+        "position_sizing" => %{"method" => "fixed_qty", "qty" => 1}
+      }
+
+      signal_specs = %{"bar_vwap" => %{kind: :vwap}}
+
+      bars = [
+        bar_with_vwap(0, 100, 99),
+        # vwap 103 > 102 -> entry fires despite close (100) never crossing
+        # any threshold; fills at bar 2's open.
+        bar_with_vwap(1, 100, 103),
+        bar_with_vwap(2, 105, 104),
+        bar_with_vwap(3, 105, 104),
+        bar_with_vwap(4, 105, 104)
+      ]
+
+      bars_by_symbol = %{"AAPL" => bars}
+
+      assert {:ok, [run]} = Backtest.run(strategy, bars_by_symbol, signal_specs: signal_specs)
+      assert run.symbol == "AAPL"
+      assert Decimal.equal?(run.entry_price, d("105"))
+    end
+
+    test "a bar with no :vwap key is treated as no value yet, not an error" do
+      strategy = %{
+        "direction" => "long",
+        "rules" => %{
+          "entry" => %{"signal" => "bar_vwap", "op" => "gt", "value" => 100},
+          "exit" => nil
+        },
+        "params" => %{},
+        "position_sizing" => %{"method" => "fixed_qty", "qty" => 1}
+      }
+
+      signal_specs = %{"bar_vwap" => %{kind: :vwap}}
+
+      bars = [bar(0, 100, 101, 99, 100), bar(1, 100, 101, 99, 100)]
+      bars_by_symbol = %{"AAPL" => bars}
+
+      assert {:ok, []} = Backtest.run(strategy, bars_by_symbol, signal_specs: signal_specs)
+    end
+
+    test "a :global-scoped vwap signal (one instrument's own vwap) is shared across the pool" do
+      strategy = %{
+        "direction" => "long",
+        "rules" => %{
+          "entry" => %{"signal" => "spy_vwap", "op" => "gt", "value" => 102},
+          "exit" => nil
+        },
+        "params" => %{},
+        "position_sizing" => %{"method" => "fixed_qty", "qty" => 1}
+      }
+
+      signal_specs = %{"spy_vwap" => %{kind: :vwap, scope: :global, symbol: "SPY"}}
+
+      spy_bars = [
+        bar_with_vwap(0, 100, 99),
+        bar_with_vwap(1, 100, 103),
+        bar_with_vwap(2, 100, 104),
+        bar_with_vwap(3, 100, 104),
+        bar_with_vwap(4, 100, 104)
+      ]
+
+      aapl_bars = [
+        bar(0, 10, 11, 9, 10),
+        bar(1, 10, 11, 9, 10),
+        bar(2, 20, 21, 19, 20),
+        bar(3, 21, 22, 20, 21),
+        bar(4, 22, 23, 21, 22)
+      ]
+
+      bars_by_symbol = %{"AAPL" => aapl_bars, "SPY" => spy_bars}
+
+      assert {:ok, runs} = Backtest.run(strategy, bars_by_symbol, signal_specs: signal_specs)
+
+      by_symbol = Enum.group_by(runs, & &1.symbol)
+      aapl_run = hd(by_symbol["AAPL"])
+
+      assert Decimal.equal?(aapl_run.entry_price, d("20"))
+    end
+  end
+
   describe "custom exit rule precedence" do
     test "a non-empty custom exit rule takes precedence over stop/target" do
       strategy = %{

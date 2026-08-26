@@ -119,6 +119,23 @@ defmodule TradingCore.Backtest do
     doesn't reproduce — a bars-based replay has no live ticks to
     reconstruct from in the first place, only the bar's own already-final
     `volume` value.
+  - `kind: :vwap` — the bar's own `vwap` field, same shape/scoping rules
+    as `kind: :price`/`:volume`. Requires the caller's `bars_by_symbol`
+    bars to actually carry a `:vwap` key (optional on the `bar()` type —
+    see that type's own doc); a bar missing it is treated the same as any
+    other kind's "no value yet" case (`nil`, dropped from the snapshot —
+    see `build_snapshot/5`). No windowing/accumulation of its own, for the
+    same reason `:volume` needs none: Polygon's own flat-file day-aggregate
+    already supplies a per-day session-VWAP figure (its own `"vw"` field),
+    already parsed into `historical_bars.vwap` by
+    `TradingBacktest.PolygonFlatFile.Client` — this kind is a pure
+    passthrough of that already-computed value, not a `cum_pv`/`cum_volume`
+    reconstruction. `TradingCore.Signals.vwap/2` and
+    `fold_price_weighted_delta/3` remain available for a caller that *does*
+    need to reconstruct VWAP from raw price/volume (e.g. a `"minute"`-
+    timespan replay with no per-bar vwap of its own); this kind is
+    specifically for the common case where the data source already did
+    that work.
   - `kind: :series` — a literal externally-supplied series (e.g. VIX
     level), looked up in `opts[:literal_series][name]`. Always `scope: :global`
     (a literal series isn't derived from any symbol's own bars). Value at
@@ -339,12 +356,13 @@ defmodule TradingCore.Backtest do
   alias TradingCore.{ExitStrategy, PositionSizing, RiskControls, RuleEngine, Signals}
 
   @type bar :: %{
-          ts: DateTime.t(),
-          open: Decimal.t(),
-          high: Decimal.t(),
-          low: Decimal.t(),
-          close: Decimal.t(),
-          volume: Decimal.t()
+          required(:ts) => DateTime.t(),
+          required(:open) => Decimal.t(),
+          required(:high) => Decimal.t(),
+          required(:low) => Decimal.t(),
+          required(:close) => Decimal.t(),
+          required(:volume) => Decimal.t(),
+          optional(:vwap) => Decimal.t()
         }
   @type run_result :: %{
           symbol: String.t(),
@@ -433,6 +451,8 @@ defmodule TradingCore.Backtest do
   defp global_spec?(%{kind: :price}, _specs), do: false
   defp global_spec?(%{kind: :volume, symbol: _explicit}, _specs), do: true
   defp global_spec?(%{kind: :volume}, _specs), do: false
+  defp global_spec?(%{kind: :vwap, symbol: _explicit}, _specs), do: true
+  defp global_spec?(%{kind: :vwap}, _specs), do: false
 
   defp global_spec?(%{parent: parent}, specs),
     do: global_spec?(Map.fetch!(specs, parent), specs)
@@ -457,6 +477,13 @@ defmodule TradingCore.Backtest do
     bars_by_symbol
     |> Map.get(symbol, [])
     |> Enum.map(&{&1.ts, &1.volume})
+  end
+
+  defp compute_global_one(_name, %{kind: :vwap, symbol: symbol}, _specs, bars_by_symbol, _literal, _acc) do
+    bars_by_symbol
+    |> Map.get(symbol, [])
+    |> Enum.map(&{&1.ts, Map.get(&1, :vwap)})
+    |> drop_nil_values()
   end
 
   defp compute_global_one(name, spec, specs, bars_by_symbol, literal_series, acc) do
@@ -771,6 +798,10 @@ defmodule TradingCore.Backtest do
 
   defp compute_symbol_signal(name, %{kind: :volume}, bar, _values, state) do
     {bar.volume, Map.fetch!(state, name)}
+  end
+
+  defp compute_symbol_signal(name, %{kind: :vwap}, bar, _values, state) do
+    {Map.get(bar, :vwap), Map.fetch!(state, name)}
   end
 
   defp compute_symbol_signal(name, %{kind: :derivative} = spec, bar, values, state) do
