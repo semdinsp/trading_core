@@ -13,9 +13,9 @@ defmodule TradingCore.Signal.Spec do
   ## Fields
 
     * `:kind` — which computation to run. One of `TradingCore.Signal.Compute`'s
-      known kinds: `:plain`, `:derivative`, `:second_derivative`, `:wavelet`,
-      `:volume`, `:vwap`, `:donchian`, `:rolling_volume`, `:self_zscore`,
-      `:percent_deviation`, `:zscore`, `:regime`, `:ratio`.
+      known kinds: `:plain`, `:momentum`, `:derivative`, `:second_derivative`,
+      `:wavelet`, `:volume`, `:vwap`, `:donchian`, `:rolling_volume`,
+      `:self_zscore`, `:percent_deviation`, `:zscore`, `:regime`, `:ratio`.
     * `:symbol` — the underlying instrument this spec is ultimately scoped
       to, or `nil` for a spec whose only inputs are its `:parent`/
       `:reference` (every wrapping kind — see `TradingSignal.Signals.SignalDefinition`'s
@@ -94,6 +94,7 @@ defmodule TradingCore.Signal.Spec do
 
   @type kind ::
           :plain
+          | :momentum
           | :derivative
           | :second_derivative
           | :wavelet
@@ -121,8 +122,14 @@ defmodule TradingCore.Signal.Spec do
   # Mirrors TradingSignal.Signals.SignalDefinition's own @base_kinds:
   # these have no parent/reference at all — their raw input is a tick
   # keyed by :symbol/:source, supplied directly to Compute.step/2 by the
-  # caller (Compute has no feed of its own to pull from).
-  @base_kinds ~w(plain volume vwap donchian rolling_volume)a
+  # caller (Compute has no feed of its own to pull from). :momentum isn't
+  # a SignalDefinition kind of its own — TradingSignal.Signals.Momentum is
+  # only ever reached via an ad-hoc {:momentum, symbol:, window:} spec, and
+  # a "plain"-kind definition with a params["window"] falls back to the
+  # same TradingCore.Signals.momentum/4 call via DefinitionSignal — but it
+  # is still a real base-kind computation with its own state shape here,
+  # independent of how a caller decides to route to it.
+  @base_kinds ~w(plain momentum volume vwap donchian rolling_volume)a
 
   # Mirrors @single_parent_kinds: wrap exactly one parent's own value
   # stream over time.

@@ -25,6 +25,55 @@ defmodule TradingCore.Signal.ComputeTest do
     end
   end
 
+  describe "momentum" do
+    test "warms up until 2 samples are in the window, then emits newest - oldest" do
+      spec = %Spec{kind: :momentum, window_ms: :timer.minutes(5)}
+      {:ok, state} = Compute.init(spec)
+
+      {state, first} = Compute.step(spec, state, %{at: @now, value: 100})
+      assert first == :warming_up
+
+      {_state, second} =
+        Compute.step(spec, state, %{at: DateTime.add(@now, 10, :second), value: 110})
+
+      assert %Decimal{} = second
+      assert Decimal.equal?(second, Decimal.new(10))
+    end
+
+    test "matches TradingCore.Signals.momentum/4 directly, tick for tick" do
+      spec = %Spec{kind: :momentum, window_ms: :timer.minutes(5)}
+      {:ok, state} = Compute.init(spec)
+
+      values = ticks([100, 101, 103, 106, 110, 115], interval: 10)
+
+      {_final_state, compute_results} =
+        Enum.reduce(values, {state, []}, fn tick, {state, acc} ->
+          {new_state, result} = Compute.step(spec, state, tick)
+          {new_state, [result | acc]}
+        end)
+
+      compute_results = Enum.reverse(compute_results)
+
+      {_final_prices, signals_results} =
+        Enum.reduce(values, {[], []}, fn %{at: at, value: value}, {prices, acc} ->
+          {new_prices, result} =
+            TradingCore.Signals.momentum(prices, value, at, window_ms: :timer.minutes(5))
+
+          {new_prices, [result || :warming_up | acc]}
+        end)
+
+      signals_results = Enum.reverse(signals_results)
+
+      assert length(compute_results) == length(signals_results)
+
+      Enum.zip(compute_results, signals_results)
+      |> Enum.each(fn
+        {:warming_up, :warming_up} -> :ok
+        {a, b} -> assert Decimal.equal?(a, b)
+      end)
+    end
+  end
+
   describe "derivative / second_derivative" do
     test "warms up until 2 samples are in the window, then emits slope" do
       spec = %Spec{kind: :derivative, window_ms: :timer.minutes(5)}
@@ -86,6 +135,56 @@ defmodule TradingCore.Signal.ComputeTest do
       # to fold this tick — same "nothing to emit yet" case as any other
       # kind's warm-up, not a re-emission of the last good value
       assert third == :warming_up
+    end
+
+    test "resets cum_volume AND last_reading when the injected session_reset reports a new session" do
+      # Regression test for the confirmed live divergence this covers:
+      # without a session reset, :volume's cum_volume grows forever across
+      # session boundaries instead of resetting to session-to-date volume
+      # each day, the way TradingSignal.Signals.CumulativeVolume actually
+      # behaves live.
+      session_reset = fn dt -> DateTime.to_date(dt) end
+      spec = %Spec{kind: :volume, params: %{"session_reset" => session_reset}}
+      {:ok, state} = Compute.init(spec)
+
+      day1 = @now
+      day2 = DateTime.add(@now, 86_400, :second)
+
+      {state, first} = Compute.step(spec, state, %{at: day1, value: 1000})
+      assert first == :warming_up
+
+      {state, second} = Compute.step(spec, state, %{at: day1, value: 1500})
+      assert Decimal.equal?(second, Decimal.new(500))
+
+      # New session: cum_volume resets to 0, and last_reading resets to
+      # nil so this first day2 reading only establishes a fresh baseline
+      # (warms up again) rather than being diffed against day1's stale
+      # 1500 reading.
+      {state, third} = Compute.step(spec, state, %{at: day2, value: 50})
+      assert third == :warming_up
+
+      {_state, fourth} = Compute.step(spec, state, %{at: day2, value: 80})
+      assert Decimal.equal?(fourth, Decimal.new(30))
+    end
+
+    test "with no session_reset configured, cum_volume never resets (single unbroken session)" do
+      spec = %Spec{kind: :volume}
+      {:ok, state} = Compute.init(spec)
+
+      day1 = @now
+      day2 = DateTime.add(@now, 86_400, :second)
+
+      {state, _} = Compute.step(spec, state, %{at: day1, value: 1000})
+      {state, _} = Compute.step(spec, state, %{at: day1, value: 1500})
+
+      # No reset rule injected: day2's reading diffs straight against
+      # day1's last reading (1500), adding another 100 on top of the
+      # already-accumulated 500 — cum_volume keeps growing across the
+      # "session" boundary exactly as if there were none, same "blended
+      # across both sessions" behavior :vwap's own no-session_reset test
+      # documents.
+      {_state, value} = Compute.step(spec, state, %{at: day2, value: 1600})
+      assert Decimal.equal?(value, Decimal.new(600))
     end
   end
 
