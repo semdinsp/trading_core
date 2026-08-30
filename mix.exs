@@ -22,7 +22,8 @@ defmodule TradingCore.MixProject do
   defp deps do
     [
       {:decimal, "~> 3.0"},
-      {:tzdata, "~> 1.1"}
+      {:tzdata, "~> 1.1"},
+      {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]
   end
 end

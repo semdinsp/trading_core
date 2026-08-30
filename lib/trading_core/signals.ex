@@ -296,11 +296,28 @@ defmodule TradingCore.Signals do
   `reference` is zero (undefined, not a divide-by-zero error) — a real
   reachable state for some reference signals (e.g. a `derivative` sitting
   at exactly zero momentarily), not just hypothetical.
-  """
-  @spec percent_deviation(Decimal.t(), Decimal.t()) :: Decimal.t() | nil
-  def percent_deviation(_value, reference) when reference == 0 or reference == 0.0, do: nil
 
-  def percent_deviation(value, reference) do
+  Rounds the *emitted* result to `precision` (default
+  #{@default_precision}), same discipline as `vwap/3`/`ratio/3` — `Decimal.div/2`
+  is exact-precision, so an entirely ordinary-looking `value`/`reference`
+  pair (e.g. `100.03`/`99.97`) can still produce a 30+ significant-digit
+  quotient (confirmed: a `0.06%`-ish deviation from realistic inputs came
+  back as 36 digits before this rounded). Left unrounded, that value is
+  exactly the shape of `Decimal` this module's own moduledoc ("Rounding/
+  precision discipline is load-bearing") warns against handing to any
+  caller that might fold it into a rolling window/Welford accumulator —
+  `TradingCore.Signal.Compute` can wire this function's own output into
+  exactly such a window (a `percent_deviation` node feeding a
+  `derivative`/`self_zscore` child in a spec tree), so this can no longer
+  be treated as "just a terminal value nothing re-consumes."
+  """
+  @spec percent_deviation(Decimal.t(), Decimal.t(), keyword()) :: Decimal.t() | nil
+  def percent_deviation(value, reference, opts \\ [])
+  def percent_deviation(_value, reference, _opts) when reference == 0 or reference == 0.0, do: nil
+
+  def percent_deviation(value, reference, opts) do
+    precision = Keyword.get(opts, :precision, @default_precision)
+
     if Decimal.compare(reference, 0) == :eq do
       nil
     else
@@ -308,6 +325,7 @@ defmodule TradingCore.Signals do
       |> Decimal.sub(reference)
       |> Decimal.div(reference)
       |> Decimal.mult(100)
+      |> Decimal.round(precision)
     end
   end
 
@@ -344,7 +362,14 @@ defmodule TradingCore.Signals do
   Returns `{new_history, new_welford, nil}` under the same "fewer than 2
   samples" / "zero variance" conditions `self_zscore/5` does.
   """
-  @spec spread_zscore(history(), WelfordAcc.t(), Decimal.t(), Decimal.t(), DateTime.t(), keyword()) ::
+  @spec spread_zscore(
+          history(),
+          WelfordAcc.t(),
+          Decimal.t(),
+          Decimal.t(),
+          DateTime.t(),
+          keyword()
+        ) ::
           {history(), WelfordAcc.t(), Decimal.t() | nil}
   def spread_zscore(history, _welford, value, reference, now, opts \\ []) do
     precision = Keyword.get(opts, :precision, @default_precision)
