@@ -235,6 +235,27 @@ defmodule TradingCore.Signal.ComputeTest do
 
       assert Decimal.equal?(value, Decimal.new(21))
     end
+
+    test "percent_deviation's emitted value is rounded before it can reach a downstream rolling window" do
+      # Compute makes it possible to wire percent_deviation's own output
+      # into a child that keeps a rolling window (derivative/self_zscore),
+      # something the live GenServer topology never did (Deviation only
+      # ever broadcast this as a terminal value). An ordinary-looking
+      # value/reference pair produces an exact-precision Decimal.div/2
+      # quotient with 30+ significant digits if unrounded — see
+      # TradingCore.Signals.percent_deviation/3's own moduledoc — so this
+      # asserts the value stored in a child's window is bounded.
+      spec = %Spec{kind: :percent_deviation}
+      {:ok, state} = Compute.init(spec)
+
+      {_state, value} =
+        Compute.step(spec, state, %{at: @now, value: "100.03", reference: "99.97"})
+
+      digit_count =
+        value |> Decimal.to_string() |> String.replace(~r/[^0-9]/, "") |> String.length()
+
+      assert digit_count <= 9
+    end
   end
 
   describe "regime" do

@@ -116,7 +116,11 @@ defmodule TradingCore.SignalsTest do
   describe "fold_price_weighted_delta/3" do
     test "adds last_price * delta to cum_pv" do
       result =
-        Signals.fold_price_weighted_delta(Decimal.new(1000), Decimal.new("101.0"), Decimal.new(500))
+        Signals.fold_price_weighted_delta(
+          Decimal.new(1000),
+          Decimal.new("101.0"),
+          Decimal.new(500)
+        )
 
       assert Decimal.equal?(result, Decimal.new("51500.0"))
     end
@@ -204,6 +208,26 @@ defmodule TradingCore.SignalsTest do
 
     test "nil when reference is zero" do
       assert Signals.percent_deviation(Decimal.new("10"), Decimal.new("0")) == nil
+    end
+
+    test "rounds the emitted result — Decimal.div/2's exact-precision output must not reach a caller unbounded" do
+      # An entirely ordinary-looking value/reference pair; Decimal.div/2
+      # being exact-precision means the raw quotient here comes back with
+      # 30+ significant digits before rounding — confirmed live as the
+      # root cause of a 9-50MB per-process memory blowup and a 300K+
+      # message mailbox backlog when a value like this sat unrounded in a
+      # downstream rolling window (see this module's own moduledoc,
+      # "Rounding/precision discipline is load-bearing").
+      value = Signals.percent_deviation(Decimal.new("100.03"), Decimal.new("99.97"))
+      assert Decimal.eq?(value, Decimal.round(value, 8))
+
+      digit_count =
+        value
+        |> Decimal.to_string()
+        |> String.replace(~r/[^0-9]/, "")
+        |> String.length()
+
+      assert digit_count <= 9
     end
   end
 
@@ -381,7 +405,9 @@ defmodule TradingCore.SignalsTest do
 
   describe "regime/4" do
     test "emits +1 (long) when direction exceeds the deadband and the gate is calm" do
-      value = Signals.regime(Decimal.new(500), Decimal.new(0), Decimal.new(300), Decimal.new("1.5"))
+      value =
+        Signals.regime(Decimal.new(500), Decimal.new(0), Decimal.new(300), Decimal.new("1.5"))
+
       assert Decimal.equal?(value, Decimal.new(1))
     end
 
@@ -393,7 +419,9 @@ defmodule TradingCore.SignalsTest do
     end
 
     test "emits 0 (choppy) when direction is within the deadband" do
-      value = Signals.regime(Decimal.new(50), Decimal.new(0), Decimal.new(300), Decimal.new("1.5"))
+      value =
+        Signals.regime(Decimal.new(50), Decimal.new(0), Decimal.new(300), Decimal.new("1.5"))
+
       assert Decimal.equal?(value, Decimal.new(0))
     end
 
