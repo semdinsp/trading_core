@@ -6,7 +6,7 @@ defmodule TradingCore.Signal.SpecTest do
   test "kinds/0 lists every recognized kind" do
     assert Enum.sort(Spec.kinds()) ==
              Enum.sort(~w(
-               plain derivative second_derivative wavelet volume vwap donchian
+               plain momentum derivative second_derivative wavelet volume vwap donchian
                rolling_volume self_zscore percent_deviation zscore regime ratio
              )a)
   end

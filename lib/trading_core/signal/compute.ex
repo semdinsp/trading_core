@@ -7,8 +7,8 @@ defmodule TradingCore.Signal.Compute do
 
   This module doesn't invent new arithmetic — every kind dispatches
   straight to the already-extracted, already-live-proven functions in
-  `TradingCore.Signals` (derivative/vwap/self_zscore/spread_zscore/
-  wavelet/donchian/regime/momentum), `TradingCore.WelfordAcc`, and
+  `TradingCore.Signals` (momentum/derivative/vwap/self_zscore/spread_zscore/
+  wavelet/donchian/regime), `TradingCore.WelfordAcc`, and
   `TradingCore.WaveletTransform`. What this module adds on top:
 
     1. **One state shape per kind**, opaque to the caller, so `step/2` has
@@ -73,21 +73,25 @@ defmodule TradingCore.Signal.Compute do
 
   ## Session boundaries are injected, never derived from wall-clock
 
-  A `:vwap` spec's `params` may include `"session_reset"`, a 1-arity
-  function `DateTime.t() -> Date.t() | term()` — `step/2` calls it once
-  per tick to get "which session does this tick belong to," and resets
-  `cum_pv`/`cum_volume` back to zero whenever it returns a different value
+  A `:vwap` or `:volume` spec's `params` may include `"session_reset"`, a
+  1-arity function `DateTime.t() -> Date.t() | term()` — `step/2` calls it
+  once per tick to get "which session does this tick belong to," and
+  resets the kind's own running total(s) back to zero (and, for `:volume`,
+  `last_reading` back to `nil` — see `maybe_reset_volume_session/3`'s own
+  comment for why that part matters) whenever it returns a different value
   than the previous tick's call did. There is no default that reaches for
   `DateTime.utc_now/0` or hardcodes `9:30am America/New_York` inside this
   module — a caller replaying historical data supplies the exact same
-  session-boundary function a live caller would (e.g. one built on
-  `TradingCore.MarketHours`/`ExchangeSessions`, mirroring
-  `TradingSignal.Signals.CumulativeVolume`'s own 9:30am ET rule), so a
-  session reset lands on the identical tick in both live and replay. See
-  `TradingCore.Signals`'s "What's deliberately NOT extracted here" for why
-  the *live* session-tracking module (`CumulativeVolume`) itself stays in
-  `trading_signal` — this is only the injection point that lets its
-  *rule* be replayed identically, not a port of that module.
+  session-boundary function a live caller would (canonically
+  `TradingCore.Session.us_equities/1`, built on `TradingCore.MarketHours`
+  — see that module's own moduledoc for why it was chosen as the shared
+  default over reproducing `TradingSignal.Signals.CumulativeVolume`'s own
+  simpler 9:30am ET rule verbatim), so a session reset lands on the
+  identical tick in both live and replay. See `TradingCore.Signals`'s
+  "What's deliberately NOT extracted here" for why the *live*
+  session-tracking module (`CumulativeVolume`) itself stays in
+  `trading_signal` — this is only the injection point that lets a session
+  rule be replayed identically, not a port of that module.
 
   ## Kinds and their `Spec` shape
 
@@ -95,8 +99,8 @@ defmodule TradingCore.Signal.Compute do
   `parent`/`reference` fields a kind reads. Summary, mirroring
   `TradingCore.Signal.Spec`'s own base/single-parent/dual-parent split:
 
-    * base (own `:symbol`/`:source`, raw ticks): `:plain`, `:volume`,
-      `:vwap`, `:donchian`, `:rolling_volume`
+    * base (own `:symbol`/`:source`, raw ticks): `:plain`, `:momentum`,
+      `:volume`, `:vwap`, `:donchian`, `:rolling_volume`
     * single-parent (wraps `:parent`'s emitted values): `:derivative`,
       `:second_derivative`, `:wavelet`, `:self_zscore`
     * dual-parent (`:parent` vs. `:reference`): `:percent_deviation`,
@@ -135,9 +139,13 @@ defmodule TradingCore.Signal.Compute do
     {:ok, %{history: []}}
   end
 
+  def init(%Spec{kind: :momentum}), do: {:ok, %{prices: []}}
+
   def init(%Spec{kind: :wavelet}), do: {:ok, %{window: []}}
 
-  def init(%Spec{kind: :volume}), do: {:ok, %{cum_volume: Decimal.new(0), last_reading: nil}}
+  def init(%Spec{kind: :volume}) do
+    {:ok, %{cum_volume: Decimal.new(0), last_reading: nil, session: nil}}
+  end
 
   def init(%Spec{kind: :vwap}) do
     {:ok,
@@ -185,6 +193,12 @@ defmodule TradingCore.Signal.Compute do
     {state, to_decimal(value)}
   end
 
+  def step(%Spec{kind: :momentum} = spec, state, %{at: now, value: value}) do
+    opts = window_opts(spec)
+    {prices, result} = Signals.momentum(state.prices, value, now, opts)
+    {%{state | prices: prices}, warm(result)}
+  end
+
   def step(%Spec{kind: :derivative} = spec, state, %{at: now, value: value}) do
     opts = window_opts(spec)
     {history, result} = Signals.derivative(state.history, value, now, opts)
@@ -202,7 +216,10 @@ defmodule TradingCore.Signal.Compute do
     {%{state | window: window}, warm(result)}
   end
 
-  def step(%Spec{kind: :volume}, state, %{value: raw_reading}) do
+  def step(%Spec{kind: :volume} = spec, state, %{at: now, value: raw_reading}) do
+    session_reset = Map.get(spec.params, "session_reset")
+    state = maybe_reset_volume_session(state, now, session_reset)
+
     reading = to_decimal(raw_reading)
 
     delta =
@@ -227,7 +244,7 @@ defmodule TradingCore.Signal.Compute do
 
   def step(%Spec{kind: :vwap} = spec, state, %{at: now} = tick) do
     session_reset = Map.get(spec.params, "session_reset")
-    state = maybe_reset_session(state, now, session_reset)
+    state = maybe_reset_vwap_session(state, now, session_reset)
 
     price = if tick[:value], do: to_decimal(tick[:value]), else: state.last_price
     delta = if tick[:volume], do: to_decimal(tick[:volume]), else: nil
@@ -669,13 +686,36 @@ defmodule TradingCore.Signal.Compute do
     if Decimal.compare(delta, 0) == :lt, do: Decimal.new(0), else: delta
   end
 
-  defp maybe_reset_session(state, _now, nil), do: state
+  defp maybe_reset_vwap_session(state, _now, nil), do: state
 
-  defp maybe_reset_session(state, now, session_reset) when is_function(session_reset, 1) do
+  defp maybe_reset_vwap_session(state, now, session_reset) when is_function(session_reset, 1) do
     session = session_reset.(now)
 
     if state.session != nil and session != state.session do
       %{state | cum_pv: Decimal.new(0), cum_volume: Decimal.new(0), session: session}
+    else
+      %{state | session: session}
+    end
+  end
+
+  # Same injected-function shape as maybe_reset_vwap_session/3 above (see
+  # step/2's :vwap clause and this module's own "Session boundaries"
+  # moduledoc section) but resets :volume's own state shape — cum_volume
+  # AND last_reading both back to their init/1 values, mirroring
+  # TradingSignal.Signals.CumulativeVolume.reset_if_new_session/1 exactly:
+  # last_reading: nil specifically (not just cum_volume: 0) is required so
+  # the very next tick after a reset is treated as "no prior reading to
+  # diff against yet" (this step/2 clause's own `case state.last_reading do
+  # nil -> nil` branch), not as a delta against a stale pre-reset reading
+  # that would otherwise register as either a huge bogus volume spike or,
+  # worse, a negative delta silently discarded as noise.
+  defp maybe_reset_volume_session(state, _now, nil), do: state
+
+  defp maybe_reset_volume_session(state, now, session_reset) when is_function(session_reset, 1) do
+    session = session_reset.(now)
+
+    if state.session != nil and session != state.session do
+      %{state | cum_volume: Decimal.new(0), last_reading: nil, session: session}
     else
       %{state | session: session}
     end
