@@ -458,28 +458,53 @@ defmodule TradingCore.Backtest do
     do: global_spec?(Map.fetch!(specs, parent), specs)
 
   defp global_spec?(%{value: value, reference: reference}, specs),
-    do: global_spec?(Map.fetch!(specs, value), specs) and global_spec?(Map.fetch!(specs, reference), specs)
+    do:
+      global_spec?(Map.fetch!(specs, value), specs) and
+        global_spec?(Map.fetch!(specs, reference), specs)
 
   defp global_spec?(%{direction: direction, gate: gate}, specs),
-    do: global_spec?(Map.fetch!(specs, direction), specs) and global_spec?(Map.fetch!(specs, gate), specs)
+    do:
+      global_spec?(Map.fetch!(specs, direction), specs) and
+        global_spec?(Map.fetch!(specs, gate), specs)
 
   defp compute_global_one(name, %{kind: :series}, _specs, _bars_by_symbol, literal_series, _acc) do
     Map.get(literal_series, name, [])
   end
 
-  defp compute_global_one(_name, %{kind: :price, symbol: symbol}, _specs, bars_by_symbol, _literal, _acc) do
+  defp compute_global_one(
+         _name,
+         %{kind: :price, symbol: symbol},
+         _specs,
+         bars_by_symbol,
+         _literal,
+         _acc
+       ) do
     bars_by_symbol
     |> Map.get(symbol, [])
     |> Enum.map(&{&1.ts, &1.close})
   end
 
-  defp compute_global_one(_name, %{kind: :volume, symbol: symbol}, _specs, bars_by_symbol, _literal, _acc) do
+  defp compute_global_one(
+         _name,
+         %{kind: :volume, symbol: symbol},
+         _specs,
+         bars_by_symbol,
+         _literal,
+         _acc
+       ) do
     bars_by_symbol
     |> Map.get(symbol, [])
     |> Enum.map(&{&1.ts, &1.volume})
   end
 
-  defp compute_global_one(_name, %{kind: :vwap, symbol: symbol}, _specs, bars_by_symbol, _literal, _acc) do
+  defp compute_global_one(
+         _name,
+         %{kind: :vwap, symbol: symbol},
+         _specs,
+         bars_by_symbol,
+         _literal,
+         _acc
+       ) do
     bars_by_symbol
     |> Map.get(symbol, [])
     |> Enum.map(&{&1.ts, Map.get(&1, :vwap)})
@@ -499,12 +524,24 @@ defmodule TradingCore.Backtest do
     fetch_series(parent, specs, bars_by_symbol, literal_series, acc)
   end
 
-  defp resolve_input_series(%{value: value, reference: reference}, specs, bars_by_symbol, literal_series, acc) do
+  defp resolve_input_series(
+         %{value: value, reference: reference},
+         specs,
+         bars_by_symbol,
+         literal_series,
+         acc
+       ) do
     {fetch_series(value, specs, bars_by_symbol, literal_series, acc),
      fetch_series(reference, specs, bars_by_symbol, literal_series, acc)}
   end
 
-  defp resolve_input_series(%{direction: direction, gate: gate}, specs, bars_by_symbol, literal_series, acc) do
+  defp resolve_input_series(
+         %{direction: direction, gate: gate},
+         specs,
+         bars_by_symbol,
+         literal_series,
+         acc
+       ) do
     {fetch_series(direction, specs, bars_by_symbol, literal_series, acc),
      fetch_series(gate, specs, bars_by_symbol, literal_series, acc)}
   end
@@ -569,8 +606,10 @@ defmodule TradingCore.Backtest do
 
     {series, _final_state} =
       Enum.map_reduce(parent_series, {[], TradingCore.WelfordAcc.new()}, fn {ts, value},
-                                                                              {history, welford} ->
-        {new_history, new_welford, result} = Signals.self_zscore(history, welford, value, ts, opts)
+                                                                            {history, welford} ->
+        {new_history, new_welford, result} =
+          Signals.self_zscore(history, welford, value, ts, opts)
+
         {{ts, result}, {new_history, new_welford}}
       end)
 
@@ -589,10 +628,16 @@ defmodule TradingCore.Backtest do
     drop_nil_values(series)
   end
 
-  defp replay_wrapping_signal(_name, %{kind: :percent_deviation}, {value_series, reference_series}) do
+  defp replay_wrapping_signal(
+         _name,
+         %{kind: :percent_deviation},
+         {value_series, reference_series}
+       ) do
     value_series
     |> merge_series(reference_series)
-    |> Enum.map(fn {ts, value, reference} -> {ts, Signals.percent_deviation(value, reference)} end)
+    |> Enum.map(fn {ts, value, reference} ->
+      {ts, Signals.percent_deviation(value, reference)}
+    end)
     |> drop_nil_values()
   end
 
@@ -605,14 +650,18 @@ defmodule TradingCore.Backtest do
     |> drop_nil_values()
   end
 
-  defp replay_wrapping_signal(_name, %{kind: :spread_zscore} = spec, {value_series, reference_series}) do
+  defp replay_wrapping_signal(
+         _name,
+         %{kind: :spread_zscore} = spec,
+         {value_series, reference_series}
+       ) do
     opts = signal_opts(spec)
 
     {series, _final_state} =
       value_series
       |> merge_series(reference_series)
       |> Enum.map_reduce({[], TradingCore.WelfordAcc.new()}, fn {ts, value, reference},
-                                                                  {history, welford} ->
+                                                                {history, welford} ->
         {new_history, new_welford, result} =
           Signals.spread_zscore(history, welford, value, reference, ts, opts)
 
@@ -661,7 +710,9 @@ defmodule TradingCore.Backtest do
     exit_rule = get_in(strategy, ["rules", "exit"])
     risk_controls_config = get_in(strategy, ["params", "risk_controls"])
     exit_strategy_config = get_in(strategy, ["params", "exit_strategy"])
-    position_sizing_config = Map.get(strategy, "position_sizing", %{"method" => "fixed_qty", "qty" => 1})
+
+    position_sizing_config =
+      Map.get(strategy, "position_sizing", %{"method" => "fixed_qty", "qty" => 1})
 
     symbol_names =
       signal_specs
@@ -691,12 +742,33 @@ defmodule TradingCore.Backtest do
 
         case acc.position do
           nil ->
-            maybe_enter(acc, symbol, bar, next_bar, snapshot, entry_rule, direction,
-              risk_controls_config, position_sizing_config, bars, index, opts)
+            maybe_enter(
+              acc,
+              symbol,
+              bar,
+              next_bar,
+              snapshot,
+              entry_rule,
+              direction,
+              risk_controls_config,
+              position_sizing_config,
+              bars,
+              index,
+              opts
+            )
 
           position ->
-            maybe_exit(acc, symbol, bar, next_bar, snapshot, position, exit_rule,
-              exit_strategy_config, direction)
+            maybe_exit(
+              acc,
+              symbol,
+              bar,
+              next_bar,
+              snapshot,
+              position,
+              exit_rule,
+              exit_strategy_config,
+              direction
+            )
         end
       end)
 
@@ -740,7 +812,9 @@ defmodule TradingCore.Backtest do
       {ordered, visited}
     else
       visited = MapSet.put(visited, name)
-      deps = spec_dependencies(Map.fetch!(specs, name)) |> Enum.filter(&MapSet.member?(name_set, &1))
+
+      deps =
+        spec_dependencies(Map.fetch!(specs, name)) |> Enum.filter(&MapSet.member?(name_set, &1))
 
       {ordered, visited} =
         Enum.reduce(deps, {ordered, visited}, fn dep, {ordered, visited} ->
@@ -928,7 +1002,13 @@ defmodule TradingCore.Backtest do
     result =
       if is_nil(direction_v) or is_nil(gate_v),
         do: nil,
-        else: Signals.regime(direction_v, gate_v, to_decimal(tick_deadband), to_decimal(vix_gate_zscore))
+        else:
+          Signals.regime(
+            direction_v,
+            gate_v,
+            to_decimal(tick_deadband),
+            to_decimal(vix_gate_zscore)
+          )
 
     {result, []}
   end
@@ -953,13 +1033,26 @@ defmodule TradingCore.Backtest do
   ## Entry
   ## -----------------------------------------------------------------------
 
-  defp maybe_enter(acc, _symbol, _bar, next_bar, snapshot, entry_rule, direction,
-         risk_controls_config, position_sizing_config, bars, index, opts) do
+  defp maybe_enter(
+         acc,
+         _symbol,
+         _bar,
+         next_bar,
+         snapshot,
+         entry_rule,
+         direction,
+         risk_controls_config,
+         position_sizing_config,
+         bars,
+         index,
+         opts
+       ) do
     if next_bar != nil and RuleEngine.evaluate(entry_rule, snapshot) do
       entry_price = next_bar.open
       entry_at = next_bar.ts
 
-      {stop_loss_price, take_profit_price} = RiskControls.levels(entry_price, risk_controls_config, direction)
+      {stop_loss_price, take_profit_price} =
+        RiskControls.levels(entry_price, risk_controls_config, direction)
 
       sizing_context =
         build_sizing_context(position_sizing_config, entry_price, bars, index, opts)
@@ -995,7 +1088,17 @@ defmodule TradingCore.Backtest do
 
     case estimate_daily_vol(bars, index, window) do
       {:ok, daily_vol} ->
-        %{daily_vol: daily_vol, price: entry_price, target_dollar_volatility: target_dollar_volatility}
+        %{
+          daily_vol: daily_vol,
+          price: entry_price,
+          target_dollar_volatility: target_dollar_volatility,
+          # A backtest never submits a real broker order — nothing here
+          # is subject to IBKR's live-order fractional-share restriction
+          # (see PositionSizing's own moduledoc, "Fractional shares"), so
+          # this always uses the exact theoretical quantity rather than
+          # rounding, for the most accurate simulated P&L.
+          fractional_shares_enabled: true
+        }
 
       :insufficient_data ->
         %{}
@@ -1060,7 +1163,17 @@ defmodule TradingCore.Backtest do
   ## Exit
   ## -----------------------------------------------------------------------
 
-  defp maybe_exit(acc, symbol, bar, next_bar, snapshot, position, exit_rule, exit_strategy_config, direction) do
+  defp maybe_exit(
+         acc,
+         symbol,
+         bar,
+         next_bar,
+         snapshot,
+         position,
+         exit_rule,
+         exit_strategy_config,
+         direction
+       ) do
     current_price = bar.close
 
     position = apply_ratchet(position, current_price, direction, exit_strategy_config)
@@ -1085,10 +1198,22 @@ defmodule TradingCore.Backtest do
   end
 
   defp apply_ratchet(position, _current_price, _direction, nil), do: position
+
   defp apply_ratchet(position, current_price, direction, exit_strategy_config) do
-    case ExitStrategy.check(position.entry_price, current_price, direction, exit_strategy_config, position.state) do
+    case ExitStrategy.check(
+           position.entry_price,
+           current_price,
+           direction,
+           exit_strategy_config,
+           position.state
+         ) do
       {:ratchet, new_stop, state_updates} ->
-        %{position | stop_loss_price: new_stop, take_profit_price: nil, state: Map.merge(position.state, state_updates)}
+        %{
+          position
+          | stop_loss_price: new_stop,
+            take_profit_price: nil,
+            state: Map.merge(position.state, state_updates)
+        }
 
       {:trail, new_stop, state_updates} ->
         %{position | stop_loss_price: new_stop, state: Map.merge(position.state, state_updates)}
@@ -1129,7 +1254,9 @@ defmodule TradingCore.Backtest do
   defp force_close_open_position(%{position: nil, runs: runs}, _symbol, _last_bar), do: runs
 
   defp force_close_open_position(%{position: position, runs: runs}, symbol, last_bar) do
-    run = close_run(symbol, position, position.direction, last_bar.close, last_bar.ts, "end_of_data")
+    run =
+      close_run(symbol, position, position.direction, last_bar.close, last_bar.ts, "end_of_data")
+
     [run | runs]
   end
 

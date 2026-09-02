@@ -508,7 +508,12 @@ defmodule TradingCore.BacktestTest do
   describe "volatility_target sizing" do
     test "estimate_daily_vol/3 matches a hand-computed stdev of daily returns" do
       # Returns: (102-100)/100=0.02, (99-102)/102≈-0.029412, (105-99)/99≈0.060606
-      bars = [bar(0, 100, 101, 99, 100), bar(1, 101, 103, 100, 102), bar(2, 100, 101, 97, 99), bar(3, 103, 106, 98, 105)]
+      bars = [
+        bar(0, 100, 101, 99, 100),
+        bar(1, 101, 103, 100, 102),
+        bar(2, 100, 101, 97, 99),
+        bar(3, 103, 106, 98, 105)
+      ]
 
       assert {:ok, daily_vol} = Backtest.estimate_daily_vol(bars, 3, 20)
 
@@ -519,7 +524,10 @@ defmodule TradingCore.BacktestTest do
       ]
 
       mean = Enum.sum(returns) / length(returns)
-      variance = Enum.sum(Enum.map(returns, fn r -> (r - mean) * (r - mean) end)) / length(returns)
+
+      variance =
+        Enum.sum(Enum.map(returns, fn r -> (r - mean) * (r - mean) end)) / length(returns)
+
       expected = :math.sqrt(variance)
 
       assert_in_delta Decimal.to_float(daily_vol), expected, 0.0001
@@ -613,7 +621,11 @@ defmodule TradingCore.BacktestTest do
 
       signal_specs = %{
         "close_price" => %{kind: :price},
-        "close_derivative" => %{kind: :derivative, parent: "close_price", window_ms: :timer.minutes(10)}
+        "close_derivative" => %{
+          kind: :derivative,
+          parent: "close_price",
+          window_ms: :timer.minutes(10)
+        }
       }
 
       # Rising prices -> positive derivative once at least 2 samples exist.
