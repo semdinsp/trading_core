@@ -189,7 +189,12 @@ defmodule TradingCore.RiskControlsTest do
     end
 
     test "returns nil when neither level is hit" do
-      assert RiskControls.check(Decimal.new("105"), Decimal.new("90"), Decimal.new("100"), "short") ==
+      assert RiskControls.check(
+               Decimal.new("105"),
+               Decimal.new("90"),
+               Decimal.new("100"),
+               "short"
+             ) ==
                nil
     end
   end

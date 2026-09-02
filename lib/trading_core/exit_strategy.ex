@@ -130,8 +130,14 @@ defmodule TradingCore.ExitStrategy do
     end
   end
 
-  defp check_trailing(_entry_price, _current_price, _direction, _config_missing_trail_pct, _state),
-    do: :no_ratchet
+  defp check_trailing(
+         _entry_price,
+         _current_price,
+         _direction,
+         _config_missing_trail_pct,
+         _state
+       ),
+       do: :no_ratchet
 
   defp trailing_high_water_mark(%{trailing_high_water_mark: %Decimal{} = stored}, _entry_price),
     do: stored

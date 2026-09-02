@@ -19,6 +19,29 @@ defmodule TradingCore.PositionSizing do
   those are in hand.
 
   All arithmetic uses `Decimal`, never floats.
+
+  ## Fractional shares
+
+  `volatility_target`'s `target_dollar_volatility / (daily_vol * price)`
+  division essentially never lands on a whole number. IBKR's API rejects
+  a fractional-quantity order outright ("Fractional-sized order cannot be
+  placed via API" — confirmed live, `trading_live` submitting real
+  orders after `target_dollar_volatility` was lowered to $10, which made
+  a non-integer result far more likely than at a larger budget) even
+  though IBKR's desktop TWS client supports fractional shares for many US
+  names; `trading_system` never submits a real order at all (paper-only),
+  so this restriction is specific to a caller that actually places live
+  orders. `context[:fractional_shares_enabled]` (boolean, required)
+  controls this: `true` returns the raw division result unchanged,
+  `false` rounds UP to the nearest whole share (`Decimal.round(qty, 0,
+  :up)` — never DOWN, so a share count of `0` is never returned; rounding
+  up means the actual dollar exposure taken can run slightly over
+  `target_dollar_volatility`, accepted as the simpler tradeoff). Each app
+  supplies its own `fractional_shares_enabled` app setting (default
+  `false` in both, since neither app can safely rely on live fractional
+  order support yet) — see `TradingLive.PositionSizing`/
+  `TradingSystem.Trading.PositionSizing`'s own callers for where it's
+  read and threaded in.
   """
 
   @doc """
@@ -31,7 +54,10 @@ defmodule TradingCore.PositionSizing do
   - `"volatility_target"` — `target_dollar_volatility / (daily_vol * price)`.
     Requires `context[:daily_vol]`, `context[:price]`, and
     `context[:target_dollar_volatility]`, all as `Decimal` (or values
-    `Decimal.new/1` accepts).
+    `Decimal.new/1` accepts). `context[:fractional_shares_enabled]`
+    (boolean, required) controls whether the raw division result is
+    returned as-is (`true`) or rounded UP to the nearest whole share
+    (`false`) — see the moduledoc's "Fractional shares" section.
 
   Returns `{:ok, Decimal.t()}` or `{:error, reason}`. Never fabricates a
   quantity on error — callers must not fall back to a guessed value.
@@ -50,12 +76,22 @@ defmodule TradingCore.PositionSizing do
              :target_dollar_volatility,
              :target_dollar_volatility_required
            ),
+         {:ok, fractional_shares_enabled} <-
+           fetch_context(
+             context,
+             :fractional_shares_enabled,
+             :fractional_shares_enabled_required
+           ),
          {:ok, daily_vol} <- to_decimal(daily_vol),
          {:ok, price} <- to_decimal(price),
          {:ok, target_dollar_volatility} <- to_decimal(target_dollar_volatility),
          false <- Decimal.eq?(daily_vol, 0),
          false <- Decimal.eq?(price, 0) do
-      {:ok, Decimal.div(target_dollar_volatility, Decimal.mult(daily_vol, price))}
+      qty = Decimal.div(target_dollar_volatility, Decimal.mult(daily_vol, price))
+
+      qty = if fractional_shares_enabled, do: qty, else: Decimal.round(qty, 0, :up)
+
+      {:ok, qty}
     else
       true -> {:error, :daily_volatility_unavailable}
       {:error, _reason} = error -> error
@@ -91,8 +127,13 @@ defmodule TradingCore.PositionSizing do
   each app's own tests, so this helper doesn't force either one to change
   its public error contract. Defaults to `:price_required`.
   """
-  @spec resolve_volatility_target(map(), map(), (String.t(), String.t() | nil ->
-          {:ok, Decimal.t()} | {:error, term()}), keyword()) ::
+  @spec resolve_volatility_target(
+          map(),
+          map(),
+          (String.t(), String.t() | nil ->
+             {:ok, Decimal.t()} | {:error, term()}),
+          keyword()
+        ) ::
           {:ok, Decimal.t()} | {:error, atom()}
   def resolve_volatility_target(config, context, daily_volatility_fn, opts \\ [])
       when is_function(daily_volatility_fn, 2) do
@@ -106,12 +147,19 @@ defmodule TradingCore.PositionSizing do
              :target_dollar_volatility,
              :target_dollar_volatility_required
            ),
+         {:ok, fractional_shares_enabled} <-
+           fetch_context(
+             context,
+             :fractional_shares_enabled,
+             :fractional_shares_enabled_required
+           ),
          exchange <- Map.get(context, :exchange),
          {:ok, daily_vol} <- daily_volatility(daily_volatility_fn, symbol, exchange) do
       calculate_qty(config, %{
         daily_vol: daily_vol,
         price: price,
-        target_dollar_volatility: target_dollar_volatility
+        target_dollar_volatility: target_dollar_volatility,
+        fractional_shares_enabled: fractional_shares_enabled
       })
     end
   end
@@ -153,13 +201,20 @@ defmodule TradingCore.PositionSizing do
              :target_dollar_volatility,
              :target_dollar_volatility_required
            ),
+         {:ok, fractional_shares_enabled} <-
+           fetch_context(
+             context,
+             :fractional_shares_enabled,
+             :fractional_shares_enabled_required
+           ),
          exchange <- Map.get(context, :exchange),
          {:ok, daily_vol} <- daily_volatility(daily_volatility_fn, symbol, exchange),
          {:ok, qty} <-
            calculate_qty(config, %{
              daily_vol: daily_vol,
              price: price,
-             target_dollar_volatility: target_dollar_volatility
+             target_dollar_volatility: target_dollar_volatility,
+             fractional_shares_enabled: fractional_shares_enabled
            }) do
       {:ok, qty, daily_vol}
     end
