@@ -107,11 +107,37 @@ defmodule TradingCore.Signal.Compute do
   `TradingCore.Signal.Spec`'s own base/single-parent/dual-parent split:
 
     * base (own `:symbol`/`:source`, raw ticks): `:plain`, `:momentum`,
-      `:volume`, `:vwap`, `:donchian`, `:rolling_volume`
+      `:volume`, `:vwap`, `:donchian`, `:rolling_volume`, `:spread` (owns
+      *two* symbols — see `Spec`'s own moduledoc, "Why `:spread` is a base
+      kind")
     * single-parent (wraps `:parent`'s emitted values): `:derivative`,
       `:second_derivative`, `:wavelet`, `:self_zscore`
     * dual-parent (`:parent` vs. `:reference`): `:percent_deviation`,
       `:zscore`, `:ratio`, `:regime`
+
+  ## `:spread`'s output is a z-score, like every other kind — extras live on `state`
+
+  `:spread`'s `step/2` still returns `{new_state, value() | :warming_up}`
+  with `value()` a plain `Decimal.t()` z-score, same as every other kind —
+  `@type value :: Decimal.t()` is not widened. Beta, alpha, half-life, and
+  crossing-count (the extra outputs the pairs-trading design calls for) are
+  not threaded through `step/2`'s return; they're read off `state` directly
+  via `spread_extras/1`.
+
+  This was a deliberate choice over the alternative (widening `value()` to
+  `Decimal.t() | map()` for this one kind): every other node in a `Spec`
+  tree — `replay/3`'s `tick_for/4` clauses, `warm/1`, a live caller wiring
+  one kind's output into another as `:parent`/`:reference` — assumes
+  "a kind's value is a scalar I can hand to the next kind's `Decimal`
+  arithmetic unchanged." Making `:spread` return a map would mean either
+  every consumer of a `:parent`/`:reference` value gains a
+  "which field, if this came from a `:spread` node" branch, or `:spread`
+  becomes unusable as an upstream node to any other kind (a strategy that
+  wants `derivative` of a spread's z-score, say) without new plumbing. A
+  strategy that wants beta to size its second leg already holds the same
+  `state` `step/2`/`replay/3` handed it back — `spread_extras/1` reads
+  beta/alpha/half-life/crossings off that state on demand, with no change
+  to the value type, the DAG-composition rules, or `replay/3` itself.
   """
 
   alias TradingCore.Signal.Spec
@@ -180,6 +206,27 @@ defmodule TradingCore.Signal.Compute do
   end
 
   def init(%Spec{kind: :regime}), do: {:ok, %{direction: nil, gate: nil}}
+
+  def init(%Spec{kind: :spread} = spec) do
+    beta_mode = Map.get(spec.params, "beta_mode", "static")
+
+    beta_state =
+      case beta_mode do
+        "rolling_ols" -> %{history: []}
+        "kalman" -> %{filter: nil, sample_count: 0}
+        "static" -> static_beta_alpha(spec.params)
+      end
+
+    {:ok,
+     %{
+       beta_mode: beta_mode,
+       beta_state: beta_state,
+       beta: nil,
+       alpha: nil,
+       spread_history: [],
+       welford: WelfordAcc.new()
+     }}
+  end
 
   ## -----------------------------------------------------------------------
   ## step/2
@@ -376,6 +423,102 @@ defmodule TradingCore.Signal.Compute do
     end
   end
 
+  # :spread's tick carries both raw prices (:value is the Y leg, :reference
+  # the X leg — see Spec's own moduledoc, "Why :spread is a base kind").
+  # beta_mode dispatch mirrors TradingCore.Signals' own one-function-per-
+  # mode split (rolling_ols_beta/4, kalman_beta/4) rather than branching
+  # inside one shared function.
+  def step(%Spec{kind: :spread} = spec, state, %{at: now, value: y, reference: x})
+      when y != nil and x != nil do
+    log_x = x |> to_decimal() |> Decimal.to_float() |> :math.log() |> Decimal.from_float()
+    log_y = y |> to_decimal() |> Decimal.to_float() |> :math.log() |> Decimal.from_float()
+
+    beta_opts = beta_window_opts(spec)
+
+    {beta_state, beta_alpha} =
+      case state.beta_mode do
+        "static" ->
+          {state.beta_state, state.beta_state}
+
+        "rolling_ols" ->
+          {history, result} =
+            Signals.rolling_ols_beta(state.beta_state.history, {log_x, log_y}, now, beta_opts)
+
+          {%{history: history}, result}
+
+        "kalman" ->
+          sample_count = state.beta_state.sample_count
+
+          {filter_state, result} =
+            Signals.kalman_beta(state.beta_state.filter, {log_x, log_y}, sample_count, beta_opts)
+
+          {%{filter: filter_state, sample_count: sample_count + 1}, result}
+      end
+
+    case beta_alpha do
+      nil ->
+        {%{state | beta_state: beta_state}, :warming_up}
+
+      {beta, alpha} ->
+        opts = window_opts(spec)
+        spread = Signals.log_spread(log_x, log_y, beta, alpha, opts)
+
+        {spread_history, welford, zscore} =
+          Signals.self_zscore(state.spread_history, state.welford, spread, now, opts)
+
+        new_state = %{
+          state
+          | beta_state: beta_state,
+            beta: beta,
+            alpha: alpha,
+            spread_history: spread_history,
+            welford: welford
+        }
+
+        {new_state, warm(zscore)}
+    end
+  end
+
+  def step(%Spec{kind: :spread}, state, _tick), do: {state, :warming_up}
+
+  @doc """
+  Beta, alpha, half-life, and crossing-count for a `:spread` node's current
+  `state` — the extra outputs that don't fit `step/2`'s scalar `value()`
+  contract (see this module's moduledoc, "`:spread`'s output is a z-score,
+  like every other kind"). Callable at any point after `init/1` (before
+  warm-up, every field is `nil`/`0` as appropriate); most useful right
+  after a `step/2` call, to read off this tick's fit alongside its z-score.
+
+  `half_life`/`crossings` are computed here, on demand, from the same
+  `state.spread_history` the z-score step already maintains — not
+  precomputed on every `step/2` call — matching the pairs-trading design's
+  call for these to be opt-in extra work, paid only by a caller that asks
+  for them, rather than unconditional per-tick cost every `:spread` node
+  pays whether or not anything downstream reads them.
+
+  Returns `nil` for `:beta`/`:alpha` before the beta estimator has produced
+  its first fit (`static` mode: never, once `spec.params` supplies
+  `"beta"`; `rolling_ols`/`kalman`: until their own minimum-sample rule is
+  met — see `TradingCore.Signals.rolling_ols_beta/4`/`kalman_beta/4`).
+  `:half_life` is `nil` under the same "not mean-reverting" / "not enough
+  samples" conditions `TradingCore.Signals.spread_half_life/1` documents.
+  `:crossings` is `0`, never `nil`, before the spread window has 2 samples.
+  """
+  @spec spread_extras(state()) :: %{
+          beta: Decimal.t() | nil,
+          alpha: Decimal.t() | nil,
+          half_life: float() | nil,
+          crossings: non_neg_integer()
+        }
+  def spread_extras(%{beta: beta, alpha: alpha, spread_history: history, welford: welford}) do
+    %{
+      beta: beta,
+      alpha: alpha,
+      half_life: Signals.spread_half_life(history),
+      crossings: Signals.spread_crossings(history, welford.mean)
+    }
+  end
+
   ## -----------------------------------------------------------------------
   ## replay/3
   ## -----------------------------------------------------------------------
@@ -527,9 +670,14 @@ defmodule TradingCore.Signal.Compute do
   end
 
   # Base kinds only get a real tick when their own series has one at this
-  # exact timeline instant.
+  # exact timeline instant. :spread is base-like (see Spec's own moduledoc,
+  # "Why :spread is a base kind") but its tick carries two raw prices
+  # (:value for its Y leg, :reference for its X leg) rather than one — the
+  # caller building `ticks`/`ticks_by_base_and_at` supplies that shape for
+  # a :spread node directly; this clause forwards it unmodified same as
+  # every other base kind's single-price tick.
   defp tick_for(%Spec{kind: kind} = node, at, ticks_by_base_and_at, _series)
-       when kind in [:plain, :volume, :vwap, :donchian, :rolling_volume] do
+       when kind in [:plain, :volume, :vwap, :donchian, :rolling_volume, :spread] do
     case Map.fetch(ticks_by_base_and_at, node) do
       {:ok, %{^at => tick}} -> tick
       _ -> :not_ready
@@ -624,6 +772,12 @@ defmodule TradingCore.Signal.Compute do
     end
   end
 
+  defp validate_node!(%Spec{kind: :spread, symbol: symbol, reference_symbol: reference_symbol}) do
+    if symbol == nil or reference_symbol == nil do
+      raise ArgumentError, ":spread spec requires both :symbol and :reference_symbol"
+    end
+  end
+
   defp validate_node!(_spec), do: :ok
 
   defp kahn_sort([], _dependents, _indegree, acc), do: Enum.reverse(acc)
@@ -673,6 +827,39 @@ defmodule TradingCore.Signal.Compute do
       nil -> opts
       max -> Keyword.put(opts, :max_history_samples, max)
     end
+  end
+
+  # :spread's beta-estimation window is deliberately independent of its
+  # mu/sigma window (window_opts/1, used for the z-score step) — see
+  # Spec's own moduledoc discussion of the two-window design and this
+  # kind's step/2 clause. Resolved the same way window_opts/1 resolves its
+  # own window: a precomputed millisecond value on params, never a
+  # duration string (see Spec's "Why window_ms is precomputed" section —
+  # the same reasoning applies to this second window).
+  defp beta_window_opts(%Spec{params: params}) do
+    []
+    |> maybe_put_beta_window_ms(params)
+    |> maybe_put_precision(params)
+    |> maybe_put_max_history_samples(params)
+  end
+
+  defp maybe_put_beta_window_ms(opts, params) do
+    case Map.get(params, "beta_window_ms") do
+      nil -> opts
+      window_ms -> Keyword.put(opts, :window_ms, window_ms)
+    end
+  end
+
+  # `static` beta_mode: beta/alpha are supplied once, up front, via
+  # params — never re-estimated — so this reads them at init/1 time and
+  # step/2's "static" branch just echoes them back every tick, same
+  # {beta, alpha} shape rolling_ols_beta/4 and kalman_beta/4 return once
+  # warmed up. Defaults alpha to 0 (a pure ratio-style spread) if the
+  # caller only cares about beta and doesn't supply an intercept.
+  defp static_beta_alpha(params) do
+    beta = Map.fetch!(params, "beta") |> to_decimal()
+    alpha = params |> Map.get("alpha", 0) |> to_decimal()
+    {beta, alpha}
   end
 
   defp warm(nil), do: :warming_up

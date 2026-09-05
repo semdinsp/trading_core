@@ -23,6 +23,14 @@ defmodule TradingCore.Signal.ComputePropertyTest do
   (state threading, `replay/3`'s tick synthesis), which is identical
   machinery regardless of which `TradingCore.Signals` function a given
   kind's `step/2` clause happens to call into.
+
+  `:spread` gets its own coverage below despite being base-like, since it's
+  the one kind whose tick carries two prices instead of one and whose state
+  holds a third kind of accumulator (a beta/alpha estimator) alongside the
+  history/`WelfordAcc` shape every windowed kind already has — worth
+  confirming the same two properties hold for that combination specifically,
+  not just assuming the shared `Compute` machinery covers it because it
+  covers everything else.
   """
 
   use ExUnit.Case, async: true
@@ -149,6 +157,95 @@ defmodule TradingCore.Signal.ComputePropertyTest do
             split_at <- integer(1..59)
           ) do
       spec = %Spec{kind: :derivative, window_ms: :timer.minutes(5)}
+      {:ok, state0} = Compute.init(spec)
+
+      {_final, one_pass} =
+        Enum.reduce(ticks, {state0, []}, fn tick, {state, acc} ->
+          {state, value} = Compute.step(spec, state, tick)
+          {state, [value | acc]}
+        end)
+
+      one_pass = Enum.reverse(one_pass)
+
+      split_at = min(split_at, length(ticks))
+      {first_half, second_half} = Enum.split(ticks, split_at)
+
+      {mid_state, part_a} =
+        Enum.reduce(first_half, {state0, []}, fn tick, {state, acc} ->
+          {state, value} = Compute.step(spec, state, tick)
+          {state, [value | acc]}
+        end)
+
+      resumed_state = mid_state |> :erlang.term_to_binary() |> :erlang.binary_to_term()
+
+      {_final2, part_b} =
+        Enum.reduce(second_half, {resumed_state, []}, fn tick, {state, acc} ->
+          {state, value} = Compute.step(spec, state, tick)
+          {state, [value | acc]}
+        end)
+
+      resumed = Enum.reverse(part_a) ++ Enum.reverse(part_b)
+
+      assert resumed == one_pass
+    end
+  end
+
+  defp spread_tick_series_generator do
+    gen all(
+          count <- integer(3..60),
+          deltas <- list_of(integer(1..30), length: count),
+          y_prices <-
+            list_of(one_of([float(min: 1.0, max: 500.0), integer(1..500)]), length: count),
+          x_prices <-
+            list_of(one_of([float(min: 1.0, max: 500.0), integer(1..500)]), length: count)
+        ) do
+      deltas
+      |> Enum.scan(0, &(&1 + &2))
+      |> Enum.zip(Enum.zip(y_prices, x_prices))
+      |> Enum.map(fn {offset_seconds, {y, x}} ->
+        %{at: DateTime.add(@now, offset_seconds, :second), value: y, reference: x}
+      end)
+    end
+  end
+
+  property "spread (static beta_mode): folding step/2 equals replay/3 for any tick series" do
+    check all(ticks <- spread_tick_series_generator()) do
+      spec = %Spec{
+        kind: :spread,
+        symbol: "Y",
+        reference_symbol: "X",
+        params: %{"beta_mode" => "static", "beta" => "1.5", "alpha" => "0.1"}
+      }
+
+      assert fold(spec, ticks) == Compute.replay(spec, ticks, only: spec)
+    end
+  end
+
+  property "spread (rolling_ols beta_mode): folding step/2 equals replay/3 for any tick series" do
+    check all(ticks <- spread_tick_series_generator()) do
+      spec = %Spec{
+        kind: :spread,
+        symbol: "Y",
+        reference_symbol: "X",
+        window_ms: :timer.minutes(5),
+        params: %{"beta_mode" => "rolling_ols", "beta_window_ms" => :timer.minutes(30)}
+      }
+
+      assert fold(spec, ticks) == Compute.replay(spec, ticks, only: spec)
+    end
+  end
+
+  property "split-and-resume from a serialized state equals a single uninterrupted pass (spread, rolling_ols)" do
+    check all(
+            ticks <- spread_tick_series_generator(),
+            split_at <- integer(1..59)
+          ) do
+      spec = %Spec{
+        kind: :spread,
+        window_ms: :timer.minutes(5),
+        params: %{"beta_mode" => "rolling_ols", "beta_window_ms" => :timer.minutes(30)}
+      }
+
       {:ok, state0} = Compute.init(spec)
 
       {_final, one_pass} =

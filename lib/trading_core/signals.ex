@@ -84,6 +84,18 @@ defmodule TradingCore.Signals do
   price ticks, identical in shape to `TradingSignal.Signals.Momentum`'s
   own logic) is pure "compute a value from a window of samples" math, and
   that shape is what `momentum/4` below covers for both callers.
+
+  ## Spread (pairs trading): new math, not extracted from anywhere
+
+  Unlike every function above, `rolling_ols_beta/4`, `kalman_beta/4`,
+  `log_spread/5`, `spread_half_life/1`, and `spread_crossings/2` have no
+  live `trading_signal` predecessor — they exist to back
+  `TradingCore.Signal.Compute`'s `:spread` kind, a real hedge-ratio pairs
+  spread (as opposed to `:zscore`'s fixed-beta-of-1 `value - reference`).
+  Same conventions apply regardless: no wall clock, `now` as an explicit
+  parameter, rounding into history before it's reused (not just on the
+  emitted value), and `nil` (never a crash) for "not enough samples" or
+  "undefined math" — see each function's own docs for its specific guard.
   """
 
   alias TradingCore.WelfordAcc
@@ -663,6 +675,293 @@ defmodule TradingCore.Signals do
     {_oldest_at, oldest} = List.last(prices)
     Decimal.sub(newest, oldest)
   end
+
+  ## ---------------------------------------------------------------------
+  ## Spread (pairs trading): rolling-OLS / Kalman beta, log-spread zscore,
+  ## half-life, crossing count
+  ## ---------------------------------------------------------------------
+
+  @doc """
+  Incremental rolling-OLS estimate of `(beta, alpha)` in `log_y = beta *
+  log_x + alpha`, refit from scratch over the trimmed `(at, log_x, log_y)`
+  window on every call — same "no cheap batch-remove" tradeoff
+  `self_zscore/5` already accepts for its own `WelfordAcc` (see that
+  function's docs and `TradingCore.WelfordAcc`'s own moduledoc): a rolling
+  window can drop arbitrarily many stale samples in one step, and there is
+  no incremental OLS update that handles removal as cheaply as addition, so
+  this recomputes the closed-form OLS sums over whatever remains in the
+  window rather than trying to maintain a streaming accumulator.
+
+  `new_sample` is `{log_x, log_y}` — the caller (`TradingCore.Signal.Compute`'s
+  `:spread` clause) is responsible for taking logs of the raw prices before
+  calling this; kept out of this function so it composes with `kalman_beta/4`
+  under one contract (`{beta, alpha}` from whatever `(x, y)` pairs it's
+  given) regardless of whether the caller wants log-space or raw-price
+  regression.
+
+  Rounds `log_x`/`log_y` to `:precision` (default #{@default_precision})
+  before they enter `history` — same discipline as every other windowed
+  function here (see this module's moduledoc, "Rounding/precision
+  discipline").
+
+  Returns `{new_history, nil}` until at least 2 samples are in the window,
+  or when `log_x`'s variance in the window is exactly zero (a vertical/
+  undefined regression line — every `log_x` sample identical).
+  """
+  @spec rolling_ols_beta(
+          [{DateTime.t(), Decimal.t(), Decimal.t()}],
+          {sample(), sample()},
+          DateTime.t(),
+          keyword()
+        ) :: {[{DateTime.t(), Decimal.t(), Decimal.t()}], {Decimal.t(), Decimal.t()} | nil}
+  def rolling_ols_beta(history, {log_x, log_y}, now, opts \\ []) do
+    precision = Keyword.get(opts, :precision, @default_precision)
+    window_ms = Keyword.get(opts, :window_ms, @default_window_ms)
+    max_history_samples = Keyword.get(opts, :max_history_samples, @default_max_history_samples)
+
+    rounded_x = log_x |> to_decimal() |> Decimal.round(precision)
+    rounded_y = log_y |> to_decimal() |> Decimal.round(precision)
+
+    new_history =
+      [{now, rounded_x, rounded_y} | history]
+      |> Enum.filter(fn {at, _x, _y} ->
+        DateTime.compare(at, DateTime.add(now, -window_ms, :millisecond)) != :lt
+      end)
+      |> Enum.take(max_history_samples)
+
+    value =
+      case ols(new_history) do
+        nil -> nil
+        {beta, alpha} -> {Decimal.round(beta, precision), Decimal.round(alpha, precision)}
+      end
+
+    {new_history, value}
+  end
+
+  defp ols(history) when length(history) < 2, do: nil
+
+  defp ols(history) do
+    xs = Enum.map(history, fn {_at, x, _y} -> Decimal.to_float(x) end)
+    ys = Enum.map(history, fn {_at, _x, y} -> Decimal.to_float(y) end)
+    n = length(xs)
+
+    mean_x = Enum.sum(xs) / n
+    mean_y = Enum.sum(ys) / n
+
+    {cov_xy, var_x} =
+      Enum.zip(xs, ys)
+      |> Enum.reduce({0.0, 0.0}, fn {x, y}, {cov, var} ->
+        dx = x - mean_x
+        {cov + dx * (y - mean_y), var + dx * dx}
+      end)
+
+    if var_x == 0.0 do
+      nil
+    else
+      beta = cov_xy / var_x
+      alpha = mean_y - beta * mean_x
+      {Decimal.from_float(beta), Decimal.from_float(alpha)}
+    end
+  end
+
+  @doc """
+  Kalman-filter estimate of `(beta, alpha)` in `log_y = beta * log_x +
+  alpha`, treating `[beta, alpha]` as a slowly-drifting 2-vector state
+  (a random walk — `process_var` is the per-tick variance added to each
+  component) observed noisily through `log_y = [log_x, 1] . [beta, alpha] +
+  noise` (`obs_var` is that noise's variance). Same `{beta, alpha}` output
+  contract as `rolling_ols_beta/4` so `TradingCore.Signal.Compute`'s
+  `:spread` clause can dispatch on `beta_mode` without either caller
+  needing a different result shape.
+
+  `state` is `{mean, cov}` — the filter's own `[beta, alpha]` estimate and
+  its `2x2` covariance, both as plain `{float, float}`/`{{float, float},
+  {float, float}}` tuples (no matrix library dependency for a 2x2 system).
+  `nil` state means "not yet initialized" — the first call seeds `mean`
+  from `{0.0, 0.0}` with a wide initial covariance, since a single sample
+  can't estimate a 2-parameter fit; the caller should expect `nil` back for
+  `value` on this first call, then real values from the second call on
+  (mirrors every other kind's "warm up before first value" rule, even
+  though a Kalman filter technically produces *some* number for both
+  fields from tick one — that number is not yet meaningfully converged).
+
+  `opts`: `:process_var` (default `1.0e-5`), `:obs_var` (default `1.0e-3`),
+  `:precision` (default #{@default_precision}, applied to the emitted
+  `beta`/`alpha` only — the filter's own internal state stays full-float
+  precision across calls, same reasoning `WelfordAcc` keeps its running
+  `mean`/`m2` as raw floats rather than rounding between ticks).
+  """
+  @spec kalman_beta(
+          {{float(), float()}, {{float(), float()}, {float(), float()}}} | nil,
+          {sample(), sample()},
+          non_neg_integer(),
+          keyword()
+        ) ::
+          {{{float(), float()}, {{float(), float()}, {float(), float()}}},
+           {Decimal.t(), Decimal.t()} | nil}
+  def kalman_beta(state, {log_x, log_y}, sample_count, opts \\ []) do
+    precision = Keyword.get(opts, :precision, @default_precision)
+    process_var = Keyword.get(opts, :process_var, 1.0e-5)
+    obs_var = Keyword.get(opts, :obs_var, 1.0e-3)
+
+    {mean, cov} = state || {{0.0, 0.0}, {{1.0e6, 0.0}, {0.0, 1.0e6}}}
+
+    x = to_float(log_x)
+    y = to_float(log_y)
+
+    {new_mean, new_cov} = kalman_step(mean, cov, x, y, process_var, obs_var)
+
+    value =
+      if sample_count < 1 do
+        nil
+      else
+        {beta, alpha} = new_mean
+
+        {Decimal.round(Decimal.from_float(beta), precision),
+         Decimal.round(Decimal.from_float(alpha), precision)}
+      end
+
+    {{new_mean, new_cov}, value}
+  end
+
+  # Standard 2-state Kalman predict/update, specialized to a scalar
+  # observation `y = h . [beta, alpha]` with `h = [x, 1]`. Predict step adds
+  # `process_var` to both diagonal covariance entries (random-walk state,
+  # no off-diagonal process noise); update step is the textbook
+  # `K = P h' / (h P h' + r)`, `mean' = mean + K (y - h . mean)`,
+  # `P' = (I - K h) P`, written out by hand for a 2x2 system rather than
+  # pulling in a matrix library for one filter.
+  defp kalman_step({beta, alpha}, {{p11, p12}, {p21, p22}}, x, y, process_var, obs_var) do
+    # Predict.
+    p11 = p11 + process_var
+    p22 = p22 + process_var
+
+    # Innovation covariance: h P h' + r, with h = [x, 1].
+    s = x * x * p11 + 2 * x * p12 + p22 + obs_var
+
+    # Kalman gain: P h' / s.
+    k1 = (x * p11 + p12) / s
+    k2 = (x * p21 + p22) / s
+
+    residual = y - (x * beta + alpha)
+
+    new_beta = beta + k1 * residual
+    new_alpha = alpha + k2 * residual
+
+    new_p11 = p11 - k1 * (x * p11 + p12)
+    new_p12 = p12 - k1 * (x * p12 + p22)
+    new_p21 = p21 - k2 * (x * p11 + p12)
+    new_p22 = p22 - k2 * (x * p12 + p22)
+
+    {{new_beta, new_alpha}, {{new_p11, new_p12}, {new_p21, new_p22}}}
+  end
+
+  @doc """
+  The log-space pairs spread `log_y - beta * log_x - alpha`, rounded to
+  `:precision` (default #{@default_precision}) — the quantity
+  `TradingCore.Signal.Compute`'s `:spread` clause feeds into `self_zscore/5`
+  to get the mean-reversion z-score, once `rolling_ols_beta/4`/
+  `kalman_beta/4` (or a fixed `static`-mode `beta`/`alpha`) has produced
+  this tick's `beta`/`alpha`. Log-space (rather than a raw `y - beta * x`
+  subtraction) is what keeps `beta` stable regardless of the pair's price
+  level — see this kind's own design doc for why raw-price spread isn't
+  offered as an alternative here.
+  """
+  @spec log_spread(sample(), sample(), Decimal.t(), Decimal.t(), keyword()) :: Decimal.t()
+  def log_spread(log_x, log_y, beta, alpha, opts \\ []) do
+    precision = Keyword.get(opts, :precision, @default_precision)
+
+    log_y
+    |> to_decimal()
+    |> Decimal.sub(Decimal.mult(beta, to_decimal(log_x)))
+    |> Decimal.sub(alpha)
+    |> Decimal.round(precision)
+  end
+
+  @doc """
+  Half-life of mean reversion for a rolling window of spread values, in the
+  same time unit as the window's own sample spacing (informally "number of
+  ticks" unless the caller's `history` is evenly time-spaced — see below).
+  Fits `phi` via OLS of `spread_t` on `spread_{t-1}` (an AR(1) coefficient:
+  `spread_t = phi * spread_{t-1} + c`), then `half_life = -ln(2) / ln(phi)`.
+
+  Returns `nil` when fewer than 3 samples are in `history` (need at least 2
+  consecutive pairs to fit an AR(1) slope), or when the fitted `phi` isn't
+  strictly inside `(0, 1)` — `phi <= 0` or `phi >= 1` means the series isn't
+  mean-reverting (a random walk or explosive/oscillating series has no
+  finite half-life), same "undefined, not a crash" contract every other
+  guard in this module uses (`percent_deviation/3`'s zero-reference case,
+  `self_zscore/5`'s zero-variance case).
+
+  `history` is the same `history()` shape every other windowed function
+  here uses (newest-first `{DateTime.t(), Decimal.t()}` pairs) — pass the
+  same trimmed window `rolling_ols_beta/4`'s sibling z-score step already
+  maintains, so this reuses that window rather than keeping its own copy.
+  """
+  @spec spread_half_life(history()) :: float() | nil
+  def spread_half_life(history) when length(history) < 3, do: nil
+
+  def spread_half_life(history) do
+    values = history |> Enum.map(fn {_at, v} -> Decimal.to_float(v) end) |> Enum.reverse()
+
+    laggeds = Enum.slice(values, 0, length(values) - 1)
+    currents = Enum.slice(values, 1, length(values) - 1)
+
+    n = length(laggeds)
+    mean_lag = Enum.sum(laggeds) / n
+    mean_cur = Enum.sum(currents) / n
+
+    {cov, var_lag} =
+      Enum.zip(laggeds, currents)
+      |> Enum.reduce({0.0, 0.0}, fn {lag, cur}, {cov, var} ->
+        dl = lag - mean_lag
+        {cov + dl * (cur - mean_cur), var + dl * dl}
+      end)
+
+    if var_lag == 0.0 do
+      nil
+    else
+      phi = cov / var_lag
+
+      if phi > 0.0 and phi < 1.0 do
+        -:math.log(2) / :math.log(phi)
+      end
+    end
+  end
+
+  @doc """
+  Count of sign changes of `(spread - rolling_mean)` across `history` —
+  how many times the spread has crossed its own rolling mean, a staleness/
+  regime-change gate a strategy can use alongside the z-score itself (a
+  pair whose spread hasn't crossed its mean in a long time despite a large
+  |z| may be trending away rather than about to revert).
+
+  `mean` is the window's current mean (the same `WelfordAcc.t()` mean the
+  z-score step already computed — pass `welford.mean` rather than
+  recomputing it here, so this never disagrees with the z-score's own
+  notion of "the mean"). `history` is the same newest-first window
+  `spread_half_life/1` takes.
+
+  Returns `0` for a window with fewer than 2 samples (nothing to compare
+  against) rather than `nil` — unlike half-life, "no crossings observed
+  yet" is a meaningful count, not an undefined quantity.
+  """
+  @spec spread_crossings(history(), float()) :: non_neg_integer()
+  def spread_crossings(history, _mean) when length(history) < 2, do: 0
+
+  def spread_crossings(history, mean) do
+    history
+    |> Enum.map(fn {_at, v} -> Decimal.to_float(v) - mean end)
+    |> Enum.reverse()
+    |> Enum.map(&sign/1)
+    |> Enum.reject(&(&1 == 0))
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.count(fn [a, b] -> a != b end)
+  end
+
+  defp sign(x) when x > 0, do: 1
+  defp sign(x) when x < 0, do: -1
+  defp sign(_x), do: 0
 
   ## ---------------------------------------------------------------------
   ## Shared helpers

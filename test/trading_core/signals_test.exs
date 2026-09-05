@@ -6,6 +6,16 @@ defmodule TradingCore.SignalsTest do
 
   @base ~U[2026-01-01 09:30:00.000000Z]
 
+  # history() is newest-first everywhere in this module (trim_window/4
+  # prepends each new sample) — builds that shape from a chronologically
+  # ordered list of values, oldest last.
+  defp newest_first_history(values, base) do
+    values
+    |> Enum.with_index()
+    |> Enum.map(fn {v, i} -> {DateTime.add(base, i, :second), Decimal.from_float(v)} end)
+    |> Enum.reverse()
+  end
+
   describe "derivative/4" do
     test "a single sample produces no value yet" do
       {history, value} = Signals.derivative([], Decimal.new(10), @base)
@@ -561,6 +571,171 @@ defmodule TradingCore.SignalsTest do
         end)
 
       assert length(final_prices) == 500
+    end
+  end
+
+  describe "rolling_ols_beta/4" do
+    test "no value until at least 2 samples are in the window" do
+      {history, value} =
+        Signals.rolling_ols_beta([], {Decimal.new("4.0"), Decimal.new("4.5")}, @base,
+          window_ms: :timer.minutes(5)
+        )
+
+      assert value == nil
+      assert length(history) == 1
+    end
+
+    test "recovers a known beta/alpha from a perfect linear relationship" do
+      # log_y = 2 * log_x + 1, exactly, over 5 points -> beta = 2, alpha = 1.
+      points = for x <- 1..5, do: {Decimal.from_float(x * 1.0), Decimal.new(2 * x + 1)}
+
+      {_history, {beta, alpha}} =
+        Enum.reduce(points, {[], nil}, fn {x, y}, {history, _} ->
+          Signals.rolling_ols_beta(history, {x, y}, @base, window_ms: :timer.minutes(30))
+        end)
+
+      assert_in_delta Decimal.to_float(beta), 2.0, 0.0001
+      assert_in_delta Decimal.to_float(alpha), 1.0, 0.0001
+    end
+
+    test "zero variance in log_x yields no value (vertical/undefined regression)" do
+      {history, _} =
+        Signals.rolling_ols_beta([], {Decimal.new("1.0"), Decimal.new("1.0")}, @base,
+          window_ms: :timer.minutes(30)
+        )
+
+      {_history, value} =
+        Signals.rolling_ols_beta(
+          history,
+          {Decimal.new("1.0"), Decimal.new("2.0")},
+          DateTime.add(@base, 1, :second),
+          window_ms: :timer.minutes(30)
+        )
+
+      assert value == nil
+    end
+
+    test "history entries are rounded to the default precision as they're stored" do
+      {history, _value} =
+        Signals.rolling_ols_beta(
+          [],
+          {Decimal.new("1.123456789123"), Decimal.new("2.123456789123")},
+          @base,
+          window_ms: :timer.minutes(5)
+        )
+
+      assert [{@base, stored_x, stored_y}] = history
+      assert Decimal.scale(stored_x) <= 8
+      assert Decimal.scale(stored_y) <= 8
+    end
+
+    test "samples outside the window are trimmed" do
+      {history, _} =
+        Signals.rolling_ols_beta([], {Decimal.new("1.0"), Decimal.new("1.0")}, @base,
+          window_ms: :timer.minutes(5)
+        )
+
+      {history, _} =
+        Signals.rolling_ols_beta(
+          history,
+          {Decimal.new("2.0"), Decimal.new("2.0")},
+          DateTime.add(@base, 6 * 60, :second),
+          window_ms: :timer.minutes(5)
+        )
+
+      assert length(history) == 1
+    end
+  end
+
+  describe "kalman_beta/4" do
+    test "returns nil value on the very first call (not yet converged)" do
+      {_state, value} = Signals.kalman_beta(nil, {1.0, 3.0}, 0)
+      assert value == nil
+    end
+
+    test "converges toward a known beta/alpha from a perfect linear relationship" do
+      points = for x <- 1..200, do: {x * 1.0, 2 * x + 1.0}
+
+      {_final_state, last_value} =
+        Enum.reduce(points, {nil, nil}, fn {x, y}, {state, count_and_value} ->
+          count = if is_nil(count_and_value), do: 0, else: elem(count_and_value, 0) + 1
+          {new_state, value} = Signals.kalman_beta(state, {x, y}, count)
+          {new_state, {count, value}}
+        end)
+
+      {_count, {beta, alpha}} = last_value
+
+      assert_in_delta Decimal.to_float(beta), 2.0, 0.05
+      assert_in_delta Decimal.to_float(alpha), 1.0, 0.5
+    end
+  end
+
+  describe "log_spread/5" do
+    test "computes log_y - beta * log_x - alpha, rounded to precision" do
+      value =
+        Signals.log_spread(
+          Decimal.new("2.0"),
+          Decimal.new("5.0"),
+          Decimal.new("1.5"),
+          Decimal.new("0.5")
+        )
+
+      # 5.0 - 1.5 * 2.0 - 0.5 = 1.5
+      assert Decimal.equal?(value, Decimal.new("1.50000000"))
+    end
+
+    test "zero beta/alpha reduces to log_y alone" do
+      value =
+        Signals.log_spread(Decimal.new("9.0"), Decimal.new("3.0"), Decimal.new(0), Decimal.new(0))
+
+      assert Decimal.equal?(value, Decimal.new("3.00000000"))
+    end
+  end
+
+  describe "spread_half_life/1" do
+    test "nil with fewer than 3 samples" do
+      history = [
+        {@base, Decimal.new("1.0")},
+        {DateTime.add(@base, 1, :second), Decimal.new("2.0")}
+      ]
+
+      assert Signals.spread_half_life(history) == nil
+    end
+
+    test "nil for a non-mean-reverting (random-walk-like) series" do
+      # Strictly increasing spread: phi from AR(1) regression will be >= 1.
+      history = newest_first_history(for(i <- 1..10, do: i * 1.0), @base)
+
+      assert Signals.spread_half_life(history) == nil
+    end
+
+    test "a finite positive half-life for a mean-reverting oscillating series" do
+      # spread_t = 0.5 * spread_{t-1} (phi = 0.5) -> half_life = -ln(2)/ln(0.5) = 1.0
+      values = Enum.scan(1..15, 100.0, fn _i, prev -> prev * 0.5 end)
+      history = newest_first_history(values, @base)
+
+      half_life = Signals.spread_half_life(history)
+
+      assert half_life != nil
+      assert_in_delta half_life, 1.0, 0.01
+    end
+  end
+
+  describe "spread_crossings/2" do
+    test "zero with fewer than 2 samples" do
+      history = [{@base, Decimal.new("1.0")}]
+      assert Signals.spread_crossings(history, 0.0) == 0
+    end
+
+    test "counts sign changes of (spread - mean) across the window" do
+      # Values relative to mean 0.0: +1, -1, +1, -1 -> 3 crossings.
+      history = newest_first_history([1.0, -1.0, 1.0, -1.0], @base)
+      assert Signals.spread_crossings(history, 0.0) == 3
+    end
+
+    test "no crossings when the spread stays on one side of the mean" do
+      history = newest_first_history([1.0, 2.0, 1.5, 3.0], @base)
+      assert Signals.spread_crossings(history, 0.0) == 0
     end
   end
 
