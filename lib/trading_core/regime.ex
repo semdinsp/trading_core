@@ -187,6 +187,10 @@ defmodule TradingCore.Regime do
   ## Classification
   ## ---------------------------------------------------------------------
 
+  @doc "The default `{low, high}` absolute vol bands `classify_vol_absolute/2` uses when not given its own — `{15.0, 22.0}`. Exposed so a caller (e.g. hysteresis code deciding which boundary a state transition crossed) can reference the same bands without duplicating the literal."
+  @spec default_vol_bands() :: {Decimal.t(), Decimal.t()}
+  def default_vol_bands, do: @default_vol_bands
+
   @doc """
   Absolute-band volatility classification: `:calm` below the low band,
   `:stressed` at or above the high band, `:normal` in between. `bands`
