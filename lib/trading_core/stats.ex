@@ -2,74 +2,115 @@ defmodule TradingCore.Stats do
   @moduledoc """
   Shared statistical helpers for strategy performance metrics.
 
-  ## Why this module exists
+  ## Naming law
 
-  Three different z-constants were in use across `trading_system` and
-  `trading_live` for what every call site documented as a "90% bound":
-  1.645 (one-sided 95% / two-sided 90%) in `trading_system`'s universe
-  metrics, and 1.2816 (one-sided 90% / two-sided 80%) in both apps'
-  `expectancy_by_regime`. Both are individually defensible critical
-  values, but having both under the same field name `lcb90` in the same
-  system means a version's `lcb90` from one payload and a bucket's
-  `lcb90` from another were not the same kind of number, with nothing in
-  either payload saying so.
+  A field named `lcbNN` / `ucbNN` is the **one-sided NN% bound**. `lcb90`
+  means "90% confident the true mean exceeds this." It does not mean
+  "the lower end of a 90% interval" — that object is `lcb95`, and
+  conflating the two is what originally put three different multipliers
+  in this system under one name (see `confidence_bounds/3`'s own doc for
+  that history).
 
-  Standardised on `z = 1.645` (two-sided 90%) — what the universe
-  metrics (the widest-read surface, and the one promotion gates run on)
-  already used, so this changes the fewest published numbers and moves
-  in the conservative direction everywhere else.
+  Never introduce a bound field whose name does not carry its level.
+
+  ## Why one-sided, not an interval
+
+  Nothing in this system ever uses `{lcb, ucb}` as an interval. Every
+  consumer asks a one-sided question: `/candidates` Gate 2 tests
+  `lcb90 > 0` ("is expectancy positive?"); `/performance/review`
+  criterion A tests `ucb90 < 0` ("is expectancy negative?"). Under a
+  one-sided reading, the two z-constants already in the codebase
+  (1.2816 and 1.645) are both correct and neither needs to change — the
+  collision that motivated `confidence_bounds/3` was never in the
+  arithmetic, it was in the shared name `lcb90` covering two different
+  levels.
   """
 
-  @doc """
-  z for a **90% two-sided** normal confidence interval (one-sided 95%).
+  # One-sided critical values. Do not "improve" 1.645 to the more precise
+  # 1.6448536 — the coarser literal is what every already-published
+  # value (e.g. universe metrics' lcb90/ucb90, now this module's
+  # bounds(..., :p95)) was computed with; tightening it would move
+  # published values in the 5th decimal for no benefit, and would make it
+  # impossible to tell whether a changed number came from a refactor or
+  # a rounding change. A precision change, if ever wanted, is its own
+  # separate, separately-verified commit.
+  @z %{p90: 1.2816, p95: 1.645}
 
-  This is the single source of truth for the multiplier behind every
-  field named `lcb90` / `ucb90` anywhere in the system. Do not inline
-  this value at a call site.
-
-  If a bound at a different confidence level is ever needed, add a named
-  constant and a distinctly named field (`lcb80`, `lcb95`) — never reuse
-  `lcb90` for it.
-  """
-  @z_90_two_sided 1.645
-
-  @spec z_90_two_sided() :: float()
-  def z_90_two_sided, do: @z_90_two_sided
+  @doc "Critical z for a one-sided bound at `:p90` or `:p95`."
+  @spec z(:p90 | :p95) :: float()
+  def z(level) when is_map_key(@z, level), do: Map.fetch!(@z, level)
 
   @doc """
-  Returns `{lcb, ucb}` — the 90% two-sided confidence interval on a
-  sample mean, given its standard deviation `sd` and sample size `n`.
+  One-sided lower bound on a sample mean at `level` (`:p90` or `:p95`) —
+  e.g. `lower_bound(mean, sd, n, :p90)` backs a field named `lcb90`.
 
-  Returns `{nil, nil}` when `n < 2` (no standard error is estimable from
-  a single observation) or when `mean`/`sd` is `nil`. Callers must render
-  `nil` as "—", never as `0.0` — a missing bound and a bound that
-  happens to sit at zero are different facts, and one of them passes a
-  promotion gate.
+  Returns `nil` when `n < 2` (no standard error is estimable from a
+  single observation) or when `mean`/`sd` is `nil`. Callers must render
+  `nil` as "—", never as `0.0` — a bound of exactly `0.0` reads as "just
+  failed to clear," a materially different statement from "not
+  computable," and one of those passes a promotion gate.
 
   Takes and returns `Decimal.t()`, matching how the rest of this system
-  carries money/R values — the `:math.sqrt/1` step is done on values
+  carries money/R values — the `:math.sqrt/1` step is done on a value
   converted to `float` internally so callers never each invent their own
   coercion.
-
-  ## Examples
-
-      iex> {lcb, ucb} = TradingCore.Stats.confidence_bounds(Decimal.new("0.36581"), Decimal.new("1.19838"), 39)
-      iex> Decimal.round(lcb, 5)
-      Decimal.new("0.05014")
-      iex> Decimal.round(ucb, 5)
-      Decimal.new("0.68148")
   """
+  @spec lower_bound(Decimal.t() | nil, Decimal.t() | nil, non_neg_integer() | nil, :p90 | :p95) ::
+          Decimal.t() | nil
+  def lower_bound(mean, sd, n, level), do: shift(mean, sd, n, level, -1)
+
+  @doc "One-sided upper bound on a sample mean at `level` — e.g. `upper_bound(mean, sd, n, :p90)` backs a field named `ucb90`. Same `nil` rules as `lower_bound/4`."
+  @spec upper_bound(Decimal.t() | nil, Decimal.t() | nil, non_neg_integer() | nil, :p90 | :p95) ::
+          Decimal.t() | nil
+  def upper_bound(mean, sd, n, level), do: shift(mean, sd, n, level, 1)
+
+  @doc """
+  `{lower, upper}` at the same one-sided `level` — the pair most callers
+  want, e.g. `bounds(mean, sd, n, :p90)` backs a payload's `{lcb90,
+  ucb90}`.
+
+  These are two independent one-sided statements, not a `level`%
+  interval — the region between them carries roughly `2 * level - 1`
+  coverage (e.g. `:p90` gives ~80% between the pair). Use each bound for
+  its own one-sided question; do not describe the pair as an interval.
+  """
+  @spec bounds(Decimal.t() | nil, Decimal.t() | nil, non_neg_integer() | nil, :p90 | :p95) ::
+          {Decimal.t() | nil, Decimal.t() | nil}
+  def bounds(mean, sd, n, level),
+    do: {lower_bound(mean, sd, n, level), upper_bound(mean, sd, n, level)}
+
+  @doc """
+  Returns `{lcb, ucb}` on a sample mean at the one-sided 95% level —
+  equivalent to `bounds(mean, sd, n, :p95)`.
+
+  Originally documented as a "90% two-sided" interval; every real
+  consumer of this pair asks a one-sided question (see this module's own
+  moduledoc), so `lcb90`/`ucb90` fields backed by this function were
+  actually one-sided-95% bounds wearing a name that said 90%. Kept, and
+  its arithmetic is unchanged — the lower endpoint of a two-sided 90%
+  interval *is* the one-sided 95% lower bound, so this delegation moves
+  no published value.
+  """
+  @deprecated "Use bounds/4 with an explicit level (:p90 or :p95)"
   @spec confidence_bounds(Decimal.t() | nil, Decimal.t() | nil, non_neg_integer() | nil) ::
           {Decimal.t() | nil, Decimal.t() | nil}
-  def confidence_bounds(nil, _sd, _n), do: {nil, nil}
-  def confidence_bounds(_mean, nil, _n), do: {nil, nil}
-  def confidence_bounds(_mean, _sd, n) when is_nil(n) or n < 2, do: {nil, nil}
+  def confidence_bounds(mean, sd, n), do: bounds(mean, sd, n, :p95)
 
-  def confidence_bounds(%Decimal{} = mean, %Decimal{} = sd, n) when is_integer(n) do
+  @doc """
+  z for a one-sided 95% bound — equivalent to `z(:p95)`.
+  """
+  @deprecated "Use z/1 with an explicit level (:p90 or :p95)"
+  @spec z_90_two_sided() :: float()
+  def z_90_two_sided, do: z(:p95)
+
+  defp shift(nil, _sd, _n, _level, _sign), do: nil
+  defp shift(_mean, nil, _n, _level, _sign), do: nil
+  defp shift(_mean, _sd, n, _level, _sign) when is_nil(n) or n < 2, do: nil
+
+  defp shift(%Decimal{} = mean, %Decimal{} = sd, n, level, sign) when is_integer(n) do
     sd_float = Decimal.to_float(sd)
-    margin = @z_90_two_sided * sd_float / :math.sqrt(n)
-    margin_decimal = Decimal.from_float(margin)
+    margin = sign * z(level) * sd_float / :math.sqrt(n)
 
-    {Decimal.sub(mean, margin_decimal), Decimal.add(mean, margin_decimal)}
+    Decimal.add(mean, Decimal.from_float(margin))
   end
 end
