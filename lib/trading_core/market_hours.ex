@@ -21,6 +21,7 @@ defmodule TradingCore.MarketHours do
   """
 
   alias TradingCore.MarketHours.Session
+  alias TradingCore.MarketHours.UsEquitiesHolidays
 
   @doc """
   The next UTC instant `session`'s session closes at or after `now`, i.e.
@@ -81,10 +82,13 @@ defmodule TradingCore.MarketHours do
 
   @doc """
   `true` if `session` is currently within its local `start_time`/`end_time`
-  window at `now`, on a day `days_of_week` marks as a trading day — a
-  genuine "is the market open right now" check, unlike `next_close/2` which
-  always returns a future instant regardless of whether `now` falls inside
-  or outside the session.
+  window at `now`, on a day `days_of_week` marks as a trading day and that
+  is not a holiday (per `holiday?/2` for `session.market`, or listed in
+  `session.extra_holidays`) — a genuine "is the market open right now"
+  check, unlike `next_close/2` which always returns a future instant
+  regardless of whether `now` falls inside or outside the session. A
+  holiday is never a valid entry day, exactly like a day `days_of_week`
+  already excludes.
 
   **Real-incident fix (originally 2026-08-15, `trading_system`)**: this used
   to only compare the local clock against `start_time`/`end_time`, with no
@@ -131,14 +135,17 @@ defmodule TradingCore.MarketHours do
   **Real-incident fix (originally 2026-08-15)**: this used to only compare
   the local clock against `end_time`, with no day-of-week check — see
   `open?/2`'s own doc for the incident this was part of. On a non-trading
-  day (per `days_of_week`), this now returns `true` regardless of clock
-  time — deliberately different from `open?/2`'s non-trading-day answer of
-  `false`. The two functions answer different questions: `open?/2` asks "is
-  a fresh entry allowed right now" (a non-trading day is never a yes),
-  while `closed_for_today?/2` asks "should an *already-open* position be
-  force-closed" (a non-trading day is never a reason to leave one open
-  indefinitely — force-close it exactly as if the session had already
-  ended, which for every practical purpose it has). Returns `false` (i.e.
+  day (per `days_of_week`, or a holiday per `holiday?/2` for
+  `session.market` / `session.extra_holidays` — all treated identically,
+  not distinct cases), this now returns
+  `true` regardless of clock time — deliberately different from `open?/2`'s
+  non-trading-day answer of `false`. The two functions answer different
+  questions: `open?/2` asks "is a fresh entry allowed right now" (a
+  non-trading day is never a yes), while `closed_for_today?/2` asks "should
+  an *already-open* position be force-closed" (a non-trading day is never a
+  reason to leave one open indefinitely — force-close it exactly as if the
+  session had already ended, which for every practical purpose it has).
+  Returns `false` (i.e.
   "not yet closed, so don't deactivate on this basis") if `session.enabled`
   is `false` — a disabled session was never open in the first place, so
   "closed" isn't the right read either; a caller requiring *every* relevant
@@ -204,19 +211,21 @@ defmodule TradingCore.MarketHours do
 
     weekday = Date.day_of_week(reference_date)
 
-    weekday not in session.days_of_week or
+    weekday not in session.days_of_week or session_holiday?(session, reference_date) or
       DateTime.compare(now, close_today_utc) != :lt
   end
 
   @doc """
   `true` if `now`'s calendar day, in `session.timezone`, is one of
-  `session.days_of_week` — deliberately independent of `enabled` (unlike
-  `open?/2`/`closed_for_today?/2`, both of which short-circuit to a fixed
-  answer when disabled). Useful for an "is this row unexpectedly disabled
-  during its own trading week" health check, which specifically needs
-  "would this normally be a trading day for this row" as a question
-  independent of the row's current `enabled` value, since `enabled: false`
-  is exactly the state being flagged as suspicious.
+  `session.days_of_week` and not a holiday (per `holiday?/2` for
+  `session.market`, or listed in `session.extra_holidays`) — deliberately
+  independent of `enabled` (unlike `open?/2`/
+  `closed_for_today?/2`, both of which short-circuit to a fixed answer when
+  disabled). Useful for an "is this row unexpectedly disabled during its
+  own trading week" health check, which specifically needs "would this
+  normally be a trading day for this row" as a question independent of the
+  row's current `enabled` value, since `enabled: false` is exactly the
+  state being flagged as suspicious.
   """
   @spec today_is_a_trading_day?(Session.t(), DateTime.t()) :: boolean()
   def today_is_a_trading_day?(%Session{} = session, %DateTime{} = now) do
@@ -224,14 +233,48 @@ defmodule TradingCore.MarketHours do
     trading_day?(session, local_now)
   end
 
+  @doc """
+  `true` if `date` is a market holiday for `market` — a day the exchange is
+  fully closed regardless of what `days_of_week` says. Backed by a static,
+  hardcoded calendar (see `TradingCore.MarketHours.UsEquitiesHolidays`);
+  currently only `"US_EQUITIES"` is recognized. An unrecognized `market`
+  value returns `false` rather than raising or treating the unknown market
+  as always-holiday — same "fail toward not blocking a real trading day"
+  posture the rest of this module already takes (e.g. `open?/2` on a
+  disabled session answers `false`, never a crash).
+  """
+  @spec holiday?(String.t(), Date.t()) :: boolean()
+  def holiday?("US_EQUITIES", %Date{} = date), do: UsEquitiesHolidays.holiday?(date)
+  def holiday?(_market, %Date{}), do: false
+
+  # `date` is a holiday for `session` — either a `holiday?/2` day on
+  # `session.market`'s static calendar, or a date the caller listed in its
+  # own `session.extra_holidays` (an ad-hoc, manually-declared one-off
+  # closure — e.g. an operator toggling a special/unscheduled closure on in
+  # their own app's settings UI). The two sources are ORed together with no
+  # further distinction once combined: both mean "the exchange is fully
+  # closed this day," and every caller in this module treats them
+  # identically.
+  defp session_holiday?(%Session{market: market, extra_holidays: extra_holidays}, %Date{} = date) do
+    holiday?(market, date) or date in extra_holidays
+  end
+
   # `local_now`'s calendar day, in `session.timezone`, is one of
-  # `session.days_of_week` — the actual day-of-week gate `open?/2`,
+  # `session.days_of_week` and not a `session_holiday?/2` day for
+  # `session` — the actual trading-day gate `open?/2`,
   # `closed_for_today?/2`, and `today_is_a_trading_day?/2` are all built
-  # on. Takes an already-shifted `DateTime` (not `now` in its original
-  # zone) since every caller already has `local_now` on hand from its own
-  # `DateTime.shift_zone/2` call and shifting twice would be redundant.
-  defp trading_day?(%Session{days_of_week: days_of_week}, %DateTime{} = local_now) do
-    weekday = local_now |> DateTime.to_date() |> Date.day_of_week()
-    weekday in days_of_week
+  # on. A holiday is treated exactly like a day `days_of_week` already
+  # excludes, not a third distinct case — so it flows through the same
+  # `open?/2` (never a valid entry day) / `closed_for_today?/2`
+  # (force-close exactly as if the session had already ended) semantics as
+  # any other non-trading day, with no separate holiday-specific branching
+  # in either caller. Takes an already-shifted `DateTime` (not `now` in its
+  # original zone) since every caller already has `local_now` on hand from
+  # its own `DateTime.shift_zone/2` call and shifting twice would be
+  # redundant.
+  defp trading_day?(%Session{days_of_week: days_of_week} = session, %DateTime{} = local_now) do
+    date = DateTime.to_date(local_now)
+    weekday = Date.day_of_week(date)
+    weekday in days_of_week and not session_holiday?(session, date)
   end
 end

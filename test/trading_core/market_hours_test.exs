@@ -341,6 +341,96 @@ defmodule TradingCore.MarketHoursTest do
     end
   end
 
+  describe "holiday?/2" do
+    test "true for a known US_EQUITIES holiday" do
+      # 2026-09-07 is Labor Day.
+      assert MarketHours.holiday?("US_EQUITIES", ~D[2026-09-07])
+    end
+
+    test "false for the day before and the day after a holiday" do
+      refute MarketHours.holiday?("US_EQUITIES", ~D[2026-09-06])
+      refute MarketHours.holiday?("US_EQUITIES", ~D[2026-09-08])
+    end
+
+    test "true for an observed date when the underlying holiday falls on a weekend" do
+      # Independence Day 2026-07-04 is a Saturday -> observed Friday 2026-07-03.
+      assert MarketHours.holiday?("US_EQUITIES", ~D[2026-07-03])
+      refute MarketHours.holiday?("US_EQUITIES", ~D[2026-07-04])
+    end
+
+    test "false for an ordinary trading day" do
+      refute MarketHours.holiday?("US_EQUITIES", ~D[2026-07-20])
+    end
+
+    test "false for an unrecognized market value, never raises" do
+      refute MarketHours.holiday?("FOREX", ~D[2026-09-07])
+      refute MarketHours.holiday?("NOT_A_REAL_MARKET", ~D[2026-01-01])
+    end
+  end
+
+  describe "open?/2 on a holiday" do
+    test "false on a holiday even during what would be session hours" do
+      # 2026-09-07 (Labor Day) is a Monday -- would otherwise be a trading day.
+      now = DateTime.new!(~D[2026-09-07], ~T[11:00:00], "America/New_York")
+      refute MarketHours.open?(@us, now)
+    end
+
+    test "true the trading day immediately after a holiday" do
+      now = DateTime.new!(~D[2026-09-08], ~T[11:00:00], "America/New_York")
+      assert MarketHours.open?(@us, now)
+    end
+
+    test "false on an unrecognized market's would-be-holiday date behaves like any ordinary open check" do
+      other_market = %{@us | market: "FOREX"}
+      now = DateTime.new!(~D[2026-09-07], ~T[11:00:00], "America/New_York")
+
+      assert MarketHours.open?(other_market, now)
+    end
+  end
+
+  describe "open?/2 with extra_holidays (manual, app-declared one-off closures)" do
+    test "false on an ordinary weekday manually declared as an ad-hoc holiday" do
+      # 2026-07-20 is an ordinary Monday, not on the static calendar.
+      manual_closure = %{@us | extra_holidays: [~D[2026-07-20]]}
+      now = DateTime.new!(~D[2026-07-20], ~T[11:00:00], "America/New_York")
+
+      refute MarketHours.open?(manual_closure, now)
+    end
+
+    test "true on other ordinary days once the manual closure date has passed" do
+      manual_closure = %{@us | extra_holidays: [~D[2026-07-20]]}
+      now = DateTime.new!(~D[2026-07-21], ~T[11:00:00], "America/New_York")
+
+      assert MarketHours.open?(manual_closure, now)
+    end
+
+    test "still false on the static calendar's own holidays when extra_holidays is unrelated" do
+      manual_closure = %{@us | extra_holidays: [~D[2026-07-20]]}
+      now = DateTime.new!(~D[2026-09-07], ~T[11:00:00], "America/New_York")
+
+      refute MarketHours.open?(manual_closure, now)
+    end
+  end
+
+  describe "closed_for_today?/2 on a holiday" do
+    test "true on a holiday even before what would be the session's start_time" do
+      now = DateTime.new!(~D[2026-09-07], ~T[06:00:00], "America/New_York")
+      assert MarketHours.closed_for_today?(@us, now)
+    end
+
+    test "false the trading day immediately after a holiday, before session open" do
+      now = DateTime.new!(~D[2026-09-08], ~T[06:00:00], "America/New_York")
+      refute MarketHours.closed_for_today?(@us, now)
+    end
+
+    test "true before start_time on a manually declared ad-hoc closure date" do
+      manual_closure = %{@us | extra_holidays: [~D[2026-07-20]]}
+      now = DateTime.new!(~D[2026-07-20], ~T[06:00:00], "America/New_York")
+
+      assert MarketHours.closed_for_today?(manual_closure, now)
+    end
+  end
+
   describe "today_is_a_trading_day?/2" do
     test "true on a weekday in days_of_week, regardless of enabled" do
       disabled = %{@us | enabled: false}
@@ -369,6 +459,18 @@ defmodule TradingCore.MarketHoursTest do
       saturday_only = %{@us | days_of_week: [6]}
 
       assert MarketHours.today_is_a_trading_day?(saturday_only, now)
+    end
+
+    test "false on a holiday even though it's a weekday in days_of_week" do
+      now = DateTime.new!(~D[2026-09-07], ~T[11:00:00], "America/New_York")
+      refute MarketHours.today_is_a_trading_day?(@us, now)
+    end
+
+    test "true on a holiday for a session with an unrecognized market value" do
+      other_market = %{@us | market: "FOREX"}
+      now = DateTime.new!(~D[2026-09-07], ~T[11:00:00], "America/New_York")
+
+      assert MarketHours.today_is_a_trading_day?(other_market, now)
     end
   end
 end
