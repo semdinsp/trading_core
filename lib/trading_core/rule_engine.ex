@@ -25,8 +25,14 @@ defmodule TradingCore.RuleEngine do
   `run_stop_loss_price`, `run_take_profit_price`) is a value the *caller*
   supplies from the run itself, not a real catalog signal. Anything without
   that prefix (`vix_last`, `momentum:SPY:5m`) is expected to resolve
-  through a signal bus. This module itself doesn't enforce or care about
-  the distinction — it just compares whatever's in the snapshot.
+  through a signal bus. A second caller-supplied convention exists
+  alongside `run_`: a name prefixed `regime_` (e.g.
+  `regime_trend_ordinal`, `regime_vol_ordinal`, as used by
+  `trading_system`'s `EntryEvaluator`/`PositionExitCheck`) is a numeric
+  regime classification the caller derived elsewhere — not a
+  `SignalBus`/catalog signal, and not a per-run value either. This module
+  itself doesn't enforce or care about any of these distinctions — it
+  just compares whatever's in the snapshot.
 
   Condition shape:
 
