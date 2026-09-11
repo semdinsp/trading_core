@@ -160,6 +160,20 @@ defmodule TradingCore.RuleEngine do
 
   def signal_names(_other), do: []
 
+  @doc """
+  `true` if the rule tree references either regime pseudo-signal
+  (`regime_trend_ordinal`/`regime_vol_ordinal`) anywhere, including nested
+  inside "all"/"any"/"not". Built on `signal_names/1` rather than a new
+  tree-walk, so this can never disagree with what `signal_names/1` already
+  extracts.
+  """
+  @spec regime_condition?(map() | nil) :: boolean()
+  def regime_condition?(rules) do
+    rules
+    |> signal_names()
+    |> Enum.any?(&(&1 in ["regime_trend_ordinal", "regime_vol_ordinal"]))
+  end
+
   defp leaf_margin(op, left, right) when op in ["gt", "gte", "lt", "lte"] do
     denominator = right |> Decimal.abs() |> Decimal.max(Decimal.new("0.0001"))
 

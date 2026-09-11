@@ -299,4 +299,48 @@ defmodule TradingCore.RuleEngineTest do
       assert RuleEngine.signal_names(%{"unrecognized" => "shape"}) == []
     end
   end
+
+  describe "regime_condition?/1" do
+    test "true when regime_trend_ordinal is nested inside an all combinator" do
+      rule = %{
+        "all" => [
+          %{"signal" => "vix_last", "op" => "lt", "value" => 18},
+          %{"signal" => "regime_trend_ordinal", "op" => "gte", "value" => 0}
+        ]
+      }
+
+      assert RuleEngine.regime_condition?(rule)
+    end
+
+    test "true when regime_vol_ordinal is nested inside an any inside a not" do
+      rule = %{
+        "not" => %{
+          "any" => [
+            %{"signal" => "regime_vol_ordinal", "op" => "lt", "value" => 0}
+          ]
+        }
+      }
+
+      assert RuleEngine.regime_condition?(rule)
+    end
+
+    test "false for a rule tree referencing neither regime pseudo-signal" do
+      rule = %{
+        "all" => [
+          %{"signal" => "momentum:SPY:5m", "op" => "gt", "value" => 0},
+          %{
+            "signal" => "current_price",
+            "op" => "lte",
+            "value_signal" => "run_stop_loss_price"
+          }
+        ]
+      }
+
+      refute RuleEngine.regime_condition?(rule)
+    end
+
+    test "false for nil rules" do
+      refute RuleEngine.regime_condition?(nil)
+    end
+  end
 end
