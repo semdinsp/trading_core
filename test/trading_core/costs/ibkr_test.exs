@@ -101,4 +101,62 @@ defmodule TradingCore.Costs.IBKRTest do
       assert Decimal.gt?(sell_cost, buy_cost)
     end
   end
+
+  # UNVERIFIED against real fills -- see option_cost/5's own moduledoc
+  # section. These tests pin the arithmetic exactly as implemented (so a
+  # future refactor can't silently change behavior), not against any real
+  # IBKR options trade confirmation the way the order_cost/4 tests above
+  # are pinned against real fills.
+  describe "option_cost/5 (Fixed plan, UNVERIFIED against real fills)" do
+    test "1 contract, small notional -- the $1.00 minimum dominates the $0.65/contract rate" do
+      contracts = Decimal.new("1")
+      notional = Decimal.new("250.00")
+
+      cost = IBKR.option_cost(contracts, notional, :sell, :fixed)
+
+      # base = max(1.00, 1*0.65) = 1.00
+      # clearing = 1*0.025 = 0.025
+      # regulatory (sell) = 250.00*0.0000206 + 1*0.00329 + 1*0.0003 = 0.00374
+      assert Decimal.round(cost, 6) == Decimal.new("1.033740")
+    end
+
+    test "10 contracts, buy -- the per-contract rate dominates the minimum" do
+      contracts = Decimal.new("10")
+      notional = Decimal.new("2500.00")
+
+      cost = IBKR.option_cost(contracts, notional, :buy, :fixed)
+
+      # base = max(1.00, 10*0.65) = 6.50
+      # clearing = 10*0.025 = 0.25
+      # regulatory (buy) = 10*0.0003 = 0.003
+      assert Decimal.round(cost, 4) == Decimal.new("6.7530")
+    end
+
+    test "defaults to the fixed plan when no plan is given" do
+      contracts = Decimal.new("1")
+      notional = Decimal.new("250.00")
+
+      assert IBKR.option_cost(contracts, notional, :buy) ==
+               IBKR.option_cost(contracts, notional, :buy, :fixed)
+    end
+
+    test "sell orders pay strictly more than an otherwise-identical buy order" do
+      contracts = Decimal.new("10")
+      notional = Decimal.new("2500.00")
+
+      buy_cost = IBKR.option_cost(contracts, notional, :buy, :fixed)
+      sell_cost = IBKR.option_cost(contracts, notional, :sell, :fixed)
+
+      assert Decimal.gt?(sell_cost, buy_cost)
+    end
+
+    test "raises on :tiered -- not implemented, IBKR options Tiered is premium+volume bracketed" do
+      contracts = Decimal.new("10")
+      notional = Decimal.new("2500.00")
+
+      assert_raise ArgumentError, ~r/does not implement :tiered/, fn ->
+        IBKR.option_cost(contracts, notional, :buy, :tiered)
+      end
+    end
+  end
 end
