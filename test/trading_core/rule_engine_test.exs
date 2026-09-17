@@ -515,25 +515,158 @@ defmodule TradingCore.RuleEngineTest do
     end
   end
 
-  describe "transition operators: margin/2" do
-    test "reports 1.0 when the transition fired and 0.0 when it did not" do
-      assert RuleEngine.margin(@sign_flip, %{"deriv" => -0.2, "prev_deriv" => 0.3}) == 1.0
-      assert RuleEngine.margin(@sign_flip, %{"deriv" => 0.2, "prev_deriv" => 0.3}) == 0.0
+  describe "margin_or_nil/2: a transition leg has no margin" do
+    # A transition fired or it didn't -- there is no "how far past the
+    # threshold" reading. Scoring it 1.0/0.0 would smuggle a boolean into
+    # a continuous statistic; averaged across runs that is a fire rate
+    # wearing the name "mean margin".
+    test "a bare transition leg is nil whether or not it fired" do
+      assert RuleEngine.margin_or_nil(@sign_flip, %{"deriv" => -0.2, "prev_deriv" => 0.3}) == nil
+      assert RuleEngine.margin_or_nil(@sign_flip, %{"deriv" => 0.2, "prev_deriv" => 0.3}) == nil
     end
 
-    test "scores 0.0 on a missing prev_, matching the fail-closed evaluate/2" do
-      assert RuleEngine.margin(@sign_flip, %{"deriv" => -0.2}) == 0.0
-    end
-
-    test "margin agrees with evaluate for every transition op" do
+    test "nil for every transition op, independent of the boolean evaluate/2 gives" do
       snapshot = %{"deriv" => -0.5, "prev_deriv" => 0.5}
 
       for op <- ["crosses_above", "crosses_below", "sign_flip", "changed"] do
         condition = %{"signal" => "deriv", "op" => op, "value" => 0}
-        fired = RuleEngine.evaluate(condition, snapshot)
 
-        assert RuleEngine.margin(condition, snapshot) == if(fired, do: 1.0, else: 0.0)
+        assert RuleEngine.margin_or_nil(condition, snapshot) == nil
       end
+    end
+
+    test "nil on a missing prev_ too -- absence is about the operator, not the data" do
+      assert RuleEngine.margin_or_nil(@sign_flip, %{"deriv" => -0.2}) == nil
+    end
+
+    test "evaluate/2 is unaffected -- an absent margin is still a decisive gate" do
+      assert RuleEngine.evaluate(@sign_flip, %{"deriv" => -0.2, "prev_deriv" => 0.3})
+      refute RuleEngine.evaluate(@sign_flip, %{"deriv" => 0.2, "prev_deriv" => 0.3})
+    end
+  end
+
+  describe "margin_or_nil/2: absence propagates through combinators" do
+    @threshold %{"signal" => "vix_last", "op" => "lt", "value" => 20}
+
+    test "all averages only the legs that have a margin" do
+      snapshot = %{"vix_last" => 10, "deriv" => -0.5, "prev_deriv" => 0.5}
+      rule = %{"all" => [@threshold, @sign_flip]}
+
+      # The transition leg is in neither the numerator nor the
+      # denominator, so this scores exactly what the lone threshold leg
+      # scored -- not an average of it with a 1.0.
+      threshold_only = RuleEngine.margin_or_nil(@threshold, snapshot)
+
+      assert RuleEngine.margin_or_nil(rule, snapshot) == threshold_only
+      assert threshold_only != 1.0
+    end
+
+    test "all with two threshold legs and a transition averages just the two" do
+      snapshot = %{
+        "vix_last" => 10,
+        "spy_return_5m" => 0.5,
+        "deriv" => -0.5,
+        "prev_deriv" => 0.5
+      }
+
+      other = %{"signal" => "spy_return_5m", "op" => "gt", "value" => 0}
+      rule = %{"all" => [@threshold, @sign_flip, other]}
+
+      a = RuleEngine.margin_or_nil(@threshold, snapshot)
+      b = RuleEngine.margin_or_nil(other, snapshot)
+
+      assert_in_delta RuleEngine.margin_or_nil(rule, snapshot), (a + b) / 2, 0.0001
+    end
+
+    test "any takes the max over the legs that have a margin" do
+      snapshot = %{"vix_last" => 10, "deriv" => -0.5, "prev_deriv" => 0.5}
+      rule = %{"any" => [@threshold, @sign_flip]}
+
+      # A fired transition must not win the max with a 1.0.
+      assert RuleEngine.margin_or_nil(rule, snapshot) ==
+               RuleEngine.margin_or_nil(@threshold, snapshot)
+    end
+
+    test "an all-transition rule has no margin at all" do
+      snapshot = %{"deriv" => -0.5, "prev_deriv" => 0.5, "x" => 1, "prev_x" => 0}
+      rule = %{"all" => [@sign_flip, %{"signal" => "x", "op" => "changed"}]}
+
+      assert RuleEngine.margin_or_nil(rule, snapshot) == nil
+    end
+
+    test "an any-of-all-transitions rule has no margin either" do
+      snapshot = %{"deriv" => -0.5, "prev_deriv" => 0.5, "x" => 1, "prev_x" => 0}
+      rule = %{"any" => [@sign_flip, %{"signal" => "x", "op" => "changed"}]}
+
+      assert RuleEngine.margin_or_nil(rule, snapshot) == nil
+    end
+
+    test "not over a transition leg propagates absence rather than inverting it" do
+      snapshot = %{"deriv" => -0.5, "prev_deriv" => 0.5}
+
+      assert RuleEngine.margin_or_nil(%{"not" => @sign_flip}, snapshot) == nil
+    end
+
+    test "not over a threshold leg still inverts as before" do
+      snapshot = %{"vix_last" => 10}
+      inner = RuleEngine.margin_or_nil(@threshold, snapshot)
+
+      assert RuleEngine.margin_or_nil(%{"not" => @threshold}, snapshot) == 1.0 - inner
+    end
+
+    test "absence propagates up through nesting" do
+      snapshot = %{"deriv" => -0.5, "prev_deriv" => 0.5}
+      rule = %{"all" => [%{"any" => [%{"not" => @sign_flip}]}]}
+
+      assert RuleEngine.margin_or_nil(rule, snapshot) == nil
+    end
+  end
+
+  describe "margin/2 keeps a float contract for callers that store a confidence" do
+    test "an all-transition rule reports 1.0, matching how a nil/empty rule is treated" do
+      snapshot = %{"deriv" => -0.5, "prev_deriv" => 0.5}
+
+      assert RuleEngine.margin_or_nil(@sign_flip, snapshot) == nil
+      assert RuleEngine.margin(@sign_flip, snapshot) == 1.0
+      # ...the same answer margin/2 already gives for "nothing constrains this".
+      assert RuleEngine.margin(nil, snapshot) == 1.0
+      assert RuleEngine.margin(%{}, snapshot) == 1.0
+    end
+
+    test "a mixed rule reports the measurable legs' score as a plain float" do
+      snapshot = %{"vix_last" => 10, "deriv" => -0.5, "prev_deriv" => 0.5}
+      rule = %{"all" => [@threshold, @sign_flip]}
+
+      result = RuleEngine.margin(rule, snapshot)
+
+      assert is_float(result)
+      assert result == RuleEngine.margin_or_nil(@threshold, snapshot)
+    end
+
+    test "threshold-only rules are bit-identical to margin_or_nil" do
+      snapshot = %{"vix_last" => 10, "spy_return_5m" => 0.5}
+
+      rules = [
+        @threshold,
+        %{"signal" => "spy_return_5m", "op" => "gt", "value" => 0},
+        %{"all" => [@threshold, %{"signal" => "spy_return_5m", "op" => "gt", "value" => 0}]},
+        %{"any" => [@threshold, %{"signal" => "spy_return_5m", "op" => "gt", "value" => 0}]},
+        %{"not" => @threshold}
+      ]
+
+      for rule <- rules do
+        assert RuleEngine.margin(rule, snapshot) == RuleEngine.margin_or_nil(rule, snapshot)
+      end
+    end
+
+    test "fail-closed scoring is unchanged: a missing signal still scores 0.0, not nil" do
+      # Absence is reserved for "this operator has no margin", NOT for
+      # "the data was missing" -- that must stay a hard 0.0 so a rule
+      # referencing an unsupplied signal can never be averaged away as
+      # though it were unmeasurable.
+      assert RuleEngine.margin_or_nil(@threshold, %{}) == 0.0
+      assert RuleEngine.margin(@threshold, %{}) == 0.0
+      assert RuleEngine.margin_or_nil(%{"nonsense" => true}, %{}) == 0.0
     end
   end
 
