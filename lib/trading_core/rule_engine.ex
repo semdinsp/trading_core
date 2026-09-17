@@ -48,10 +48,73 @@ defmodule TradingCore.RuleEngine do
   A missing signal in the snapshot fails closed (the condition is not met)
   — a rule referencing a signal nobody supplied should never be silently
   treated as satisfied.
+
+  ## Transition operators and the `prev_` convention
+
+  `gt`/`gte`/`lt`/`lte`/`eq` are stateless threshold tests: they ask "is
+  signal X past threshold T *right now*". A signal jittering around T
+  therefore flips true/false/true/false across consecutive evaluations,
+  and every `true` is a real trigger. On the exit side that is whipsaw —
+  the same position churning on noise, paying real slippage and
+  commission each time.
+
+  The four **transition operators** — `crosses_above`, `crosses_below`,
+  `sign_flip`, `changed` — fire on a *change between evaluations* rather
+  than on a level, which makes them scale-free: no per-signal deadband
+  constant to hand-tune, and nothing that has to mean the same thing
+  across a wavelet derivative and a composite.
+
+  | op | fires when | comparand |
+  |---|---|---|
+  | `crosses_above` | `prev <= T` and `now > T` | `value` or `value_signal` |
+  | `crosses_below` | `prev >= T` and `now < T` | `value` or `value_signal` |
+  | `sign_flip` | `sign(prev) != sign(now)`, neither being zero | none |
+  | `changed` | `prev != now` | none |
+
+  `sign_flip` and `changed` take no comparand — a condition using them
+  carries no `"value"`/`"value_signal"` key.
+
+  A third caller-supplied naming convention carries the prior value: for
+  a condition on signal `X`, the previous evaluation's value is read from
+  `"prev_" <> X`. So `%{"signal" => "wavelet_deriv", "op" =>
+  "crosses_above", "value" => 0}` reads both `"wavelet_deriv"` and
+  `"prev_wavelet_deriv"` from the snapshot. This keeps the engine pure —
+  it holds no state between calls and owns no ETS/process; the caller
+  supplies both edges of the transition, exactly as it already supplies
+  `run_`/`regime_` values.
+
+  `signal_names/1` deliberately does **not** return `prev_` names — only
+  the bare `X`. Callers use that list to decide which signals to resolve
+  from a signal bus, and `prev_X` is not a catalog signal; returning it
+  would make the caller try (and fail) to fetch it. Deriving the `prev_`
+  key is the caller's job.
+
+  A missing `prev_` key fails closed, same as any other missing signal.
+  That is what makes the first evaluation after entry safe: with no prior
+  value seeded, no transition fires on tick one, so a position that opens
+  already past `T` does not instantly exit.
+
+  ### Zero and `sign_flip`
+
+  An exact zero on **either** side does not fire `sign_flip`. Zero is
+  treated as "no sign" rather than as a sign of its own, so `+ → 0 → -`
+  is a single flip observed on the `0 → -` step, not two. The reason is
+  the whipsaw this operator exists to prevent: a signal resting at `0.0`
+  and wobbling a hair either side would otherwise emit a flip on nearly
+  every tick — precisely the churn the transition operators are meant to
+  suppress. Use `changed` if a move off zero should itself be a trigger.
   """
 
   @type snapshot :: %{optional(String.t()) => Decimal.t() | number()}
   @type rule :: map()
+
+  # Ops that compare the current value against the prior evaluation's
+  # (read from `prev_<signal>`) rather than against a threshold alone.
+  @transition_ops ["crosses_above", "crosses_below", "sign_flip", "changed"]
+
+  # The subset of the above that still take a threshold comparand;
+  # `sign_flip`/`changed` carry no "value"/"value_signal".
+  @thresholded_transition_ops ["crosses_above", "crosses_below"]
 
   @doc """
   `true` if `rule` is satisfied against `snapshot`. A `nil` or empty-map rule
@@ -73,6 +136,22 @@ defmodule TradingCore.RuleEngine do
 
   def evaluate(%{"not" => condition}, snapshot) when is_map(condition) do
     not evaluate(condition, snapshot)
+  end
+
+  # Transition operators need both edges (the prior value as well as the
+  # current one), so they fetch `prev_<signal>` alongside `<signal>`
+  # rather than a comparand-vs-level pair. Matched ahead of the general
+  # leaf clause below; the stateless ops never reach here, so their
+  # behavior is bit-identical to before this clause existed.
+  def evaluate(%{"signal" => signal_name, "op" => op} = condition, snapshot)
+      when op in @transition_ops do
+    with {:ok, now} <- fetch_signal(snapshot, signal_name),
+         {:ok, prev} <- fetch_signal(snapshot, prev_key(signal_name)),
+         {:ok, threshold} <- fetch_transition_comparand(op, condition, snapshot) do
+      transition(op, prev, now, threshold)
+    else
+      :error -> false
+    end
   end
 
   def evaluate(%{"signal" => signal_name, "op" => op} = condition, snapshot) do
@@ -119,6 +198,24 @@ defmodule TradingCore.RuleEngine do
     1.0 - margin(condition, snapshot)
   end
 
+  # A transition op has no continuous "how far past the threshold"
+  # reading to report — it either fired on this step or it didn't — so
+  # its margin is the boolean restated as 1.0/0.0. Routed through
+  # evaluate/2 rather than falling into leaf_margin/3's catch-all, both
+  # so the two can never disagree and so this is a deliberate answer
+  # rather than an accidental "unrecognized op scores 0.0".
+  #
+  # Note for consumers that average margins (trading_system's
+  # ConditionStats.avg_margin) or store one as a confidence
+  # (EntryEvaluator's enqueue_entry): averaging a binary yields a
+  # fire-rate, not a mean margin. That is a different statistic under the
+  # same name, so a rule mixing transition and threshold legs produces a
+  # blended number worth reading with care.
+  def margin(%{"signal" => _signal_name, "op" => op} = condition, snapshot)
+      when op in @transition_ops do
+    if evaluate(condition, snapshot), do: 1.0, else: 0.0
+  end
+
   def margin(%{"signal" => signal_name, "op" => op} = condition, snapshot) do
     with {:ok, left} <- fetch_signal(snapshot, signal_name),
          {:ok, right} <- fetch_comparand(condition, snapshot) do
@@ -138,6 +235,17 @@ defmodule TradingCore.RuleEngine do
   a strategy is watching. `nil`/malformed input yields `[]`, same
   fail-closed spirit as `evaluate/2` — nothing to reference means nothing
   to collect.
+
+  Returns **bare names only, never the `prev_` keys** a transition
+  operator also reads (see this module's own moduledoc). This is a
+  contract, not an oversight: callers feed this list to a signal bus to
+  resolve catalog signals, and `prev_X` is not one — it is a value the
+  caller itself carries forward between evaluations. Adding `prev_`
+  names here would make a caller try to fetch a signal that cannot
+  resolve, and callers that require every returned name to be present in
+  a snapshot (e.g. `trading_system`'s `ConditionStats`) would start
+  silently excluding rows. A caller that needs the prior value derives
+  the key itself.
   """
   @spec signal_names(rule() | nil) :: [String.t()]
   def signal_names(nil), do: []
@@ -188,6 +296,50 @@ defmodule TradingCore.RuleEngine do
 
   defp leaf_margin("eq", left, right), do: if(Decimal.equal?(left, right), do: 1.0, else: 0.0)
   defp leaf_margin(_unrecognized_op, _left, _right), do: 0.0
+
+  # The snapshot key carrying `signal_name`'s value from the previous
+  # evaluation. Deliberately not exposed via signal_names/1 — see this
+  # module's own moduledoc for why the caller derives this itself.
+  defp prev_key(signal_name), do: "prev_" <> signal_name
+
+  # crosses_above/crosses_below compare against a threshold, so they
+  # reuse the normal comparand path (literal or another signal).
+  # sign_flip/changed have no comparand at all; {:ok, nil} keeps the
+  # `with` in evaluate/2 uniform across all four.
+  defp fetch_transition_comparand(op, condition, snapshot)
+       when op in @thresholded_transition_ops,
+       do: fetch_comparand(condition, snapshot)
+
+  defp fetch_transition_comparand(_op, _condition, _snapshot), do: {:ok, nil}
+
+  defp transition("crosses_above", prev, now, threshold) do
+    Decimal.compare(prev, threshold) != :gt and Decimal.compare(now, threshold) == :gt
+  end
+
+  defp transition("crosses_below", prev, now, threshold) do
+    Decimal.compare(prev, threshold) != :lt and Decimal.compare(now, threshold) == :lt
+  end
+
+  # Zero on either side is "no sign", not a sign of its own — so + -> 0 -> -
+  # is one flip (on the 0 -> - step), not two, and a signal resting at
+  # 0.0 doesn't emit a flip every tick it wobbles. See this module's own
+  # moduledoc for the reasoning.
+  defp transition("sign_flip", prev, now, _threshold) do
+    prev_sign = sign_of(prev)
+    now_sign = sign_of(now)
+
+    prev_sign != 0 and now_sign != 0 and prev_sign != now_sign
+  end
+
+  defp transition("changed", prev, now, _threshold), do: not Decimal.equal?(prev, now)
+
+  defp sign_of(value) do
+    case Decimal.compare(value, Decimal.new(0)) do
+      :gt -> 1
+      :lt -> -1
+      :eq -> 0
+    end
+  end
 
   defp fetch_comparand(%{"value_signal" => signal_name}, snapshot),
     do: fetch_signal(snapshot, signal_name)
