@@ -74,6 +74,10 @@ defmodule TradingCore.RuleEngine do
   `sign_flip` and `changed` take no comparand — a condition using them
   carries no `"value"`/`"value_signal"` key.
 
+  A transition leg has **no margin** — it fired or it didn't, with no
+  "how far past the threshold" reading — so `margin_or_nil/2` excludes
+  such legs rather than scoring them. See that function's own doc.
+
   A third caller-supplied naming convention carries the prior value: for
   a condition on signal `X`, the previous evaluation's value is read from
   `"prev_" <> X`. So `%{"signal" => "wavelet_deriv", "op" =>
@@ -179,44 +183,99 @@ defmodule TradingCore.RuleEngine do
   strongest passing leg carries it), `"not"` inverts. Same fail-closed
   convention as `evaluate/2`: a missing signal or malformed node scores
   `0.0`, not an error.
+
+  **Transition legs have no margin at all** and are excluded rather than
+  scored — see `margin_or_nil/2`, which this function delegates to. A rule
+  with no measurable leg (every leg a transition op) has no margin to
+  report; this function answers `1.0` for that case, matching how it
+  already treats a `nil`/empty rule — "nothing constrains this" — and
+  keeping the `float()` return a caller like `trading_system`'s
+  `EntryEvaluator.enqueue_entry` can store directly as a confidence. A
+  caller that needs to tell "no measurable margin" apart from "measured,
+  and it cleared comfortably" must call `margin_or_nil/2` instead.
   """
   @spec margin(rule() | nil, snapshot()) :: float()
-  def margin(nil, _snapshot), do: 1.0
-  def margin(rule, _snapshot) when map_size(rule) == 0, do: 1.0
+  def margin(rule, snapshot) do
+    case margin_or_nil(rule, snapshot) do
+      nil -> 1.0
+      value -> value
+    end
+  end
 
-  def margin(%{"all" => conditions}, snapshot) when is_list(conditions) and conditions != [] do
+  @doc """
+  Like `margin/2`, but returns `nil` where no margin is meaningful rather
+  than substituting a number.
+
+  Margin measures *how far past a threshold* a passing leg cleared. A
+  transition operator (`crosses_above`, `crosses_below`, `sign_flip`,
+  `changed`) has no such reading — it either fired on this step or it
+  didn't — so scoring it `1.0`/`0.0` would smuggle a boolean into a
+  continuous statistic. Averaged across runs that produces a *fire rate*
+  wearing the name "mean margin", which is a different number than it
+  appears to be. Such legs are therefore absent, not zero and not one.
+
+  Absence propagates through the combinators:
+
+    * `"all"` averages **only the legs that have a margin** — a transition
+      leg is not in the numerator or the denominator, so an `all` of
+      `[threshold, transition]` scores exactly what the threshold leg
+      scored. All legs absent ⇒ `nil`.
+    * `"any"` takes the max **over the legs that have a margin**. All legs
+      absent ⇒ `nil`.
+    * `"not"` inverts a present margin (`1.0 - m`) and **propagates
+      absence** — the inverse of "no meaningful margin" is still no
+      meaningful margin, not `1.0 - nil`. Inverting an absent value would
+      invent a reading the underlying leg never produced.
+
+  A rule whose legs are all transitions therefore yields `nil` — "margin
+  is not a meaningful question for this rule" — rather than a fire rate.
+
+  This is deliberately *not* the same question as `evaluate/2`: a leg can
+  be absent here while still being decisive there. `evaluate/2` is
+  unaffected by any of this.
+  """
+  @spec margin_or_nil(rule() | nil, snapshot()) :: float() | nil
+  def margin_or_nil(nil, _snapshot), do: 1.0
+  def margin_or_nil(rule, _snapshot) when map_size(rule) == 0, do: 1.0
+
+  def margin_or_nil(%{"all" => conditions}, snapshot)
+      when is_list(conditions) and conditions != [] do
     conditions
-    |> Enum.map(&margin(&1, snapshot))
-    |> then(&(Enum.sum(&1) / length(&1)))
+    |> Enum.map(&margin_or_nil(&1, snapshot))
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> nil
+      measurable -> Enum.sum(measurable) / length(measurable)
+    end
   end
 
-  def margin(%{"any" => conditions}, snapshot) when is_list(conditions) and conditions != [] do
-    conditions |> Enum.map(&margin(&1, snapshot)) |> Enum.max()
+  def margin_or_nil(%{"any" => conditions}, snapshot)
+      when is_list(conditions) and conditions != [] do
+    conditions
+    |> Enum.map(&margin_or_nil(&1, snapshot))
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> nil
+      measurable -> Enum.max(measurable)
+    end
   end
 
-  def margin(%{"not" => condition}, snapshot) when is_map(condition) do
-    1.0 - margin(condition, snapshot)
+  def margin_or_nil(%{"not" => condition}, snapshot) when is_map(condition) do
+    case margin_or_nil(condition, snapshot) do
+      nil -> nil
+      value -> 1.0 - value
+    end
   end
 
-  # A transition op has no continuous "how far past the threshold"
-  # reading to report — it either fired on this step or it didn't — so
-  # its margin is the boolean restated as 1.0/0.0. Routed through
-  # evaluate/2 rather than falling into leaf_margin/3's catch-all, both
-  # so the two can never disagree and so this is a deliberate answer
-  # rather than an accidental "unrecognized op scores 0.0".
-  #
-  # Note for consumers that average margins (trading_system's
-  # ConditionStats.avg_margin) or store one as a confidence
-  # (EntryEvaluator's enqueue_entry): averaging a binary yields a
-  # fire-rate, not a mean margin. That is a different statistic under the
-  # same name, so a rule mixing transition and threshold legs produces a
-  # blended number worth reading with care.
-  def margin(%{"signal" => _signal_name, "op" => op} = condition, snapshot)
-      when op in @transition_ops do
-    if evaluate(condition, snapshot), do: 1.0, else: 0.0
-  end
+  # A transition op reports no margin at all — see this function's own
+  # doc. Matched ahead of the general leaf clause so these never reach
+  # leaf_margin/3 (where they would otherwise hit the unrecognized-op
+  # catch-all and score a misleading 0.0).
+  def margin_or_nil(%{"signal" => _signal_name, "op" => op}, _snapshot)
+      when op in @transition_ops,
+      do: nil
 
-  def margin(%{"signal" => signal_name, "op" => op} = condition, snapshot) do
+  def margin_or_nil(%{"signal" => signal_name, "op" => op} = condition, snapshot) do
     with {:ok, left} <- fetch_signal(snapshot, signal_name),
          {:ok, right} <- fetch_comparand(condition, snapshot) do
       leaf_margin(op, left, right)
@@ -225,7 +284,7 @@ defmodule TradingCore.RuleEngine do
     end
   end
 
-  def margin(_malformed, _snapshot), do: 0.0
+  def margin_or_nil(_malformed, _snapshot), do: 0.0
 
   @doc """
   Every signal name a rule tree references, either as the left-hand
