@@ -774,6 +774,40 @@ defmodule TradingCore.Signal.ComputeTest do
       assert length(state.spread_history) == 1
     end
 
+    test "a frozen leg does not collapse variance, so the floor cannot catch a stale pairing" do
+      # Pins the reason max_leg_staleness_ms is load-bearing rather than a
+      # nicety. It is reasonable to expect Signals.zscore/2's
+      # degenerate-variance floor to catch a stale pairing -- a frozen leg
+      # ought to flatten the spread -- but with one leg frozen the
+      # variance is driven entirely by the leg that still moves, so it
+      # never collapses and an ordinary-looking z-score is emitted. A
+      # stale pairing therefore fails SILENTLY; nothing downstream can
+      # detect it. If this test ever starts asserting :warming_up, the
+      # comment on step/2's :spread clause needs revisiting.
+      spec = %Spec{
+        kind: :spread,
+        symbol: "Y",
+        reference_symbol: "X",
+        params: %{"beta_mode" => "static", "beta" => "1.0"},
+        window_ms: :timer.minutes(5)
+      }
+
+      {:ok, state} = Compute.init(spec)
+
+      # X frozen at 50 throughout; Y creeps on a quiet tape.
+      {state, value} =
+        Enum.reduce(0..9, {state, nil}, fn i, {acc, _} ->
+          Compute.step(spec, acc, %{
+            at: DateTime.add(@now, i, :second),
+            value: 100.0 + i * 0.001,
+            reference: 50.0
+          })
+        end)
+
+      assert %Decimal{} = value,
+             "expected an ordinary reading from a frozen leg, not suppression"
+    end
+
     test "replay/3 threads two raw prices per tick (:value and :reference) through a single spread node" do
       spec = %Spec{
         kind: :spread,

@@ -457,6 +457,21 @@ defmodule TradingCore.Signal.Compute do
   # :warming_up rather than a fabricated pair. Unset (the default) means
   # unbounded, preserving exactly the behavior a caller already feeding
   # joined ticks sees today.
+  #
+  # Why that bound is load-bearing rather than a nicety, for anyone
+  # weighing whether to set it: a stale pairing fails *silently*. It was
+  # reasonable to expect `Signals.zscore/2`'s degenerate-variance floor to
+  # catch it — a frozen leg ought to flatten the spread — but that was
+  # tested and it does not. With one leg frozen the spread's variance is
+  # driven entirely by whichever leg still moves, so it never collapses:
+  # a frozen X against a quiet Y emits z = 1.49, a perfectly ordinary
+  # reading. Nothing downstream flags it, because there is nothing
+  # anomalous to see. The output is arithmetically correct and describes a
+  # distribution that no pair of simultaneous prices ever generated —
+  # the same failure shape as a z-score computed on a too-short window,
+  # and not one any consumer can detect after the fact. A caller feeding
+  # two genuinely independent feeds should set this; only a caller whose
+  # ticks are already joined at the source can safely leave it unset.
   def step(%Spec{kind: :spread} = spec, state, %{at: now} = tick) do
     state = merge_spread_legs(state, tick, now)
 
