@@ -325,6 +325,130 @@ defmodule TradingCore.Signal.ComputeTest do
       assert %Decimal{} = w2
     end
 
+    test "zscore honors its configured window_ms rather than the 5-minute internal default" do
+      # Regression: this clause used to call spread_zscore/5 with no opts,
+      # so window_ms was silently ignored and every :zscore ran on the
+      # 5-minute default. A 30s window must drop a sample older than 30s.
+      spec = %Spec{kind: :zscore, window_ms: :timer.seconds(30)}
+      {:ok, state} = Compute.init(spec)
+
+      {state, _} = Compute.step(spec, state, %{at: @now, value: 100, reference: 90})
+
+      # Well inside a 5-minute window, well outside a 30-second one.
+      later = DateTime.add(@now, 120, :second)
+      {state, _} = Compute.step(spec, state, %{at: later, value: 105, reference: 90})
+
+      # Only the in-window sample survives the trim.
+      assert length(state.history) == 1
+      assert [{^later, _spread}] = state.history
+    end
+
+    test "a wider window_ms keeps samples a narrower one would drop" do
+      wide = %Spec{kind: :zscore, window_ms: :timer.minutes(10)}
+      {:ok, state} = Compute.init(wide)
+
+      {state, _} = Compute.step(wide, state, %{at: @now, value: 100, reference: 90})
+
+      later = DateTime.add(@now, 120, :second)
+      {state, _} = Compute.step(wide, state, %{at: later, value: 105, reference: 90})
+
+      assert length(state.history) == 2
+    end
+
+    test "zscore threads precision and max_history_samples from params" do
+      spec = %Spec{
+        kind: :zscore,
+        window_ms: :timer.minutes(10),
+        params: %{"max_history_samples" => 2}
+      }
+
+      {:ok, state} = Compute.init(spec)
+
+      state =
+        Enum.reduce(0..4, state, fn i, acc ->
+          {next, _} =
+            Compute.step(spec, acc, %{
+              at: DateTime.add(@now, i, :second),
+              value: 100 + i,
+              reference: 90
+            })
+
+          next
+        end)
+
+      assert length(state.history) == 2
+    end
+
+    test "zscore clears its spread window when the injected session_reset reports a new session" do
+      # A :zscore whose reference is a session-resetting kind (a :vwap)
+      # sees that reference jump discontinuously at the boundary. Samples
+      # either side of the jump aren't observations of the same quantity,
+      # so the window is cleared rather than straddling it.
+      session_reset = fn dt -> DateTime.to_date(dt) end
+
+      spec = %Spec{
+        kind: :zscore,
+        window_ms: :timer.hours(48),
+        params: %{"session_reset" => session_reset}
+      }
+
+      {:ok, state} = Compute.init(spec)
+
+      day1 = @now
+      day1_later = DateTime.add(@now, 60, :second)
+      day2 = DateTime.add(@now, 86_400, :second)
+
+      {state, _} = Compute.step(spec, state, %{at: day1, value: 100, reference: 90})
+      {state, _} = Compute.step(spec, state, %{at: day1_later, value: 105, reference: 90})
+      assert length(state.history) == 2
+
+      # New session: the 48h window would otherwise have kept both day1
+      # samples, so anything less than a full clear proves the reset ran.
+      {state, value} = Compute.step(spec, state, %{at: day2, value: 50, reference: 40})
+
+      assert length(state.history) == 1
+      assert [{^day2, _}] = state.history
+      # One sample has no variance yet, so the rebuilt window is warming up.
+      assert value == :warming_up
+    end
+
+    test "zscore with no session_reset keeps a window straddling the boundary (opt-in)" do
+      spec = %Spec{kind: :zscore, window_ms: :timer.hours(48)}
+      {:ok, state} = Compute.init(spec)
+
+      day1 = @now
+      day2 = DateTime.add(@now, 86_400, :second)
+
+      {state, _} = Compute.step(spec, state, %{at: day1, value: 100, reference: 90})
+      {state, _} = Compute.step(spec, state, %{at: day2, value: 105, reference: 90})
+
+      # Unchanged from before this feature existed: both samples retained.
+      assert length(state.history) == 2
+    end
+
+    test "zscore does not clear within a single session" do
+      session_reset = fn dt -> DateTime.to_date(dt) end
+
+      spec = %Spec{
+        kind: :zscore,
+        window_ms: :timer.hours(48),
+        params: %{"session_reset" => session_reset}
+      }
+
+      {:ok, state} = Compute.init(spec)
+
+      {state, _} = Compute.step(spec, state, %{at: @now, value: 100, reference: 90})
+
+      {state, _} =
+        Compute.step(spec, state, %{
+          at: DateTime.add(@now, 3600, :second),
+          value: 105,
+          reference: 90
+        })
+
+      assert length(state.history) == 2
+    end
+
     test "'latest of each' — a tick from just one side recomputes using the other's last-known value" do
       spec = %Spec{kind: :percent_deviation}
       {:ok, state} = Compute.init(spec)

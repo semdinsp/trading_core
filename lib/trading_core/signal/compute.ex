@@ -73,13 +73,16 @@ defmodule TradingCore.Signal.Compute do
 
   ## Session boundaries are injected, never derived from wall-clock
 
-  A `:vwap` or `:volume` spec's `params` may include `"session_reset"`, a
-  1-arity function `DateTime.t() -> Date.t() | term()` — `step/2` calls it
-  once per tick to get "which session does this tick belong to," and
-  resets the kind's own running total(s) back to zero (and, for `:volume`,
+  A `:vwap`, `:volume`, or `:zscore` spec's `params` may include
+  `"session_reset"`, a 1-arity function `DateTime.t() -> Date.t() | term()`
+  — `step/2` calls it once per tick to get "which session does this tick
+  belong to," and resets the kind's own session-scoped state whenever it
+  returns a different value than the previous tick's call did: the running
+  total(s) back to zero for `:vwap`/`:volume` (and, for `:volume`,
   `last_reading` back to `nil` — see `maybe_reset_volume_session/3`'s own
-  comment for why that part matters) whenever it returns a different value
-  than the previous tick's call did. There is no default that reaches for
+  comment for why that part matters), or the accumulated spread window for
+  `:zscore` (see `maybe_reset_zscore_session/3`, which also explains why
+  that one is opt-in rather than always-on). There is no default that reaches for
   `DateTime.utc_now/0` or hardcodes `9:30am America/New_York` inside this
   module — a caller replaying historical data supplies the exact same
   session-boundary function a live caller would (canonically
@@ -169,7 +172,7 @@ defmodule TradingCore.Signal.Compute do
   end
 
   def init(%Spec{kind: :zscore}) do
-    {:ok, %{value: nil, reference: nil, history: [], welford: WelfordAcc.new()}}
+    {:ok, %{value: nil, reference: nil, history: [], welford: WelfordAcc.new(), session: nil}}
   end
 
   def init(%Spec{kind: :regime}), do: {:ok, %{direction: nil, gate: nil}}
@@ -324,7 +327,7 @@ defmodule TradingCore.Signal.Compute do
     end
   end
 
-  def step(%Spec{kind: :zscore}, state, tick) do
+  def step(%Spec{kind: :zscore} = spec, state, tick) do
     state = merge_dual_parent(state, tick)
 
     case ready_dual(state) do
@@ -333,9 +336,19 @@ defmodule TradingCore.Signal.Compute do
 
       true ->
         now = Map.fetch!(tick, :at)
+        session_reset = Map.get(spec.params, "session_reset")
+        state = maybe_reset_zscore_session(state, now, session_reset)
+        opts = window_opts(spec)
 
         {history, welford, result} =
-          Signals.spread_zscore(state.history, state.welford, state.value, state.reference, now)
+          Signals.spread_zscore(
+            state.history,
+            state.welford,
+            state.value,
+            state.reference,
+            now,
+            opts
+          )
 
         {%{state | history: history, welford: welford}, warm(result)}
     end
@@ -716,6 +729,43 @@ defmodule TradingCore.Signal.Compute do
 
     if state.session != nil and session != state.session do
       %{state | cum_volume: Decimal.new(0), last_reading: nil, session: session}
+    else
+      %{state | session: session}
+    end
+  end
+
+  # Same injected-function shape as the two helpers above, clearing
+  # :zscore's own spread window rather than a running total.
+  #
+  # Why a spread z-score wants this at all: a :zscore whose reference is a
+  # session-resetting kind (canonically a `:vwap`) measures value-minus-
+  # reference, and that reference jumps discontinuously the instant its
+  # session rolls — the new session's VWAP restarts from its first tick
+  # rather than continuing yesterday's cumulative average. Spread samples
+  # taken either side of that jump are not observations of the same
+  # quantity, so a window straddling it produces a mean and standard
+  # deviation describing a distribution that never existed, and a z-score
+  # against it is meaningless in a way no window length can fix. Clearing
+  # both `history` and `welford` restarts the distribution with the new
+  # session, at the cost of a fresh warm-up (`spread_zscore/6` returns
+  # nil, hence `:warming_up`, until the rebuilt Welford accumulator has
+  # enough samples for a standard deviation).
+  #
+  # Opt-in: with no "session_reset" in params this is a no-op, so an
+  # existing spec's behavior is unchanged until it asks for this. Unlike
+  # :vwap/:volume — where a missing session_reset means a total that grows
+  # without bound and is plainly wrong — a spread window straddling a
+  # session boundary is merely *stale*, self-healing once the window
+  # slides past the discontinuity, so defaulting this on would be a live
+  # change to every existing :zscore for a problem that partially fixes
+  # itself.
+  defp maybe_reset_zscore_session(state, _now, nil), do: state
+
+  defp maybe_reset_zscore_session(state, now, session_reset) when is_function(session_reset, 1) do
+    session = session_reset.(now)
+
+    if state.session != nil and session != state.session do
+      %{state | history: [], welford: WelfordAcc.new(), session: session}
     else
       %{state | session: session}
     end
