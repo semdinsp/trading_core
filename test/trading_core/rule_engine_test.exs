@@ -200,6 +200,73 @@ defmodule TradingCore.RuleEngineTest do
     end
   end
 
+  # A signal bus can emit nil while warming up. Before this was handled,
+  # a present-with-nil key reached to_decimal/1 — which has clauses for
+  # Decimal/float/integer/binary and none for nil — and raised
+  # FunctionClauseError from inside whatever was evaluating. For the live
+  # callers that is a periodic exit sweep, so one unlucky snapshot would
+  # abort the whole sweep and take every other position's exit check with
+  # it, rather than declining a single condition.
+  describe "a nil value in the snapshot is treated as a missing signal" do
+    test "evaluate/2 fails closed rather than raising" do
+      rule = %{"signal" => "vix_last", "op" => "gt", "value" => 0}
+
+      refute RuleEngine.evaluate(rule, %{"vix_last" => nil})
+      # Identical to the absent-key answer.
+      assert RuleEngine.evaluate(rule, %{"vix_last" => nil}) ==
+               RuleEngine.evaluate(rule, %{})
+    end
+
+    test "a nil value_signal comparand fails closed rather than raising" do
+      rule = %{"signal" => "price", "op" => "gt", "value_signal" => "run_stop"}
+
+      refute RuleEngine.evaluate(rule, %{"price" => 100, "run_stop" => nil})
+    end
+
+    test "a nil rule literal fails closed rather than comparing against zero" do
+      rule = %{"signal" => "vix_last", "op" => "gte", "value" => nil}
+
+      refute RuleEngine.evaluate(rule, %{"vix_last" => 18})
+    end
+
+    test "margin/2 scores 0.0, matching its missing-signal convention" do
+      rule = %{"signal" => "vix_last", "op" => "lt", "value" => 18}
+
+      assert RuleEngine.margin(rule, %{"vix_last" => nil}) == 0.0
+      assert RuleEngine.margin_or_nil(rule, %{"vix_last" => nil}) == 0.0
+    end
+
+    test "a transition op with a nil current or prior value fails closed" do
+      rule = %{"signal" => "deriv", "op" => "sign_flip"}
+
+      refute RuleEngine.evaluate(rule, %{"deriv" => nil, "prev_deriv" => 0.5})
+      refute RuleEngine.evaluate(rule, %{"deriv" => -0.5, "prev_deriv" => nil})
+    end
+
+    test "a nil leg does not poison an any combinator's other legs" do
+      rule = %{
+        "any" => [
+          %{"signal" => "vix_last", "op" => "gt", "value" => 0},
+          %{"signal" => "spy_return_5m", "op" => "gt", "value" => 0}
+        ]
+      }
+
+      # The nil leg declines; the live leg still carries the rule.
+      assert RuleEngine.evaluate(rule, %{"vix_last" => nil, "spy_return_5m" => 1.5})
+    end
+
+    test "a nil leg makes an all combinator false without raising" do
+      rule = %{
+        "all" => [
+          %{"signal" => "vix_last", "op" => "gt", "value" => 0},
+          %{"signal" => "spy_return_5m", "op" => "gt", "value" => 0}
+        ]
+      }
+
+      refute RuleEngine.evaluate(rule, %{"vix_last" => nil, "spy_return_5m" => 1.5})
+    end
+  end
+
   describe "margin/2 — combinators" do
     test "all averages its children's margins" do
       rule = %{
