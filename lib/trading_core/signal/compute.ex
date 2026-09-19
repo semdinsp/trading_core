@@ -223,6 +223,13 @@ defmodule TradingCore.Signal.Compute do
        beta_state: beta_state,
        beta: nil,
        alpha: nil,
+       # Last-known price of each leg, with the timestamp it arrived on,
+       # so a tick carrying only one leg can be paired against the other's
+       # most recent print — see step/2's own :spread clause.
+       y: nil,
+       y_at: nil,
+       x: nil,
+       x_at: nil,
        spread_history: [],
        welford: WelfordAcc.new()
      }}
@@ -423,13 +430,43 @@ defmodule TradingCore.Signal.Compute do
     end
   end
 
-  # :spread's tick carries both raw prices (:value is the Y leg, :reference
-  # the X leg — see Spec's own moduledoc, "Why :spread is a base kind").
+  # :spread's tick carries raw prices (:value is the Y leg, :reference the
+  # X leg — see Spec's own moduledoc, "Why :spread is a base kind").
   # beta_mode dispatch mirrors TradingCore.Signals' own one-function-per-
   # mode split (rolling_ols_beta/4, kalman_beta/4) rather than branching
   # inside one shared function.
-  def step(%Spec{kind: :spread} = spec, state, %{at: now, value: y, reference: x})
-      when y != nil and x != nil do
+  #
+  # A tick may carry one leg or both. Two independent price feeds never
+  # print simultaneously — SPY ticks, then QQQ ticks — so requiring both
+  # on one tick would push last-known-of-each bookkeeping onto every
+  # consumer, each reimplementing it slightly differently. Worse, it would
+  # make the *pairing policy* a caller concern: which Y is matched against
+  # which X decides what distribution the spread's z-score is measuring,
+  # so a live path holding legs in a GenServer and a replay path feeding
+  # pre-joined rows would be computing genuinely different signals. Since
+  # "replay is provably the same computation" is this module's whole
+  # reason for existing, the merge belongs here. Same fix, same reasoning,
+  # as the dual-parent kinds' own merge_dual_parent/2.
+  #
+  # Unlike those kinds, though, staleness matters: a percent_deviation
+  # against a reference that last moved an hour ago is merely stale, but a
+  # pairs spread pairing a fresh Y against an hour-old X reports a
+  # relationship that never held at any instant. `params`
+  # "max_leg_staleness_ms" bounds that — when set, the legs must have
+  # printed within that many milliseconds of each other or the tick yields
+  # :warming_up rather than a fabricated pair. Unset (the default) means
+  # unbounded, preserving exactly the behavior a caller already feeding
+  # joined ticks sees today.
+  def step(%Spec{kind: :spread} = spec, state, %{at: now} = tick) do
+    state = merge_spread_legs(state, tick, now)
+
+    case spread_legs_ready(state, spec, now) do
+      {:ok, y, x} -> compute_spread(spec, state, y, x, now)
+      :error -> {state, :warming_up}
+    end
+  end
+
+  defp compute_spread(spec, state, y, x, now) do
     log_x = x |> to_decimal() |> Decimal.to_float() |> :math.log() |> Decimal.from_float()
     log_y = y |> to_decimal() |> Decimal.to_float() |> :math.log() |> Decimal.from_float()
 
@@ -479,7 +516,41 @@ defmodule TradingCore.Signal.Compute do
     end
   end
 
-  def step(%Spec{kind: :spread}, state, _tick), do: {state, :warming_up}
+  # Stores whichever legs this tick carried, each with its own arrival
+  # time, leaving the other leg's last-known value untouched. Mirrors
+  # merge_dual_parent/2's "latest of each" semantics, plus the per-leg
+  # timestamp spread_legs_ready/3 needs to judge staleness.
+  defp merge_spread_legs(state, tick, now) do
+    state
+    |> put_leg(:y, :y_at, Map.get(tick, :value), now)
+    |> put_leg(:x, :x_at, Map.get(tick, :reference), now)
+  end
+
+  defp put_leg(state, _key, _at_key, nil, _now), do: state
+
+  defp put_leg(state, key, at_key, value, now) do
+    state |> Map.put(key, to_decimal(value)) |> Map.put(at_key, now)
+  end
+
+  # Both legs must be known, and — when "max_leg_staleness_ms" is set —
+  # must have printed within that window of each other. Unset means
+  # unbounded, so a caller already supplying joined ticks is unaffected.
+  defp spread_legs_ready(%{y: nil}, _spec, _now), do: :error
+  defp spread_legs_ready(%{x: nil}, _spec, _now), do: :error
+
+  defp spread_legs_ready(%{y: y, x: x, y_at: y_at, x_at: x_at}, spec, _now) do
+    case Map.get(spec.params, "max_leg_staleness_ms") do
+      nil ->
+        {:ok, y, x}
+
+      max_ms ->
+        if abs(DateTime.diff(y_at, x_at, :millisecond)) <= max_ms do
+          {:ok, y, x}
+        else
+          :error
+        end
+    end
+  end
 
   @doc """
   Beta, alpha, half-life, and crossing-count for a `:spread` node's current
