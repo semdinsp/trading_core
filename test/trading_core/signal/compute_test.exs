@@ -661,13 +661,117 @@ defmodule TradingCore.Signal.ComputeTest do
       assert extras == %{beta: nil, alpha: nil, half_life: nil, crossings: 0}
     end
 
-    test "a tick missing either leg leaves state untouched and stays warming_up" do
+    test "a tick carrying only one leg is remembered rather than discarded" do
+      # Two independent price feeds never print simultaneously, so a
+      # single-leg tick must store that leg and wait for the other -- an
+      # earlier version discarded it, which silently dropped the first
+      # side's reading.
       spec = %Spec{kind: :spread, params: %{"beta_mode" => "static", "beta" => "1.0"}}
       {:ok, state} = Compute.init(spec)
 
-      {new_state, value} = Compute.step(spec, state, %{at: @now, value: nil, reference: 100})
+      {after_x, value} = Compute.step(spec, state, %{at: @now, value: nil, reference: 100})
+
       assert value == :warming_up
-      assert new_state == state
+      assert Decimal.equal?(after_x.x, Decimal.new(100))
+      assert after_x.y == nil
+    end
+
+    test "the other leg arriving on a later tick completes the pair" do
+      spec = %Spec{kind: :spread, params: %{"beta_mode" => "static", "beta" => "1.0"}}
+      {:ok, state} = Compute.init(spec)
+
+      {state, :warming_up} = Compute.step(spec, state, %{at: @now, value: nil, reference: 100})
+
+      # Y arrives alone one second later; X's last-known print is paired
+      # against it rather than the tick being dropped for lacking X.
+      {state, _} =
+        Compute.step(spec, state, %{
+          at: DateTime.add(@now, 1, :second),
+          value: 105,
+          reference: nil
+        })
+
+      assert Decimal.equal?(state.y, Decimal.new(105))
+      assert Decimal.equal?(state.x, Decimal.new(100))
+      # One spread sample recorded from the completed pair.
+      assert length(state.spread_history) == 1
+    end
+
+    test "a single-leg tick updates only that leg, holding the other's last print" do
+      spec = %Spec{kind: :spread, params: %{"beta_mode" => "static", "beta" => "1.0"}}
+      {:ok, state} = Compute.init(spec)
+
+      {state, _} = Compute.step(spec, state, %{at: @now, value: 100, reference: 50})
+
+      {state, _} =
+        Compute.step(spec, state, %{
+          at: DateTime.add(@now, 1, :second),
+          value: 110,
+          reference: nil
+        })
+
+      assert Decimal.equal?(state.y, Decimal.new(110))
+      assert Decimal.equal?(state.x, Decimal.new(50))
+    end
+
+    test "max_leg_staleness_ms rejects a pair whose legs printed too far apart" do
+      spec = %Spec{
+        kind: :spread,
+        params: %{"beta_mode" => "static", "beta" => "1.0", "max_leg_staleness_ms" => 5_000}
+      }
+
+      {:ok, state} = Compute.init(spec)
+
+      {state, _} = Compute.step(spec, state, %{at: @now, value: nil, reference: 50})
+
+      # Y prints 60s after X -- well outside the 5s bound, so pairing a
+      # fresh Y against that stale X would report a relationship that
+      # never held at any instant.
+      {state, value} =
+        Compute.step(spec, state, %{
+          at: DateTime.add(@now, 60, :second),
+          value: 100,
+          reference: nil
+        })
+
+      assert value == :warming_up
+      assert state.spread_history == []
+    end
+
+    test "max_leg_staleness_ms admits a pair whose legs printed close together" do
+      spec = %Spec{
+        kind: :spread,
+        params: %{"beta_mode" => "static", "beta" => "1.0", "max_leg_staleness_ms" => 5_000}
+      }
+
+      {:ok, state} = Compute.init(spec)
+
+      {state, _} = Compute.step(spec, state, %{at: @now, value: nil, reference: 50})
+
+      {state, _} =
+        Compute.step(spec, state, %{
+          at: DateTime.add(@now, 1, :second),
+          value: 100,
+          reference: nil
+        })
+
+      assert length(state.spread_history) == 1
+    end
+
+    test "with no max_leg_staleness_ms, an arbitrarily stale leg still pairs (default unbounded)" do
+      spec = %Spec{kind: :spread, params: %{"beta_mode" => "static", "beta" => "1.0"}}
+      {:ok, state} = Compute.init(spec)
+
+      {state, _} = Compute.step(spec, state, %{at: @now, value: nil, reference: 50})
+
+      {state, _} =
+        Compute.step(spec, state, %{
+          at: DateTime.add(@now, 3600, :second),
+          value: 100,
+          reference: nil
+        })
+
+      assert length(state.spread_history) == 1
     end
 
     test "replay/3 threads two raw prices per tick (:value and :reference) through a single spread node" do
