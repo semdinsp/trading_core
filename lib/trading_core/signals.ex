@@ -244,9 +244,13 @@ defmodule TradingCore.Signals do
   `(sample - mean) / stdev`.
 
   Returns `{new_history, new_welford, nil}` when fewer than 2 samples
-  remain in the window, or when the window's variance is exactly zero (a
-  flat value — dividing by a zero stdev is undefined) — same two "nothing
-  to emit yet" cases the live signal module guards against.
+  remain in the window, or when the window is flat enough that a z-score
+  is meaningless — not merely an *exactly* zero variance, but any stdev
+  negligible against the magnitude of the values themselves. A
+  near-constant window (a quiet or closed tape) otherwise divides by a
+  vanishing stdev and emits a large, confident, meaningless reading; see
+  `zscore/2`'s own comment for the observed case and why the floor is
+  relative rather than absolute.
   """
   @spec self_zscore(history(), WelfordAcc.t(), sample(), DateTime.t(), keyword()) ::
           {history(), WelfordAcc.t(), Decimal.t() | nil}
@@ -272,18 +276,69 @@ defmodule TradingCore.Signals do
     end)
   end
 
+  # Relative floor on the standard deviation, below which a z-score is
+  # reported as `nil` rather than as a number.
+  #
+  # A bare `variance <= 0.0` check only catches an *exactly* constant
+  # window. A near-constant one — every sample identical to ~8 decimal
+  # places, which is what a quiet or closed tape produces — yields a
+  # variance around 1e-17 that passes that check and then divides a
+  # small numerator by a vanishing stdev, emitting a large, confident,
+  # meaningless reading. Observed live: `massive_spy_vwap_zscore` at
+  # -11.49 on a closed Saturday tape, and reproduced here at variance
+  # 9.17e-17 => z = 1.31 from four samples differing only in the 8th
+  # decimal. Rounding the inputs does not prevent it (samples that differ
+  # in the 8th decimal survive precision-8 rounding), and a wider window
+  # only makes it rarer — any sufficiently quiet window reaches it.
+  #
+  # The floor is relative rather than absolute because this helper serves
+  # both `self_zscore/5` (wrapping whatever series its parent emits — a
+  # VIX level near 20, a price near 500) and `spread_zscore/6` (a spread
+  # that may sit near 0.15). No single absolute epsilon is right across
+  # those units.
+  #
+  # Scaled against the larger of |mean| and |sample|, never |mean| alone:
+  # a spread oscillating symmetrically around zero has a mean of ~1e-17
+  # with a genuinely large stdev (0.51 in a reproduced case), so a
+  # mean-only scale would compute a ~1e-26 floor there and suppress
+  # nothing. Taking the magnitude of the observation as well keeps the
+  # floor meaningful exactly where the mean vanishes. When both are ~0 the
+  # series is degenerate in absolute terms too, so the absolute fallback
+  # below is the correct reading.
+  # Calibrated against real cases rather than picked round. Measuring
+  # stdev/scale on each: the 8th-decimal-jitter window that must be
+  # suppressed sits at 9.6e-9, while the tightest *legitimate* window
+  # checked — a price series moving 0.01% — sits at 1.3e-4, and an
+  # ordinary VIX window at 6.2e-2. 1e-6 falls between those two clusters
+  # with ~100x margin on either side, so it suppresses the degenerate
+  # case without touching a genuinely quiet but real one. The absolute
+  # fallback catches a series where both mean and sample are ~0, where
+  # any ratio is meaningless.
+  @degenerate_stdev_ratio 1.0e-6
+  @degenerate_stdev_absolute 1.0e-12
+
   defp zscore(_sample, %{count: count}) when count < 2, do: nil
 
   defp zscore(sample, welford) do
     variance = WelfordAcc.variance(welford)
+    sample_f = Decimal.to_float(sample)
 
-    if variance <= 0.0 do
+    if degenerate_variance?(variance, welford.mean, sample_f) do
       nil
     else
       stdev = :math.sqrt(variance)
-      sample_f = Decimal.to_float(sample)
       Decimal.from_float((sample_f - welford.mean) / stdev)
     end
+  end
+
+  defp degenerate_variance?(variance, _mean, _sample) when variance <= 0.0, do: true
+
+  defp degenerate_variance?(variance, mean, sample) do
+    stdev = :math.sqrt(variance)
+    scale = max(abs(mean), abs(sample))
+    floor = max(scale * @degenerate_stdev_ratio, @degenerate_stdev_absolute)
+
+    stdev < floor
   end
 
   ## ---------------------------------------------------------------------
@@ -360,7 +415,10 @@ defmodule TradingCore.Signals do
   rolling mean/stdev.
 
   Returns `{new_history, new_welford, nil}` under the same "fewer than 2
-  samples" / "zero variance" conditions `self_zscore/5` does.
+  samples" / "degenerate variance" conditions `self_zscore/5` does — the
+  latter matters more here than for `self_zscore/5`, since a spread
+  against a slow-moving reference is exactly the series that goes
+  near-constant on a quiet tape.
   """
   @spec spread_zscore(
           history(),
