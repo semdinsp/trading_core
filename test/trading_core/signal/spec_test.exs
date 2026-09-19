@@ -7,8 +7,14 @@ defmodule TradingCore.Signal.SpecTest do
     assert Enum.sort(Spec.kinds()) ==
              Enum.sort(~w(
                plain momentum derivative second_derivative wavelet volume vwap donchian
-               rolling_volume self_zscore percent_deviation zscore regime ratio
+               rolling_volume self_zscore percent_deviation zscore regime ratio spread
              )a)
+  end
+
+  test ":spread is a base kind, not a dual-parent kind" do
+    assert Spec.base_kind?(:spread)
+    refute Spec.dual_parent_kind?(:spread)
+    refute Spec.single_parent_kind?(:spread)
   end
 
   test "base_kind?/1, single_parent_kind?/1, dual_parent_kind?/1 partition the kind set" do

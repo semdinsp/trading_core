@@ -555,6 +555,139 @@ defmodule TradingCore.Signal.ComputeTest do
     end
   end
 
+  describe "spread" do
+    defp spread_ticks(pairs, opts \\ []) do
+      interval = Keyword.get(opts, :interval, 1)
+
+      pairs
+      |> Enum.with_index()
+      |> Enum.map(fn {{y, x}, i} ->
+        %{at: DateTime.add(@now, i * interval, :second), value: y, reference: x}
+      end)
+    end
+
+    test "static beta_mode: warms up until the mu/sigma window has 2 samples, then emits a z-score" do
+      spec = %Spec{kind: :spread, params: %{"beta_mode" => "static", "beta" => "1.0"}}
+      {:ok, state} = Compute.init(spec)
+
+      {state, first} = Compute.step(spec, state, %{at: @now, value: 100, reference: 100})
+      assert first == :warming_up
+
+      {_state, second} =
+        Compute.step(spec, state, %{
+          at: DateTime.add(@now, 1, :second),
+          value: 110,
+          reference: 100
+        })
+
+      assert %Decimal{} = second
+    end
+
+    test "static beta_mode never re-estimates beta/alpha across ticks" do
+      spec = %Spec{kind: :spread, params: %{"beta_mode" => "static", "beta" => "2.0"}}
+      {:ok, state} = Compute.init(spec)
+
+      ticks = spread_ticks([{100, 50}, {110, 55}, {90, 60}, {120, 40}])
+
+      final_state =
+        Enum.reduce(ticks, state, fn tick, state ->
+          {state, _value} = Compute.step(spec, state, tick)
+          state
+        end)
+
+      extras = Compute.spread_extras(final_state)
+      assert Decimal.equal?(extras.beta, Decimal.new("2.0"))
+      assert Decimal.equal?(extras.alpha, Decimal.new(0))
+    end
+
+    test "static beta_mode defaults alpha to 0 when not supplied" do
+      spec = %Spec{kind: :spread, params: %{"beta_mode" => "static", "beta" => "1.0"}}
+      {:ok, state} = Compute.init(spec)
+
+      {state, _} = Compute.step(spec, state, %{at: @now, value: 100, reference: 100})
+      extras = Compute.spread_extras(state)
+      assert Decimal.equal?(extras.alpha, Decimal.new(0))
+    end
+
+    test "rolling_ols beta_mode re-estimates beta/alpha as ticks arrive" do
+      spec = %Spec{
+        kind: :spread,
+        window_ms: :timer.minutes(30),
+        params: %{"beta_mode" => "rolling_ols", "beta_window_ms" => :timer.minutes(30)}
+      }
+
+      {:ok, state} = Compute.init(spec)
+
+      # log_y = 2 * log_x, exactly, so beta should converge toward 2.
+      pairs = for x <- 1..10, do: {:math.exp(2 * :math.log(x)), x * 1.0}
+
+      ticks = spread_ticks(pairs, interval: 60)
+
+      final_state =
+        Enum.reduce(ticks, state, fn tick, state ->
+          {state, _value} = Compute.step(spec, state, tick)
+          state
+        end)
+
+      extras = Compute.spread_extras(final_state)
+      assert extras.beta != nil
+      assert_in_delta Decimal.to_float(extras.beta), 2.0, 0.01
+    end
+
+    test "kalman beta_mode warms up on the very first tick, then produces beta/alpha" do
+      spec = %Spec{kind: :spread, params: %{"beta_mode" => "kalman"}}
+      {:ok, state} = Compute.init(spec)
+
+      {state, first} = Compute.step(spec, state, %{at: @now, value: 100, reference: 100})
+      assert first == :warming_up
+
+      {state, _second} =
+        Compute.step(spec, state, %{
+          at: DateTime.add(@now, 1, :second),
+          value: 110,
+          reference: 100
+        })
+
+      extras = Compute.spread_extras(state)
+      assert extras.beta != nil
+      assert extras.alpha != nil
+    end
+
+    test "spread_extras/1 returns nil beta/alpha/half_life and 0 crossings before warm-up" do
+      spec = %Spec{kind: :spread, params: %{"beta_mode" => "rolling_ols"}}
+      {:ok, state} = Compute.init(spec)
+
+      extras = Compute.spread_extras(state)
+      assert extras == %{beta: nil, alpha: nil, half_life: nil, crossings: 0}
+    end
+
+    test "a tick missing either leg leaves state untouched and stays warming_up" do
+      spec = %Spec{kind: :spread, params: %{"beta_mode" => "static", "beta" => "1.0"}}
+      {:ok, state} = Compute.init(spec)
+
+      {new_state, value} = Compute.step(spec, state, %{at: @now, value: nil, reference: 100})
+      assert value == :warming_up
+      assert new_state == state
+    end
+
+    test "replay/3 threads two raw prices per tick (:value and :reference) through a single spread node" do
+      spec = %Spec{
+        kind: :spread,
+        symbol: "AAPL",
+        reference_symbol: "MSFT",
+        params: %{"beta_mode" => "static", "beta" => "1.0"}
+      }
+
+      pairs = Enum.map(0..30, fn i -> {100 + i * 1.0, 100 + i * 0.5} end)
+      ticks = spread_ticks(pairs, interval: 1)
+
+      result = Compute.replay(spec, ticks, only: spec)
+
+      assert length(result) == length(ticks)
+      assert Enum.any?(result, &(&1 != :warming_up))
+    end
+  end
+
   describe "replay/3 — DAG resolution" do
     test "resolves a chain (spy plain -> wavelet -> wavelet derivative -> wavelet acceleration) topologically" do
       spy = %Spec{kind: :plain}

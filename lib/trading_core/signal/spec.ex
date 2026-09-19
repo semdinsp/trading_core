@@ -15,16 +15,29 @@ defmodule TradingCore.Signal.Spec do
     * `:kind` — which computation to run. One of `TradingCore.Signal.Compute`'s
       known kinds: `:plain`, `:momentum`, `:derivative`, `:second_derivative`,
       `:wavelet`, `:volume`, `:vwap`, `:donchian`, `:rolling_volume`,
-      `:self_zscore`, `:percent_deviation`, `:zscore`, `:regime`, `:ratio`.
+      `:self_zscore`, `:percent_deviation`, `:zscore`, `:regime`, `:ratio`,
+      `:spread`.
     * `:symbol` — the underlying instrument this spec is ultimately scoped
       to, or `nil` for a spec whose only inputs are its `:parent`/
       `:reference` (every wrapping kind — see `TradingSignal.Signals.SignalDefinition`'s
       own `@base_kinds`/`@dual_parent_kinds`/`@single_parent_kinds` split,
-      which this mirrors).
+      which this mirrors). For `:spread` — a base kind, despite comparing
+      two instruments (see "Why `:spread` is a base kind" below) — this is
+      the "Y" leg (the dependent side of `log_y = beta * log_x + alpha`).
     * `:source` — which feed/provider this spec's raw ticks come from (e.g.
       `"ibkr"`, `"massive"`) — meaningful only for a base kind with its own
       `:symbol`; carried here so a caller building a spec tree from a
-      `SignalDefinition` doesn't need a side-channel.
+      `SignalDefinition` doesn't need a side-channel. For `:spread`, the
+      feed for its `:symbol`/"Y" leg specifically — see `:reference_source`
+      for the "X" leg's feed.
+    * `:reference_symbol` — the "X" leg (the independent side of the
+      regression) for the `:spread` kind only. `nil` for every other kind.
+      Named to echo `:reference` (the "other side" of a comparison) without
+      colliding with it — `:spread` has no derived-node `:reference`, only
+      this raw second symbol.
+    * `:reference_source` — which feed/provider `:reference_symbol`'s raw
+      ticks come from, for `:spread` only — mirrors `:source`/`:symbol`'s
+      own relationship. `nil` for every other kind.
     * `:params` — kind-specific tuning knobs as a plain map with string
       keys (mirrors `SignalDefinition.params`'s own jsonb shape exactly, so
       a caller can pass a definition's `params` straight through
@@ -66,6 +79,30 @@ defmodule TradingCore.Signal.Spec do
   from its own config format can do the same — resolve a duration to
   milliseconds however it likes, then hand `Compute` a plain integer.
 
+  ## Why `:spread` is a base kind, not a dual-parent kind
+
+  Every existing dual-parent kind (`percent_deviation`, `zscore`, `regime`,
+  `ratio`) compares two already-computed *derived values* — `:parent` and
+  `:reference` are themselves `Spec` nodes with their own `step/2`, and
+  `Compute.replay/3` feeds a dual-parent node the synthesized `%{value:,
+  reference:}` tick built from each side's own latest emission (see
+  `Compute`'s moduledoc). A pairs spread needs something structurally
+  different: two *raw price ticks* (X and Y) to fit its own rolling
+  regression, with no upstream node computing either side first. Reusing
+  `:parent`/`:reference` for that would silently redefine what those
+  fields mean everywhere else in this struct — "another node's emitted
+  scalar" would suddenly also mean "a raw tick source" depending on which
+  kind you're looking at.
+
+  So `:spread` is base-like instead: it owns its own two symbols directly
+  (`:symbol`/`:source` for Y, `:reference_symbol`/`:reference_source` for
+  X) and reads both raw prices from the tick it's given each call, the same
+  way `:vwap`/`:volume` own their single feed rather than wrapping another
+  node. See `TradingCore.Signal.Compute`'s `:spread` `step/2` clause for
+  the tick shape this expects (both prices on one tick, not two separate
+  per-symbol tick streams merged by timestamp) and its own moduledoc for
+  why.
+
   ## Why `:parent`/`:reference` are nested `t()`s, not ids
 
   `TradingSignal.Signals.SignalDefinition`'s DAG is expressed as
@@ -86,6 +123,8 @@ defmodule TradingCore.Signal.Spec do
   defstruct kind: nil,
             symbol: nil,
             source: nil,
+            reference_symbol: nil,
+            reference_source: nil,
             params: %{},
             window_ms: nil,
             expression: nil,
@@ -107,11 +146,14 @@ defmodule TradingCore.Signal.Spec do
           | :zscore
           | :regime
           | :ratio
+          | :spread
 
   @type t :: %__MODULE__{
           kind: kind(),
           symbol: String.t() | nil,
           source: String.t() | nil,
+          reference_symbol: String.t() | nil,
+          reference_source: String.t() | nil,
           params: %{optional(String.t()) => term()},
           window_ms: pos_integer() | nil,
           expression: String.t() | nil,
@@ -129,7 +171,10 @@ defmodule TradingCore.Signal.Spec do
   # same TradingCore.Signals.momentum/4 call via DefinitionSignal — but it
   # is still a real base-kind computation with its own state shape here,
   # independent of how a caller decides to route to it.
-  @base_kinds ~w(plain momentum volume vwap donchian rolling_volume)a
+  # :spread is base-like despite comparing two symbols — see "Why :spread
+  # is a base kind" above — so it belongs in this list, not
+  # @dual_parent_kinds, even though its Spec.t() carries a second symbol.
+  @base_kinds ~w(plain momentum volume vwap donchian rolling_volume spread)a
 
   # Mirrors @single_parent_kinds: wrap exactly one parent's own value
   # stream over time.
