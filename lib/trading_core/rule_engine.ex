@@ -47,7 +47,10 @@ defmodule TradingCore.RuleEngine do
 
   A missing signal in the snapshot fails closed (the condition is not met)
   — a rule referencing a signal nobody supplied should never be silently
-  treated as satisfied.
+  treated as satisfied. A key present with a `nil` value counts as
+  missing: a signal bus that emits `nil` while warming up produces the
+  same "no value to compare" state as an absent key, and both decline the
+  condition rather than raising.
 
   ## Transition operators and the `prev_` convention
 
@@ -403,11 +406,32 @@ defmodule TradingCore.RuleEngine do
   defp fetch_comparand(%{"value_signal" => signal_name}, snapshot),
     do: fetch_signal(snapshot, signal_name)
 
+  # A rule literal of `"value" => nil` is malformed JSON for a comparison,
+  # not a comparable zero — same fail-closed answer as a missing key.
+  defp fetch_comparand(%{"value" => nil}, _snapshot), do: :error
   defp fetch_comparand(%{"value" => value}, _snapshot), do: {:ok, to_decimal(value)}
   defp fetch_comparand(_condition, _snapshot), do: :error
 
+  # A key present with a `nil` value is treated exactly as an absent key:
+  # `:error`, so the condition fails closed.
+  #
+  # `@type snapshot` says `Decimal.t() | number()`, so a `nil` is strictly
+  # a caller contract violation — but this clause is deliberate rather
+  # than permissive. Without it `to_decimal/1` has no matching clause and
+  # raises `FunctionClauseError` from inside whatever is evaluating, which
+  # for the live callers is a periodic exit sweep: one unlucky snapshot
+  # would abort the whole sweep, taking every *other* position's exit
+  # check down with it, rather than declining one condition. "A missing
+  # signal fails closed" (this module's own moduledoc) is the intended
+  # posture, and a nil is a missing signal by any useful reading.
+  #
+  # Known reachable shape: a signal bus that emits `nil` while warming up.
+  # `trading_system`'s exit path happens to omit the key entirely in that
+  # case (verified), but that is one caller's convention, not something
+  # this shared module can rely on.
   defp fetch_signal(snapshot, signal_name) do
     case Map.fetch(snapshot, signal_name) do
+      {:ok, nil} -> :error
       {:ok, value} -> {:ok, to_decimal(value)}
       :error -> :error
     end
