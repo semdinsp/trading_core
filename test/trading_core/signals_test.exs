@@ -181,6 +181,52 @@ defmodule TradingCore.SignalsTest do
       assert value == nil
     end
 
+    # Regression: a bare `variance <= 0.0` check caught only an exactly
+    # flat window. A near-constant one yields a variance around 1e-17 that
+    # passes it, then divides by a vanishing stdev and emits a large,
+    # confident, meaningless number. Observed live as
+    # massive_spy_vwap_zscore at -11.49 on a closed Saturday tape.
+    test "nil when the window is near-constant, not merely exactly flat" do
+      # Four samples differing only in the 8th decimal -- they survive
+      # precision-8 rounding, so rounding alone does not prevent this.
+      samples = [1.00000001, 1.00000002, 1.00000001, 1.00000003]
+
+      {_history, _welford, value} = reduce_self_zscore(samples)
+
+      assert value == nil
+    end
+
+    test "nil when both the values and their spread are near zero" do
+      {_history, _welford, value} =
+        reduce_self_zscore([1.0e-9, 1.1e-9, 1.0e-9, 1.2e-9])
+
+      assert value == nil
+    end
+
+    test "still emits for a spread oscillating around zero (mean ~0, real stdev)" do
+      # The case a mean-only relative floor would wrongly suppress: mean
+      # is ~1e-17 while stdev is ~0.51. Scaling by max(|mean|, |sample|)
+      # keeps the floor meaningful here.
+      {_history, _welford, value} = reduce_self_zscore([-0.5, 0.5, -0.4, 0.6, -0.2])
+
+      assert %Decimal{} = value
+      assert_in_delta Decimal.to_float(value), -0.3885, 0.001
+    end
+
+    test "still emits for a genuinely quiet but real window" do
+      # 0.01% price moves -- tight, but four orders of magnitude above the
+      # degenerate threshold. Suppressing this would be a false positive.
+      {_history, _welford, value} = reduce_self_zscore([100.00, 100.01, 99.99, 100.02])
+
+      assert %Decimal{} = value
+    end
+
+    test "still emits for an ordinary volatile series" do
+      {_history, _welford, value} = reduce_self_zscore([18.0, 19.5, 17.2, 20.1, 18.8])
+
+      assert %Decimal{} = value
+    end
+
     test "history is capped at max_history_samples" do
       # Same fixed-`now` shape as Derivative's identically-named test — all
       # ticks land within the time window, so only the hard cap can be
@@ -267,6 +313,28 @@ defmodule TradingCore.SignalsTest do
       expected_z = (9.0 - 5.0) / expected_stdev
 
       assert_in_delta Decimal.to_float(final_value), expected_z, 0.0001
+    end
+
+    test "nil on a near-constant spread (the closed-tape case, shared guard)" do
+      # Same degenerate guard as self_zscore/5 -- both route through the
+      # one private zscore helper, so this covers the VWAP-spread path
+      # that produced the -11.49 reading on a closed Saturday tape.
+      spreads = [0.14700001, 0.14700002, 0.14700001, 0.14700003]
+
+      {_history, _welford, value} =
+        spreads
+        |> Enum.with_index()
+        |> Enum.reduce({[], WelfordAcc.new(), nil}, fn {spread, i}, {history, welford, _value} ->
+          Signals.spread_zscore(
+            history,
+            welford,
+            Decimal.from_float(spread),
+            Decimal.new(0),
+            DateTime.add(@base, i, :second)
+          )
+        end)
+
+      assert value == nil
     end
 
     test "no value until at least 2 samples are in the window" do
@@ -494,5 +562,20 @@ defmodule TradingCore.SignalsTest do
 
       assert length(final_prices) == 500
     end
+  end
+
+  # Feeds `samples` through self_zscore/5 one per second from @base,
+  # returning the final {history, welford, value}.
+  defp reduce_self_zscore(samples) do
+    samples
+    |> Enum.with_index()
+    |> Enum.reduce({[], WelfordAcc.new(), nil}, fn {sample, i}, {history, welford, _value} ->
+      Signals.self_zscore(
+        history,
+        welford,
+        Decimal.from_float(sample),
+        DateTime.add(@base, i, :second)
+      )
+    end)
   end
 end
