@@ -426,6 +426,48 @@ defmodule TradingCore.Signal.ComputeTest do
       assert length(state.history) == 2
     end
 
+    test "a reset-enabled zscore reports warming_up where an unreset one reports a number" do
+      # Pins the documented semantics: enabling session_reset yields a
+      # DIFFERENT signal, not a corrected one. Around a session open the
+      # reset version has an empty window (count < 2 => nil => :warming_up)
+      # exactly where the straddling version still emits, so values either
+      # side of the switch are not comparable.
+      session_reset = fn dt -> DateTime.to_date(dt) end
+      window = :timer.hours(48)
+
+      reset_spec = %Spec{
+        kind: :zscore,
+        window_ms: window,
+        params: %{"session_reset" => session_reset}
+      }
+
+      plain_spec = %Spec{kind: :zscore, window_ms: window}
+
+      day1 = @now
+      day1_later = DateTime.add(@now, 60, :second)
+      day2 = DateTime.add(@now, 86_400, :second)
+
+      ticks = [
+        %{at: day1, value: 100, reference: 90},
+        %{at: day1_later, value: 105, reference: 90},
+        %{at: day2, value: 50, reference: 40}
+      ]
+
+      run = fn spec ->
+        {:ok, state} = Compute.init(spec)
+
+        Enum.reduce(ticks, {state, nil}, fn tick, {acc, _} ->
+          Compute.step(spec, acc, tick)
+        end)
+      end
+
+      {_reset_state, reset_value} = run.(reset_spec)
+      {_plain_state, plain_value} = run.(plain_spec)
+
+      assert reset_value == :warming_up
+      assert %Decimal{} = plain_value
+    end
+
     test "zscore does not clear within a single session" do
       session_reset = fn dt -> DateTime.to_date(dt) end
 

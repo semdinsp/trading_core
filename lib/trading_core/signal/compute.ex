@@ -82,7 +82,11 @@ defmodule TradingCore.Signal.Compute do
   `last_reading` back to `nil` — see `maybe_reset_volume_session/3`'s own
   comment for why that part matters), or the accumulated spread window for
   `:zscore` (see `maybe_reset_zscore_session/3`, which also explains why
-  that one is opt-in rather than always-on). There is no default that reaches for
+  that one is opt-in rather than always-on — briefly: enabling it yields a
+  *different* signal rather than a corrected one, reporting `:warming_up`
+  around a session open where the unreset version reports a number, so
+  values either side of the change are not comparable and a consumer
+  holding history needs to know when it was switched on). There is no default that reaches for
   `DateTime.utc_now/0` or hardcodes `9:30am America/New_York` inside this
   module — a caller replaying historical data supplies the exact same
   session-boundary function a live caller would (canonically
@@ -759,6 +763,20 @@ defmodule TradingCore.Signal.Compute do
   # slides past the discontinuity, so defaulting this on would be a live
   # change to every existing :zscore for a problem that partially fixes
   # itself.
+  #
+  # The stronger reason to keep it opt-in is semantic, not just
+  # change-aversion: **turning this on produces a different signal, not a
+  # corrected one.** Around a session open, a reset-enabled :zscore
+  # reports `:warming_up` exactly where the straddling version reports a
+  # number — the reset empties `history`, so the next tick has `count < 2`,
+  # `Signals.zscore/2` returns nil, and `warm/1` maps that to
+  # `:warming_up`. Values recorded before and after the switch are
+  # therefore not comparable: a consumer holding history across the change
+  # has to re-read the old values under the new meaning rather than assume
+  # a continuous series. Anything storing or scoring this signal's output
+  # (a strategy's condition history, a rating computed over closed runs)
+  # wants to know the date this was enabled for a given spec, the same way
+  # it would for a window change.
   defp maybe_reset_zscore_session(state, _now, nil), do: state
 
   defp maybe_reset_zscore_session(state, now, session_reset) when is_function(session_reset, 1) do
