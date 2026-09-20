@@ -71,6 +71,28 @@ defmodule TradingCore.Signal.Compute do
   itself — `Compute` never reimplements a warm-up check separately from
   the computation it gates).
 
+  ## Quote merging for the microstructure kinds
+
+  A tick may carry top-of-book fields (`:bid`, `:ask`, `:bid_size`,
+  `:ask_size`) for the kinds that need them. Every other kind ignores
+  them, so a caller with no book data is unaffected.
+
+  Crucially, a tick may carry **one side only**: IBKR broadcasts partial
+  quote updates (`%{bid:, bid_size:}`, then separately `%{ask:,
+  ask_size:}`), while a snapshot provider like Polygon/Massive supplies
+  all four at once. `merge_quote/3` holds the last known state of each
+  side so a kind sees a complete book either way, and `quote_ready?/2`
+  gates on both sides being known — optionally bounding how far apart
+  they printed.
+
+  That merge belongs here rather than in each consumer because it decides
+  **which bid is paired with which ask**, and that pairing is precisely
+  what an imbalance or order-flow signal measures. Leaving it to callers
+  would mean a live path and a replay path computing different signals
+  from the same market data. See `merge_quote/3`'s own doc, and
+  `:spread`'s leg pairing for the same reasoning applied to two price
+  feeds.
+
   ## Session boundaries are injected, never derived from wall-clock
 
   A `:vwap`, `:volume`, or `:zscore` spec's `params` may include
@@ -143,10 +165,53 @@ defmodule TradingCore.Signal.Compute do
   alias TradingCore.Signal.Spec
   alias TradingCore.{Signals, WelfordAcc}
 
+  @typedoc """
+  One observation handed to `step/2`.
+
+  `:value` is the kind's primary input — a price for most kinds, the Y leg
+  for `:spread`. `:reference` is the second input for the dual-parent
+  kinds and for `:spread`'s X leg.
+
+  The `:bid`/`:ask`/`:bid_size`/`:ask_size` fields carry top-of-book
+  quote state for the microstructure kinds. They are optional and ignored
+  by every other kind, so a caller that has no book data keeps working
+  unchanged.
+
+  A tick may carry **one side of the book only**. IBKR delivers partial
+  quote updates — `%{bid:, bid_size:}`, then separately `%{ask:,
+  ask_size:}` — so `merge_quote/3` holds the last known state of each
+  side rather than requiring both on one tick. A snapshot provider like
+  Polygon supplies all four at once, in which case the merge is a no-op.
+  See "Quote merging" in this module's own moduledoc for why that merge
+  lives here rather than in each caller.
+  """
   @type tick :: %{
           required(:at) => DateTime.t(),
           required(:value) => Signals.sample() | nil,
-          optional(:volume) => Signals.sample() | nil
+          optional(:reference) => Signals.sample() | nil,
+          optional(:volume) => Signals.sample() | nil,
+          optional(:bid) => Signals.sample() | nil,
+          optional(:ask) => Signals.sample() | nil,
+          optional(:bid_size) => Signals.sample() | nil,
+          optional(:ask_size) => Signals.sample() | nil
+        }
+
+  @typedoc """
+  Merged top-of-book state: the last known price and size for each side,
+  each stamped with the tick time that side last changed.
+
+  The two `_at` stamps are per-side, not per-field — a side's price and
+  size arrive together and are meaningless apart, so they share one
+  timestamp. The gap between them is what
+  `quote_ready?/2`'s staleness bound measures.
+  """
+  @type quote_state :: %{
+          bid: Decimal.t() | nil,
+          bid_size: Decimal.t() | nil,
+          bid_at: DateTime.t() | nil,
+          ask: Decimal.t() | nil,
+          ask_size: Decimal.t() | nil,
+          ask_at: DateTime.t() | nil
         }
 
   @type state :: term()
@@ -535,6 +600,86 @@ defmodule TradingCore.Signal.Compute do
   # time, leaving the other leg's last-known value untouched. Mirrors
   # merge_dual_parent/2's "latest of each" semantics, plus the per-leg
   # timestamp spread_legs_ready/3 needs to judge staleness.
+  @doc """
+  Empty top-of-book state, for a kind's own `init/1` to embed.
+
+  A microstructure kind holds this under some key in its state and threads
+  it through `merge_quote/3` on every tick.
+  """
+  @spec new_quote_state() :: quote_state()
+  def new_quote_state do
+    %{bid: nil, bid_size: nil, bid_at: nil, ask: nil, ask_size: nil, ask_at: nil}
+  end
+
+  @doc """
+  Folds whichever book sides `tick` carries into `quote_state`, leaving
+  the other side's last known values untouched.
+
+  A side updates only when its **price** is present on the tick; size
+  alone is not enough to establish a side, since a size without a price
+  cannot be compared against anything. Both the price and the size for
+  that side are taken from the same tick and stamped with `now`.
+
+  ## Why this merge lives here
+
+  IBKR delivers partial quote updates — `%{bid:, bid_size:}`, then later
+  `%{ask:, ask_size:}` — so a consumer given the raw feed must hold the
+  other side itself. If each consumer does that, each one decides *which
+  bid gets paired with which ask*, and that pairing is what an order-flow
+  or imbalance signal actually measures. A live path merging in a
+  GenServer and a replay path reading pre-joined rows would then compute
+  genuinely different signals from the same market data, which defeats
+  the reason this library exists.
+
+  Same problem, same answer, as `:spread`'s leg pairing.
+
+  A snapshot provider (Polygon/Massive supplies all four fields at once)
+  makes this a no-op, which is one reason a snapshot feed is the better
+  source for these signals.
+  """
+  @spec merge_quote(quote_state(), tick(), DateTime.t()) :: quote_state()
+  def merge_quote(quote_state, tick, now) do
+    quote_state
+    |> put_side(:bid, :bid_size, :bid_at, Map.get(tick, :bid), Map.get(tick, :bid_size), now)
+    |> put_side(:ask, :ask_size, :ask_at, Map.get(tick, :ask), Map.get(tick, :ask_size), now)
+  end
+
+  defp put_side(quote_state, _p_key, _s_key, _at_key, nil, _size, _now), do: quote_state
+
+  defp put_side(quote_state, p_key, s_key, at_key, price, size, now) do
+    quote_state
+    |> Map.put(p_key, to_decimal(price))
+    |> Map.put(s_key, maybe_to_decimal(size))
+    |> Map.put(at_key, now)
+  end
+
+  @doc """
+  `true` when both sides of the book are known and, if
+  `max_quote_staleness_ms` is given, printed within that many
+  milliseconds of each other.
+
+  Pass `nil` for an unbounded pairing — correct for a snapshot provider,
+  where both sides always share a timestamp and the bound can never bite.
+
+  For a partial-update feed the bound is load-bearing rather than a
+  nicety: pairing a fresh bid against an ask from minutes ago describes a
+  book that existed at no instant. That failure is **silent** — the
+  arithmetic is valid and the number looks ordinary — so nothing
+  downstream can detect it. A caller on a partial-update feed should set
+  it.
+  """
+  @spec quote_ready?(quote_state(), pos_integer() | nil) :: boolean()
+  def quote_ready?(%{bid: nil}, _max_ms), do: false
+  def quote_ready?(%{ask: nil}, _max_ms), do: false
+  def quote_ready?(%{bid_at: _, ask_at: _}, nil), do: true
+
+  def quote_ready?(%{bid_at: bid_at, ask_at: ask_at}, max_ms) do
+    abs(DateTime.diff(bid_at, ask_at, :millisecond)) <= max_ms
+  end
+
+  defp maybe_to_decimal(nil), do: nil
+  defp maybe_to_decimal(value), do: to_decimal(value)
+
   defp merge_spread_legs(state, tick, now) do
     state
     |> put_leg(:y, :y_at, Map.get(tick, :value), now)
