@@ -8,7 +8,16 @@ All six are incremental and streaming, so they fit the existing
 `Spec` → `init/1` → `step/2` → `replay/3` machinery. That part genuinely
 is free. **The tick shape is not** — see phase 0.
 
-Status: phase 0 in progress. Everything else is queued behind it.
+Status: **phase 0 complete** (merged). Phase 1 is next.
+
+**Feed decision: Massive/Polygon quotes, not IBKR.** Confirmed by the
+user 2026-09-20 — forcing the microstructure kinds onto a snapshot quote
+feed is acceptable. That removes the partial-update merge problem
+entirely (it becomes a no-op), supplies a real `quote_timestamp` for
+honest effective spread, and is the only shape that makes OFI's
+definition well-posed. The merge machinery from phase 0 stays regardless:
+it costs nothing on a snapshot feed and keeps the IBKR path correct if
+anything ever uses it.
 
 ---
 
@@ -62,7 +71,12 @@ Massive/Polygon rather than IBKR:
 
 ## Phases, ordered by dependency
 
-### Phase 0 — extend the tick *(prerequisite)*
+### Phase 0 — extend the tick *(prerequisite)* — **DONE**
+
+Merged as `1832e59`. `new_quote_state/0`, `merge_quote/3` and
+`quote_ready?/2` are on `main`; the tick carries optional
+`:bid`/`:ask`/`:bid_size`/`:ask_size`, and every existing kind is
+provably unaffected.
 
 Add optional quote fields to the tick type, and merge one-sided updates
 inside `Compute` rather than pushing that onto every caller.
