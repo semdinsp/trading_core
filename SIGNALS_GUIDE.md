@@ -170,6 +170,19 @@ each observation is many collapsed revisions. **Use the Polygon WS feed**
 Note `TradingHub.MarketData.PolygonStreamer` is *not* a streamer — it is
 a deprecated 15-second REST poller.
 
+**1b. Distinguish trade from quote messages by `metadata.data_type`,
+not by which keys are present.** On the Polygon WS feed both arrive as
+`type: :price` and are tagged `:ws_trade`, `:ws_quote`, or
+`:ws_aggregate` (`web_socket_client.ex:480/520/555`). Trades carry
+`last` and no sizes; quotes carry `bid`/`ask`/`bid_size`/`ask_size` and
+**no `last` key at all**.
+
+That matters for any adapter translating this feed into ticks: matching
+on `data: %{last: last}` silently drops every quote. Measured on a live
+SPY capture, quotes were **1509 of 1940 messages — 77.8%** — so a
+key-presence matcher discards the large majority of the feed with no
+error anywhere. Match on the tag.
+
 **2. Set `max_quote_staleness_ms` on any partial-update feed.** Pairing a
 fresh bid against a minutes-old ask describes a book that existed at no
 instant — and that failure is **silent**: valid arithmetic, an
@@ -250,6 +263,28 @@ These hold for every kind, and exist because each was violated once:
   and a missing size all return `:warming_up`, not `0.0`.
 
 ---
+
+## Operational note: `trading_core` is a `path:` dependency
+
+Consuming apps take this library as `path:`, which means **a running node
+only picks up changes at compile + boot**. Editing here and expecting a
+live node to see it does not work.
+
+This has bitten the workspace at least twice: `TradingCore.Stats.bounds/4`
+raising `UndefinedFunctionError` on a live node after the function was
+merged, and a node running bytecode predating a day's signal work. Both
+looked like "the code is wrong" and were actually "the node is old".
+
+Check what a node actually has before debugging:
+
+```elixir
+:erpc.call(:"trading_signal@Scotts-Mac-mini.local",
+           TradingCore.Signal.Spec, :kinds, [])
+|> length()
+```
+
+If that disagrees with `Spec.kinds()` here, the node needs
+`mix deps.compile trading_core --force` and a restart — not a code fix.
 
 ## Reference
 
