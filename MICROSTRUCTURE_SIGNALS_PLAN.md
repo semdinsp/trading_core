@@ -433,7 +433,7 @@ candidate rather than new regression code.
 >
 > **Done when:** the standard bar, pushed on `claude/kyle-lambda`.
 
-### Phase 6 — `:two_scale_rv`
+### Phase 6 — `:two_scale_rv` — **DONE**
 
 Two-scale realized volatility (Zhang/Mykland/Aït-Sahalia).
 

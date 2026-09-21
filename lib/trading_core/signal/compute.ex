@@ -132,7 +132,7 @@ defmodule TradingCore.Signal.Compute do
       `:volume`, `:vwap`, `:donchian`, `:rolling_volume`, `:spread` (owns
       *two* symbols — see `Spec`'s own moduledoc, "Why `:spread` is a base
       kind"), `:book_imbalance` (reads top-of-book quote fields rather
-      than a price series — see "Quote merging" above)
+      than a price series — see "Quote merging" above), `:two_scale_rv`
     * single-parent (wraps `:parent`'s emitted values): `:derivative`,
       `:second_derivative`, `:wavelet`, `:self_zscore`
     * dual-parent (`:parent` vs. `:reference`): `:percent_deviation`,
@@ -274,6 +274,14 @@ defmodule TradingCore.Signal.Compute do
   def init(%Spec{kind: :regime}), do: {:ok, %{direction: nil, gate: nil}}
 
   def init(%Spec{kind: :book_imbalance}), do: {:ok, %{quote: new_quote_state()}}
+
+  def init(%Spec{kind: :two_scale_rv} = spec) do
+    # Validate the mode at init rather than on the first tick, so a
+    # misconfigured spec fails where it is built rather than silently
+    # warming up forever inside a live loop.
+    _ = subsample_mode!(spec)
+    {:ok, %{prices: []}}
+  end
 
   def init(%Spec{kind: :spread} = spec) do
     beta_mode = Map.get(spec.params, "beta_mode", "static")
@@ -549,6 +557,38 @@ defmodule TradingCore.Signal.Compute do
   # snapshot feed both sides always share a timestamp so the bound never
   # bites; on a partial-update feed it is what stops a fresh bid being
   # paired against a stale ask — see quote_ready?/2's own doc.
+  # Two-scale realized volatility (Zhang/Mykland/Aït-Sahalia). Emits the
+  # noise-corrected variance over the window — see
+  # TradingCore.Signals.two_scale_rv/2 for why naive tick RV is not an
+  # acceptable substitute (it overstated true variance ~9x on a simulated
+  # noisy walk).
+  #
+  # The subsampling scale is explicit in params, never implicit:
+  #
+  #   "subsample_mode" => "tick_count" (default) | "time"
+  #   "subsample_k"    => integer, the subsampling factor for tick_count
+  #   "subsample_ms"   => integer, the subgrid spacing for time
+  #
+  # The two disagree materially on a thin name — a fixed tick count spans
+  # seconds on a liquid symbol and many minutes on an illiquid one, so
+  # "every 10th print" and "every 10 seconds" are different estimators
+  # rather than two spellings of one. Forcing the caller to say which is
+  # the point; an unrecognised mode raises rather than defaulting.
+  def step(%Spec{kind: :two_scale_rv} = spec, state, %{at: now, value: value}) do
+    opts = window_opts(spec)
+
+    prices =
+      [{now, to_decimal(value)} | state.prices]
+      |> trim_price_window(now, opts)
+
+    state = %{state | prices: prices}
+
+    # Oldest first for the estimator; state holds newest first.
+    ordered = prices |> Enum.reverse() |> Enum.map(&elem(&1, 1))
+
+    {state, warm(two_scale_rv_value(ordered, prices, spec))}
+  end
+
   def step(%Spec{kind: :book_imbalance} = spec, state, %{at: now} = tick) do
     quote_state = merge_quote(state.quote, tick, now)
     state = %{state | quote: quote_state}
@@ -728,6 +768,66 @@ defmodule TradingCore.Signal.Compute do
       nil -> value
       precision -> Decimal.round(value, precision)
     end
+  end
+
+  # "tick_count" subsamples every kth print; "time" first thins the
+  # series to one print per subsample_ms bucket, then runs the estimator
+  # on that thinned series. Raises on anything else — a silent default
+  # here would pick one of two materially different estimators on the
+  # caller's behalf.
+  defp subsample_mode!(%Spec{params: params}) do
+    case Map.get(params, "subsample_mode", "tick_count") do
+      "tick_count" -> :tick_count
+      "time" -> :time
+      other -> raise ArgumentError, ":two_scale_rv unknown subsample_mode #{inspect(other)}"
+    end
+  end
+
+  defp two_scale_rv_value(ordered_prices, stamped_prices, spec) do
+    case subsample_mode!(spec) do
+      :tick_count ->
+        Signals.two_scale_rv(ordered_prices, Map.get(spec.params, "subsample_k", 5))
+
+      :time ->
+        bucket_ms = Map.get(spec.params, "subsample_ms", 1_000)
+
+        stamped_prices
+        |> Enum.reverse()
+        |> thin_by_time(bucket_ms)
+        # On a time-thinned series the grid is already the slow scale, so
+        # a further tick-count factor of 2 gives the two scales the
+        # estimator needs without re-introducing a second tunable.
+        |> Signals.two_scale_rv(2)
+    end
+  end
+
+  # One price per bucket_ms window, keeping the first print in each —
+  # first rather than last so the thinned series is a genuine subsample
+  # of observed prices at roughly even spacing, not a series of
+  # bucket-closing prints.
+  defp thin_by_time([], _bucket_ms), do: []
+
+  defp thin_by_time([{first_at, _} | _] = stamped, bucket_ms) do
+    stamped
+    |> Enum.group_by(fn {at, _} -> div(DateTime.diff(at, first_at, :millisecond), bucket_ms) end)
+    |> Enum.sort_by(fn {bucket, _} -> bucket end)
+    |> Enum.map(fn {_bucket, [{_at, price} | _]} -> price end)
+  end
+
+  defp trim_price_window(stamped, now, opts) do
+    window_ms = Keyword.get(opts, :window_ms)
+    max_samples = Keyword.get(opts, :max_history_samples, 1_000)
+
+    stamped
+    |> then(fn list ->
+      if window_ms do
+        cutoff = DateTime.add(now, -window_ms, :millisecond)
+        Enum.filter(list, fn {at, _} -> DateTime.compare(at, cutoff) != :lt end)
+      else
+        list
+      end
+    end)
+    |> Enum.take(max_samples)
   end
 
   defp maybe_to_decimal(nil), do: nil
