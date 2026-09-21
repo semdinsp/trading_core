@@ -83,6 +83,21 @@ defmodule TradingCore.Signal.SignedVolumeTest do
 
       assert Decimal.equal?(value, Decimal.new(1))
     end
+
+    # Regression: found by replaying live SPY ticks. Map.get/3's default
+    # only fires on an ABSENT key, but the real feed sends volume: nil on
+    # a trade carrying no size, which crashed Decimal.mult/2. Both
+    # spellings of "no size" must mean the same thing.
+    test "an explicit nil volume is treated as unsized, not as a crash" do
+      ticks = [
+        %{at: at(0), value: 100.0, volume: nil},
+        %{at: at(1), value: 100.1, volume: nil}
+      ]
+
+      {_s, value} = run(%{}, ticks)
+
+      assert Decimal.equal?(value, Decimal.new(1))
+    end
   end
 
   describe "lee_ready" do

@@ -279,6 +279,25 @@ defmodule TradingCore.Signal.Compute do
 
   def init(%Spec{kind: :book_imbalance}), do: {:ok, %{quote: new_quote_state()}}
 
+  def init(%Spec{kind: :kyle_lambda} = spec) do
+    # Same init-time validation as :signed_volume, whose classifier this
+    # kind reuses — a misconfigured spec should fail where it is built.
+    _ = classifier!(spec)
+
+    {:ok,
+     %{
+       quote: new_quote_state(),
+       last_mid: nil,
+       last_price: nil,
+       last_sign: nil,
+       ols_history: []
+     }}
+  end
+
+  def init(%Spec{kind: :ofi}) do
+    {:ok, %{quote: new_quote_state(), prev: nil, history: []}}
+  end
+
   def init(%Spec{kind: :signed_volume} = spec) do
     # Validate the classifier at init, same reasoning as :two_scale_rv's
     # subsample_mode — a misconfigured spec should fail where it is built.
@@ -578,6 +597,102 @@ defmodule TradingCore.Signal.Compute do
   # snapshot feed both sides always share a timestamp so the bound never
   # bites; on a partial-update feed it is what stops a fresh bid being
   # paired against a stale ask — see quote_ready?/2's own doc.
+  # Kyle's lambda: the rolling regression slope of mid return on signed
+  # volume. A direct price-impact measure — how far a given unit of
+  # signed order flow moves the mid — so a HIGHER lambda means thinner
+  # liquidity. Emitting it is the point; it is a conditioning variable
+  # (size smaller when impact is high), not a trade trigger.
+  #
+  # Each observation pairs one trade with the mid move since the previous
+  # trade: x = signed volume of this trade, y = mid return over the same
+  # interval. Reuses Signals.rolling_ols_beta/4 rather than a second
+  # regression implementation — it already fits a rolling OLS over a
+  # {x, y} window and returns {beta, alpha}, and lambda is that beta.
+  #
+  # Trade signing uses the same classifier logic as :signed_volume (see
+  # params "classifier"), so the two kinds cannot disagree about which
+  # side initiated a print.
+  #
+  # Returns :warming_up until there are two observations with actual
+  # variation in signed volume — rolling_ols_beta/4 returns nil on a
+  # zero-variance x, which is the right answer: a window where every
+  # trade had identical signed volume carries no information about
+  # impact, and a slope fitted to it would be meaningless or explosive.
+  #
+  # A near-zero or NEGATIVE lambda is a real reading, not a fault.
+  # Measured on live SPY over 60s windows it sits around -4e-7: the mid
+  # mean-reverts within the window and retail-size prints do not move the
+  # most liquid ETF in the world, so the fitted slope is noise around
+  # zero. Lambda is informative where impact actually exists — a thin
+  # name, a large print, a stressed book — and a tiny magnitude is the
+  # correct answer for a deep one. Read the magnitude; do not read the
+  # sign of a near-zero slope as direction.
+  def step(%Spec{kind: :kyle_lambda} = spec, state, %{at: now} = tick) do
+    quote_state = merge_quote(state.quote, tick, now)
+    state = %{state | quote: quote_state}
+    price = Map.get(tick, :value)
+
+    cond do
+      price == nil ->
+        {state, :warming_up}
+
+      not quote_ready?(quote_state, Map.get(spec.params, "max_quote_staleness_ms")) ->
+        {state, :warming_up}
+
+      true ->
+        kyle_lambda_step(spec, state, quote_state, to_decimal(price), tick, now)
+    end
+  end
+
+  # Order flow imbalance (Cont/Kukanov/Stoikov). Per quote update,
+  # against the previous book:
+  #
+  #   bid price ROSE      -> +new_bid_size   (new buyers stepped up)
+  #   bid price UNCHANGED -> +(bid_size delta)
+  #   bid price FELL      -> -old_bid_size   (that bid was pulled)
+  #
+  # The ask side mirrors with signs reversed: an ask price FALLING is
+  # buy-side pressure (sellers undercutting), so it subtracts, while an
+  # ask RISING adds. Summed over window_ms.
+  #
+  # This is the single most-validated short-horizon predictor in the
+  # microstructure literature, and it needs only L1. It is also the
+  # signal most sensitive to the quote-pairing policy: a mis-paired
+  # update does not raise, it silently produces a wrong number. That is
+  # why merge_quote/3 lives in this module rather than in each caller —
+  # see "Quote merging" in the moduledoc.
+  #
+  # Feed quality matters as much as the arithmetic. Measured 2026-09-21
+  # on Polygon's WebSocket: ~88-119 quotes/sec for SPY with both sides
+  # and both sizes on every message. OFI over a throttled feed (IBKR's
+  # is bucketed to ~250ms) is a weaker statistic wearing the validated
+  # name, because each observation is the net of many collapsed
+  # revisions rather than a single book update.
+  def step(%Spec{kind: :ofi} = spec, state, %{at: now} = tick) do
+    quote_state = merge_quote(state.quote, tick, now)
+    state = %{state | quote: quote_state}
+
+    cond do
+      not quote_ready?(quote_state, Map.get(spec.params, "max_quote_staleness_ms")) ->
+        {state, :warming_up}
+
+      state.prev == nil ->
+        # No previous book to difference against. Record this one so the
+        # NEXT update has a reference, but contribute nothing.
+        {%{state | prev: quote_state}, :warming_up}
+
+      true ->
+        contribution = ofi_contribution(state.prev, quote_state)
+        opts = window_opts(spec)
+        history = trim_price_window([{now, contribution} | state.history], now, opts)
+        state = %{state | prev: quote_state, history: history}
+
+        total = Enum.reduce(history, Decimal.new(0), fn {_at, v}, acc -> Decimal.add(acc, v) end)
+
+        {state, round_to_precision(total, spec.params)}
+    end
+  end
+
   # Signed volume: buyer-initiated minus seller-initiated volume over the
   # window. Complements :ofi — that measures quote revisions, this
   # measures the executions that actually happened.
@@ -945,6 +1060,87 @@ defmodule TradingCore.Signal.Compute do
     {state, warm(two_scale_rv_value(ordered, prices, spec))}
   end
 
+  # e_n = bid-side contribution - ask-side contribution, per CKS. A
+  # missing size is treated as zero rather than skipping the update: the
+  # price move itself is information, and dropping the tick would lose
+  # it. (On the measured Polygon feed sizes are always present; this is
+  # for a feed that omits them.)
+  defp kyle_lambda_step(spec, state, quote_state, price, tick, now) do
+    mid = mid_price(quote_state.bid, quote_state.ask)
+    sign = trade_sign(classifier!(spec), price, quote_state, state)
+
+    base = %{state | last_price: price, last_sign: sign || state.last_sign, last_mid: mid}
+
+    if sign == nil or state.last_mid == nil do
+      # Either the trade could not be signed (no predecessor, no usable
+      # quote) or there is no earlier mid to measure the move against.
+      {base, :warming_up}
+    else
+      size = trade_size(tick)
+      signed_volume = Decimal.mult(size, Decimal.new(sign))
+      mid_return = mid |> Decimal.sub(state.last_mid) |> Decimal.div(state.last_mid)
+
+      {ols_history, result} =
+        Signals.rolling_ols_beta(
+          state.ols_history,
+          {signed_volume, mid_return},
+          now,
+          window_opts(spec)
+        )
+
+      state = %{base | ols_history: ols_history}
+
+      case result do
+        nil -> {state, :warming_up}
+        {beta, _alpha} -> {state, round_to_precision(beta, spec.params)}
+      end
+    end
+  end
+
+  # Both sides use the identical rule; the asymmetry is the subtraction,
+  # not the per-side arithmetic. An ask price FALLING gives that side a
+  # negative delta, which subtracted becomes a positive OFI contribution
+  # — correct, since sellers undercutting is buy-side pressure.
+  defp ofi_contribution(prev, curr) do
+    Decimal.sub(
+      side_delta(prev.bid, prev.bid_size, curr.bid, curr.bid_size),
+      side_delta(prev.ask, prev.ask_size, curr.ask, curr.ask_size)
+    )
+  end
+
+  defp side_delta(prev_price, prev_size, curr_price, curr_size) do
+    prev_size = prev_size || Decimal.new(0)
+    curr_size = curr_size || Decimal.new(0)
+
+    case Decimal.compare(curr_price, prev_price) do
+      # Price moved up: the size resting at the new level is wholly new
+      # liquidity on that side.
+      :gt -> curr_size
+      # Price unchanged: only the change in resting size is new.
+      :eq -> Decimal.sub(curr_size, prev_size)
+      # Price moved down: the whole previous level was pulled or consumed.
+      :lt -> Decimal.negate(prev_size)
+    end
+  end
+
+  # Trade size, defaulting to 1 when the feed does not supply one.
+  #
+  # Map.get/3's default only fires on an ABSENT key, but a real feed
+  # sends `volume: nil` on a trade message carrying no size — measured on
+  # Polygon's WS, where trade and quote messages share a shape. Both
+  # spellings of "no size" must mean the same thing here, or a live tick
+  # crashes where a synthetic one passes.
+  #
+  # Defaulting to 1 rather than 0 keeps an unsized print counted as one
+  # unit of directional flow instead of silently contributing nothing;
+  # the sign is the information, and dropping it would understate flow.
+  defp trade_size(tick) do
+    case Map.get(tick, :volume) do
+      nil -> Decimal.new(1)
+      size -> to_decimal(size)
+    end
+  end
+
   defp classifier!(%Spec{params: params}) do
     case Map.get(params, "classifier", "tick_rule") do
       "tick_rule" -> :tick_rule
@@ -966,7 +1162,7 @@ defmodule TradingCore.Signal.Compute do
         {state, :warming_up}
 
       sign ->
-        size = tick |> Map.get(:volume, 1) |> to_decimal()
+        size = trade_size(tick)
         signed = Decimal.mult(size, Decimal.new(sign))
         opts = window_opts(spec)
         history = trim_price_window([{now, signed} | state.history], now, opts)

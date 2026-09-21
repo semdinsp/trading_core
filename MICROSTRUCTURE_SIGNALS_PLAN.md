@@ -8,9 +8,14 @@ All six are incremental and streaming, so they fit the existing
 `Spec` → `init/1` → `step/2` → `replay/3` machinery. That part genuinely
 is free. **The tick shape is not** — see phase 0.
 
-Status: **phases 0 and 1 complete** (merged).
+Status: **ALL PHASES COMPLETE** (0-6). `trading_hub` shipped bid/ask
+sizes on the Polygon WS feed on 2026-09-21, unblocking the last two.
+Verified live: 2386/2386 quotes carried sizes, and all seven kinds
+replay cleanly against real SPY ticks.
 
-**Phase 2 is BLOCKED** — not on rate (the Polygon WebSocket delivers 88
+Historical note, kept because it explains the phase ordering:
+
+**Phase 2 WAS BLOCKED** — not on rate (the Polygon WebSocket delivers 88
 quotes/sec, measured), but on **bid/ask sizes being dropped** by
 `trading_hub`'s WS quote handler. See "MEASURED, 2026-09-21" below.
 Needs a one-line-ish fix in `trading_hub`, which is a sibling app this
@@ -235,7 +240,7 @@ denominator is zero.
 > **Done when:** `mix test` green, `mix compile --warnings-as-errors`
 > clean, no new deps, pushed on `claude/book-imbalance`.
 
-### Phase 2 — `:ofi` (order flow imbalance)
+### Phase 2 — `:ofi` (order flow imbalance) — **DONE**
 
 Cont/Kukanov/Stoikov. Per quote update: add bid size change when the bid
 price rises or holds, subtract bid size when it falls; mirror on the ask;
@@ -399,7 +404,7 @@ Complements OFI: executions versus quote revisions.
 >
 > **Done when:** the standard bar, pushed on `claude/signed-volume`.
 
-### Phase 5 — `:kyle_lambda`
+### Phase 5 — `:kyle_lambda` — **DONE**
 
 Rolling regression of mid return on signed volume. A direct price-impact
 and liquidity measure, and a good conditioning variable.
