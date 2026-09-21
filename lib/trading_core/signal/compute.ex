@@ -131,7 +131,8 @@ defmodule TradingCore.Signal.Compute do
     * base (own `:symbol`/`:source`, raw ticks): `:plain`, `:momentum`,
       `:volume`, `:vwap`, `:donchian`, `:rolling_volume`, `:spread` (owns
       *two* symbols — see `Spec`'s own moduledoc, "Why `:spread` is a base
-      kind")
+      kind"), `:book_imbalance` (reads top-of-book quote fields rather
+      than a price series — see "Quote merging" above)
     * single-parent (wraps `:parent`'s emitted values): `:derivative`,
       `:second_derivative`, `:wavelet`, `:self_zscore`
     * dual-parent (`:parent` vs. `:reference`): `:percent_deviation`,
@@ -271,6 +272,8 @@ defmodule TradingCore.Signal.Compute do
   end
 
   def init(%Spec{kind: :regime}), do: {:ok, %{direction: nil, gate: nil}}
+
+  def init(%Spec{kind: :book_imbalance}), do: {:ok, %{quote: new_quote_state()}}
 
   def init(%Spec{kind: :spread} = spec) do
     beta_mode = Map.get(spec.params, "beta_mode", "static")
@@ -537,6 +540,27 @@ defmodule TradingCore.Signal.Compute do
   # and not one any consumer can detect after the fact. A caller feeding
   # two genuinely independent feeds should set this; only a caller whose
   # ticks are already joined at the source can safely leave it unset.
+  # Top-of-book imbalance: (bid_size - ask_size) / (bid_size + ask_size),
+  # in -1.0..1.0, positive when bid-side size dominates. A strong
+  # 1-60 second predictor, and the cheapest consumer of the quote state —
+  # it holds no history of its own beyond the merged book.
+  #
+  # Reads params "max_quote_staleness_ms" (default nil, unbounded). On a
+  # snapshot feed both sides always share a timestamp so the bound never
+  # bites; on a partial-update feed it is what stops a fresh bid being
+  # paired against a stale ask — see quote_ready?/2's own doc.
+  def step(%Spec{kind: :book_imbalance} = spec, state, %{at: now} = tick) do
+    quote_state = merge_quote(state.quote, tick, now)
+    state = %{state | quote: quote_state}
+    max_staleness = Map.get(spec.params, "max_quote_staleness_ms")
+
+    if quote_ready?(quote_state, max_staleness) do
+      {state, warm(book_imbalance(quote_state, spec))}
+    else
+      {state, :warming_up}
+    end
+  end
+
   def step(%Spec{kind: :spread} = spec, state, %{at: now} = tick) do
     state = merge_spread_legs(state, tick, now)
 
@@ -675,6 +699,35 @@ defmodule TradingCore.Signal.Compute do
 
   def quote_ready?(%{bid_at: bid_at, ask_at: ask_at}, max_ms) do
     abs(DateTime.diff(bid_at, ask_at, :millisecond)) <= max_ms
+  end
+
+  # nil rather than a number whenever the ratio would be meaningless:
+  # either side's size unknown (a price can arrive without a size), or a
+  # zero total. Zero depth on both sides is *no book at all*, not a
+  # perfectly balanced one — emitting 0.0 there would be indistinguishable
+  # from a genuinely balanced book, which is the same class of mistake as
+  # a z-score computed on a near-constant window.
+  defp book_imbalance(%{bid_size: nil}, _spec), do: nil
+  defp book_imbalance(%{ask_size: nil}, _spec), do: nil
+
+  defp book_imbalance(%{bid_size: bid_size, ask_size: ask_size}, spec) do
+    total = Decimal.add(bid_size, ask_size)
+
+    if Decimal.equal?(total, 0) do
+      nil
+    else
+      bid_size
+      |> Decimal.sub(ask_size)
+      |> Decimal.div(total)
+      |> round_to_precision(spec.params)
+    end
+  end
+
+  defp round_to_precision(value, params) do
+    case Map.get(params, "precision") do
+      nil -> value
+      precision -> Decimal.round(value, precision)
+    end
   end
 
   defp maybe_to_decimal(nil), do: nil

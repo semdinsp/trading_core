@@ -8,7 +8,8 @@ All six are incremental and streaming, so they fit the existing
 `Spec` → `init/1` → `step/2` → `replay/3` machinery. That part genuinely
 is free. **The tick shape is not** — see phase 0.
 
-Status: **phase 0 complete** (merged). Phase 1 is next.
+Status: **phases 0 and 1 complete** (merged). Phase 2 (OFI) is next, and
+is gated on verifying live quote arrival rate.
 
 **Feed decision: Massive/Polygon quotes, not IBKR.** Confirmed by the
 user 2026-09-20 — forcing the microstructure kinds onto a snapshot quote
@@ -69,6 +70,23 @@ Massive/Polygon rather than IBKR:
 
 ---
 
+## How to use the prompts below
+
+Each phase carries a **Prompt** block: paste it into a session scoped to
+`trading_core/` and it is executable as-is. They assume the reader has
+not read this document, so each repeats what it needs — but read "The
+blocker" above first if you are touching phases 1–5, because the quote
+merge is the thing most likely to be reimplemented by mistake.
+
+Phases are **sequential**, not parallel: 1 proves the tick shape, 2–5
+each build on the one before, and only 6 is independent. Do not start a
+phase whose predecessor has not merged.
+
+Every prompt ends at the same bar: `mix test` green,
+`mix compile --warnings-as-errors` clean, no new deps, branch pushed.
+
+---
+
 ## Phases, ordered by dependency
 
 ### Phase 0 — extend the tick *(prerequisite)* — **DONE**
@@ -98,7 +116,7 @@ signal's logic has moved into the caller and replay equivalence is lost —
 the same mistake as caller-side leg pairing. The tick carries trade price
 and size; the kind classifies.
 
-### Phase 1 — `:book_imbalance`
+### Phase 1 — `:book_imbalance` — **DONE**
 
 `(bid_size − ask_size) / (bid_size + ask_size)`.
 
@@ -108,6 +126,51 @@ validate the tick change** before four more kinds depend on it.
 
 Returns `nil` (→ `:warming_up`) when either size is missing or the
 denominator is zero.
+
+> **Prompt — phase 1**
+>
+> In `trading_core/`, add a `:book_imbalance` signal kind.
+>
+> **What it computes:** `(bid_size - ask_size) / (bid_size + ask_size)`,
+> from the merged top of book. Range `-1.0`..`1.0`; positive means bid-side
+> size dominates. Stateless apart from the book state itself.
+>
+> **Use the existing quote machinery — do not reimplement it.**
+> `TradingCore.Signal.Compute` already has `new_quote_state/0`,
+> `merge_quote/3` and `quote_ready?/2` (added in phase 0, `1832e59`). The
+> tick carries optional `:bid`, `:ask`, `:bid_size`, `:ask_size`, and may
+> carry **one side only** — `merge_quote/3` holds the other. That merge
+> decides which bid is paired with which ask, which is what this signal
+> measures, so it must stay in `Compute`.
+>
+> **Add:**
+> - `:book_imbalance` to `Spec`'s `@base_kinds` and the `kind()` type. It
+>   is base-like: it owns its own feed, wraps no parent node.
+> - `init/1` returning `%{quote: Compute.new_quote_state()}`.
+> - A `step/2` clause: merge the tick, then
+>   `quote_ready?(state.quote, max_quote_staleness_ms)`; when ready compute
+>   the ratio, else `:warming_up`. Read the bound from
+>   `params["max_quote_staleness_ms"]`, defaulting to `nil` (unbounded).
+>
+> **Edge cases that must return `nil` → `:warming_up`, not a number:**
+> - either side unknown (book not yet complete)
+> - either size missing (a price can arrive without a size)
+> - `bid_size + ask_size == 0` — zero total depth is not a balanced book,
+>   it is no book at all, and `0/0` must not become `0.0`
+>
+> Use `Decimal` throughout, matching the other kinds. Round to
+> `params["precision"]` if present, as `window_opts/1` already does
+> elsewhere.
+>
+> **Tests:** assert exact values for a bid-heavy, ask-heavy and balanced
+> book; both boundary values (`-1.0` when bid size is 0, `1.0` when ask
+> size is 0); every `:warming_up` case above, each separately; that a
+> one-sided tick sequence (IBKR's `%{bid:, bid_size:}` then `%{ask:,
+> ask_size:}`) completes the book and emits; and that the staleness bound
+> rejects a stale pairing.
+>
+> **Done when:** `mix test` green, `mix compile --warnings-as-errors`
+> clean, no new deps, pushed on `claude/book-imbalance`.
 
 ### Phase 2 — `:ofi` (order flow imbalance)
 
@@ -122,6 +185,42 @@ sum over a window.
   wrong number.
 - Verify quote arrival rate before trusting output (see above).
 
+> **Prompt — phase 2**
+>
+> In `trading_core/`, add an `:ofi` (order flow imbalance) kind,
+> Cont/Kukanov/Stoikov. Phase 1 must have merged first.
+>
+> **Per quote update**, comparing against the previous book:
+> - bid price **rose**: add the new bid size
+> - bid price **unchanged**: add the *change* in bid size
+> - bid price **fell**: subtract the old bid size
+> - ask side mirrors with the signs reversed (ask price falling is
+>   buy-side pressure)
+>
+> Sum those contributions over `window_ms`. Reuse
+> `TradingCore.Signals.trim_window/3`'s pattern for the rolling sum
+> rather than writing new window code, and use the phase 0 quote
+> machinery for the book.
+>
+> **State** must carry the previous bid price *and* size and ask price
+> *and* size — the deltas are meaningless without both. First tick after
+> init has no previous book, so it contributes nothing and returns
+> `:warming_up`.
+>
+> **Read the "Provider shapes differ" section of this plan before
+> starting.** OFI is the signal most sensitive to the merge policy: a
+> mis-paired update does not raise, it silently produces a wrong number.
+> Confirm the live quote arrival rate first — OFI over a throttled or
+> coalesced feed is a different, weaker statistic wearing the validated
+> name.
+>
+> **Tests:** each of the six price-direction cases separately with
+> hand-computed contributions; a full window summing several updates;
+> first-tick-after-init returning `:warming_up`; and a window rolling
+> off old contributions.
+>
+> **Done when:** the standard bar, pushed on `claude/ofi`.
+
 ### Phase 3 — `:quoted_spread` / `:effective_spread`
 
 - **Quoted**: `ask − bid`, or relative to mid. Trivial from a merged
@@ -133,6 +232,32 @@ sum over a window.
 
 Both are a cost input *and* a liquidity-regime feature — a widening
 spread is a tradeable state change, not just a fee.
+
+> **Prompt — phase 3**
+>
+> In `trading_core/`, add `:quoted_spread` and `:effective_spread` kinds.
+>
+> - **`:quoted_spread`** — `ask - bid`, or `(ask - bid) / mid` when
+>   `params["relative"]` is true. Straight off the phase 0 quote state.
+> - **`:effective_spread`** — `2 * abs(trade_price - mid_at_execution)`,
+>   again relative to mid when asked.
+>
+> **The honesty problem, which must be documented rather than hidden:**
+> effective spread needs the mid *prevailing at execution*. On a snapshot
+> feed carrying `quote_timestamp` that is a real lookup. Without one it
+> degrades to mid-at-last-merged-quote, which is an approximation. Say so
+> in the moduledoc and name the condition under which it is exact; do not
+> let a caller assume precision the data does not support.
+>
+> Return `:warming_up` when the book is incomplete, and when a crossed or
+> locked book would make the spread negative or zero — a negative spread
+> is bad data, not a tradeable signal.
+>
+> **Tests:** absolute and relative forms for both kinds; a crossed book
+> returning `:warming_up`; effective spread against a known trade and
+> mid; incomplete book cases.
+>
+> **Done when:** the standard bar, pushed on `claude/spread-measures`.
 
 ### Phase 4 — `:signed_volume`
 
@@ -148,6 +273,35 @@ Tick-rule or Lee-Ready classification of each print, then netted.
 
 Complements OFI: executions versus quote revisions.
 
+> **Prompt — phase 4**
+>
+> In `trading_core/`, add a `:signed_volume` kind netting
+> buyer-initiated against seller-initiated volume over a window.
+>
+> One kind, with `params["classifier"]`:
+> - **`"tick_rule"`** (default) — sign from the trade price against the
+>   *previous trade price*: higher → buy, lower → sell, equal → carry the
+>   previous sign forward. Needs no quote data.
+> - **`"lee_ready"`** — trade above mid → buy, below → sell, exactly at
+>   mid → fall back to the tick rule. Needs the phase 0 quote state.
+>
+> Mirror `:spread`'s `beta_mode` dispatch: one clause per classifier,
+> **raise on an unrecognised value** rather than defaulting silently.
+>
+> **Do not accept a caller-supplied trade side.** Classification is the
+> computation this kind exists to perform; taking it as input moves the
+> logic into the caller and loses replay equivalence. The tick carries
+> trade price and size; this kind decides the sign.
+>
+> First trade has no predecessor and no carried sign, so it contributes
+> nothing and returns `:warming_up`.
+>
+> **Tests:** each classifier separately; the equal-price carry-forward;
+> `lee_ready`'s at-mid fallback to tick rule; an unrecognised classifier
+> raising; first-trade `:warming_up`; window roll-off.
+>
+> **Done when:** the standard bar, pushed on `claude/signed-volume`.
+
 ### Phase 5 — `:kyle_lambda`
 
 Rolling regression of mid return on signed volume. A direct price-impact
@@ -156,6 +310,32 @@ and liquidity measure, and a good conditioning variable.
 Depends on phase 4's output. **`Signals.rolling_ols_beta/4` already
 exists** from the `:spread` work and is exactly this shape — strong reuse
 candidate rather than new regression code.
+
+> **Prompt — phase 5**
+>
+> In `trading_core/`, add a `:kyle_lambda` kind: the rolling regression
+> slope of mid return on signed volume. Phase 4 must have merged.
+>
+> **Reuse `TradingCore.Signals.rolling_ols_beta/4`.** It already fits a
+> rolling OLS over a `{x, y}` window and returns `{beta, alpha}` — do not
+> write a second regression. Here `x` is signed volume over the interval
+> and `y` is the mid return over the same interval.
+>
+> Lambda is the slope: higher means a given signed volume moves price
+> further, i.e. thinner liquidity. Emitting it is the point; it is a
+> conditioning variable, not a trade trigger.
+>
+> **Guard the degenerate case.** A window with no variation in signed
+> volume gives a meaningless or explosive slope — `rolling_ols_beta/4`
+> should already return `nil` there, but assert it rather than assume it,
+> the same way `Signals.zscore/2`'s relative stdev floor exists because a
+> near-constant window emitting a confident number is worse than emitting
+> nothing.
+>
+> **Tests:** a hand-computed slope on a known series; a flat signed-volume
+> window returning `:warming_up`; insufficient samples; window roll-off.
+>
+> **Done when:** the standard bar, pushed on `claude/kyle-lambda`.
 
 ### Phase 6 — `:two_scale_rv`
 
@@ -168,6 +348,37 @@ the noise-corrected estimator is the point.
 Decide up front whether the slow scale is time-based or tick-count-based.
 They diverge badly on thin names, and the choice should be explicit in
 `params` rather than implicit in the implementation.
+
+> **Prompt — phase 6**
+>
+> In `trading_core/`, add a `:two_scale_rv` kind: noise-corrected
+> realized volatility (Zhang/Mykland/Aït-Sahalia).
+>
+> **Independent of phases 1–5** — it needs only trade prices, so it can be
+> built any time, including before them.
+>
+> Naive tick-frequency RV is dominated by microstructure noise: sampling
+> faster makes the estimate *worse*, not better, because each print
+> carries bid-ask bounce. The two-scale estimator computes RV on a fast
+> scale and a slow (subsampled) scale and combines them to cancel the
+> noise term. Shipping naive tick RV instead is the failure this phase
+> exists to avoid.
+>
+> **Make the slow scale explicit in `params`**, not implicit: a
+> tick-count subsample and a time-based subsample give materially
+> different answers on a thin name, and the caller must choose. Raise on
+> an unrecognised mode rather than defaulting silently.
+>
+> Return `:warming_up` until the slow scale has enough samples to be
+> estimable at all.
+>
+> **Tests:** the estimator against a hand-computed value on a short
+> series; both subsample modes on the same input, asserting they differ;
+> an unrecognised mode raising; insufficient-sample cases. A property
+> test that the corrected estimate is not systematically larger than
+> naive RV on a noisy series would be worth having.
+>
+> **Done when:** the standard bar, pushed on `claude/two-scale-rv`.
 
 ---
 
