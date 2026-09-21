@@ -124,6 +124,47 @@ defmodule TradingCore.Signal.TwoScaleRvTest do
       assert_in_delta value, true_rv, true_rv * 0.25
     end
 
+    # Regression: found by replaying 1874 real SPY ticks through the kind.
+    # On a live feed trades and quotes are separate messages -- roughly 3
+    # of every 4 ticks carry no trade price -- so a clause requiring
+    # :value crashed on the majority of real input. Realized volatility
+    # is defined over TRADE prices; a quote is not an observation of one.
+    test "a quote-only tick contributes nothing instead of crashing" do
+      quote_tick = %{at: @now, value: nil, bid: 99.98, ask: 100.02}
+
+      spec = %Spec{kind: :two_scale_rv, symbol: "SPY"}
+      {:ok, state} = Compute.init(spec)
+
+      assert {^state, :warming_up} = Compute.step(spec, state, quote_tick)
+    end
+
+    test "a tick omitting :value entirely is also safe" do
+      spec = %Spec{kind: :two_scale_rv, symbol: "SPY"}
+      {:ok, state} = Compute.init(spec)
+
+      assert {^state, :warming_up} = Compute.step(spec, state, %{at: @now, bid: 99.98})
+    end
+
+    test "interleaved quote and trade ticks still compute from the trades" do
+      {_true, noisy} = noisy_walk(200, 0.0004)
+
+      spec = %Spec{kind: :two_scale_rv, symbol: "SPY", params: %{"subsample_k" => 5}}
+      {:ok, state} = Compute.init(spec)
+
+      # A quote between every trade, as a real feed delivers.
+      {_state, value} =
+        noisy
+        |> Enum.with_index()
+        |> Enum.reduce({state, :warming_up}, fn {price, i}, {acc, _} ->
+          at = DateTime.add(@now, i, :second)
+          {acc, _} = Compute.step(spec, acc, %{at: at, value: nil, bid: 99.0, ask: 101.0})
+          Compute.step(spec, acc, %{at: at, value: price})
+        end)
+
+      assert is_float(value)
+      assert value > 0.0
+    end
+
     test "warms up until the slow scale has enough samples" do
       {_state, value} = run(%{"subsample_k" => 10}, Enum.map(1..5, &(100.0 + &1)))
 

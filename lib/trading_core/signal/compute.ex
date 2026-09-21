@@ -629,20 +629,18 @@ defmodule TradingCore.Signal.Compute do
   # "every 10th print" and "every 10 seconds" are different estimators
   # rather than two spellings of one. Forcing the caller to say which is
   # the point; an unrecognised mode raises rather than defaulting.
-  def step(%Spec{kind: :two_scale_rv} = spec, state, %{at: now, value: value}) do
-    opts = window_opts(spec)
-
-    prices =
-      [{now, to_decimal(value)} | state.prices]
-      |> trim_price_window(now, opts)
-
-    state = %{state | prices: prices}
-
-    # Oldest first for the estimator; state holds newest first.
-    ordered = prices |> Enum.reverse() |> Enum.map(&elem(&1, 1))
-
-    {state, warm(two_scale_rv_value(ordered, prices, spec))}
+  # A tick with no trade price contributes nothing. On a real feed,
+  # trades and quotes arrive as separate messages — measured on Polygon's
+  # WS, roughly 3 of every 4 ticks are quote-only — so a clause requiring
+  # :value would crash on the majority of live input. Realized volatility
+  # is defined over *trade* prices; a quote is not an observation of one.
+  def step(%Spec{kind: :two_scale_rv} = spec, state, %{at: now} = tick) do
+    case Map.get(tick, :value) do
+      nil -> {state, :warming_up}
+      value -> two_scale_rv_step(spec, state, now, value)
+    end
   end
+
 
 
   # Quoted spread: ask - bid, or (ask - bid) / mid when params
@@ -930,6 +928,21 @@ defmodule TradingCore.Signal.Compute do
       nil -> value
       precision -> Decimal.round(value, precision)
     end
+  end
+
+  defp two_scale_rv_step(spec, state, now, value) do
+    opts = window_opts(spec)
+
+    prices =
+      [{now, to_decimal(value)} | state.prices]
+      |> trim_price_window(now, opts)
+
+    state = %{state | prices: prices}
+
+    # Oldest first for the estimator; state holds newest first.
+    ordered = prices |> Enum.reverse() |> Enum.map(&elem(&1, 1))
+
+    {state, warm(two_scale_rv_value(ordered, prices, spec))}
   end
 
   defp classifier!(%Spec{params: params}) do
