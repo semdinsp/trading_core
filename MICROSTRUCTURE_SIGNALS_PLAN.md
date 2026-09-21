@@ -16,7 +16,8 @@ quotes/sec, measured), but on **bid/ask sizes being dropped** by
 Needs a one-line-ish fix in `trading_hub`, which is a sibling app this
 repo must not edit — so it needs a handoff prompt.
 
-Phases 3 and 6 are **not** blocked and can proceed today.
+Phases 3, 4 and 6 are **done**. Only 2 (OFI) and 5 (Kyle's lambda,
+which consumes phase 4's output alongside sizes) remain blocked.
 
 **Feed decision: Massive/Polygon quotes, not IBKR.** Confirmed by the
 user 2026-09-20 — forcing the microstructure kinds onto a snapshot quote
@@ -355,7 +356,7 @@ spread is a tradeable state change, not just a fee.
 >
 > **Done when:** the standard bar, pushed on `claude/spread-measures`.
 
-### Phase 4 — `:signed_volume`
+### Phase 4 — `:signed_volume` — **DONE**
 
 Tick-rule or Lee-Ready classification of each print, then netted.
 
