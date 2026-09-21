@@ -8,8 +8,15 @@ All six are incremental and streaming, so they fit the existing
 `Spec` → `init/1` → `step/2` → `replay/3` machinery. That part genuinely
 is free. **The tick shape is not** — see phase 0.
 
-Status: **phases 0 and 1 complete** (merged). Phase 2 (OFI) is next, and
-is gated on verifying live quote arrival rate.
+Status: **phases 0 and 1 complete** (merged).
+
+**Phase 2 is BLOCKED** — not on rate (the Polygon WebSocket delivers 88
+quotes/sec, measured), but on **bid/ask sizes being dropped** by
+`trading_hub`'s WS quote handler. See "MEASURED, 2026-09-21" below.
+Needs a one-line-ish fix in `trading_hub`, which is a sibling app this
+repo must not edit — so it needs a handoff prompt.
+
+Phases 3 and 6 are **not** blocked and can proceed today.
 
 **Feed decision: Massive/Polygon quotes, not IBKR.** Confirmed by the
 user 2026-09-20 — forcing the microstructure kinds onto a snapshot quote
@@ -37,6 +44,61 @@ anything ever uses it.
 No bid, ask, bid size, ask size, or trade price distinct from `:value`.
 Four of the six signals need data this type cannot express, so a tick
 extension is the prerequisite for everything except two-scale RV.
+
+### MEASURED, 2026-09-21 — read this before phase 2
+
+Live measurement of SPY during market hours, three feeds compared. This
+supersedes the speculation in the section below, and changes what phase 2
+can be built on.
+
+| | IBKR (`prices:SPY`) | Polygon **WS** (`prices:polygon:SPY`) | Polygon `PolygonStreamer` |
+|---|---|---|---|
+| Rate | 2.9 quotes/sec | **88.3 quotes/sec** | ~1 per 12s |
+| Quote gap p50 | **253 ms** (throttled) | **0 ms** (p90 = 11 ms) | 15 s |
+| Both sides per message | **0 of 111** | **2650 of 2650** | n/a |
+| **Bid/ask sizes** | **yes** | **NO — dropped** | yes |
+
+Three conclusions:
+
+1. **IBKR is a 4Hz sampler, not a quote stream.** The gap histogram is
+   quantized — a spike at 0 ms, then mass at 200–250 ms, nothing below.
+   That is IBKR's standard snapshot bucket. OFI computed on it would be
+   OFI over a sampled book.
+2. **`TradingHub.MarketData.PolygonStreamer` is not a streamer.** Despite
+   the name it polls REST every 15 s through a 5-calls/60-s budget, and
+   is explicitly marked deprecated in
+   `trading_hub/MARKET_DATA_GUIDE.md`. The flag
+   `:polygon_streaming_enabled` belongs to *it*, not to the WebSocket —
+   checking that flag to answer "is Polygon streaming up?" gives the
+   wrong answer, which the guide warns about and which this measurement
+   initially got wrong.
+3. **`TradingHub.Polygon.WebSocketClient` is the real thing** and is
+   already enabled (`:polygon_ws_enabled` = true) and running. 88
+   quotes/sec, both sides on every message, sub-millisecond median gap.
+   This is a genuine tick-level quote feed and OFI is well-posed on it.
+
+**The one blocker: sizes are dropped in translation.** Polygon's `Q`
+event carries `"bs"`/`"as"` (bid and ask size), but
+`web_socket_client.ex:480`'s `broadcast_quote/1` pattern-matches only
+`"bp"`/`"ap"` and publishes `%{bid:, ask:, timestamp:}`. So the feed with
+the right *rate* currently lacks the sizes, and the feeds with sizes have
+the wrong rate.
+
+Every size-dependent signal is blocked on that: **`:book_imbalance`
+(phase 1, already built), `:ofi` (phase 2)**. Not blocked:
+`:quoted_spread` (phase 3, prices only), `:two_scale_rv` (phase 6, trades
+only).
+
+**`trading_hub` is a sibling app — this repo must not edit it.** The fix
+is to add `"bs"`/`"as"` to that pattern match and include `bid_size`/
+`ask_size` in the broadcast payload, which needs a handoff prompt to
+`trading_hub`'s own session. Until then, phase 1 runs correctly against
+IBKR's sized-but-slow feed and phase 2 should not be started.
+
+To reproduce: subscribe via
+`TradingHub.Polygon.WebSocketClient.subscribe_symbol("SPY", "your_tag")`
+then listen on `TradingContract.Topics.prices_polygon("SPY")`. See
+`trading_hub/MARKET_DATA_GUIDE.md`.
 
 ### Provider shapes differ, and it matters
 
@@ -184,6 +246,40 @@ sum over a window.
   policy — a mis-paired update does not error, it silently produces a
   wrong number.
 - Verify quote arrival rate before trusting output (see above).
+
+> **Prompt — for `trading_hub`'s session (unblocks phase 2)**
+>
+> In `trading_hub/`, include bid and ask **sizes** in the Polygon
+> WebSocket quote broadcast.
+>
+> `lib/trading_hub/polygon/web_socket_client.ex:480`'s `broadcast_quote/1`
+> currently matches only the prices:
+>
+> ```elixir
+> defp broadcast_quote(%{"sym" => symbol, "bp" => bid, "ap" => ask, "t" => timestamp_ms}) do
+> ```
+>
+> Polygon's `Q` event also carries `"bs"` (bid size) and `"as"` (ask
+> size). Add them to the match and to the broadcast `data` map as
+> `bid_size`/`ask_size`, converted the same way the prices are.
+>
+> **Why:** `trading_core`'s microstructure kinds — `:book_imbalance`
+> (built) and `:ofi` (blocked on this) — compute
+> `(bid_size - ask_size) / (bid_size + ask_size)` and per-update size
+> deltas. Measured 2026-09-21: the Polygon WS feed delivers 88
+> quotes/sec with both sides on every message, which is exactly the rate
+> those signals need, but the sizes are dropped here so they cannot be
+> computed from it. IBKR's feed carries sizes but is throttled to ~250 ms,
+> which is too coarse for order-flow imbalance.
+>
+> **Keep it additive.** Existing consumers match on `:bid`/`:ask`; adding
+> keys must not change what they see. Match sizes as optional if a `Q`
+> event can ever omit them, rather than letting a sizeless quote fall
+> through to the `broadcast_quote(_quote), do: :ok` catch-all and silently
+> stop publishing quotes.
+>
+> Worth updating `MARKET_DATA_GUIDE.md`'s quote-shape example too — it
+> documents `%{bid:, ask:, timestamp:}`.
 
 > **Prompt — phase 2**
 >
