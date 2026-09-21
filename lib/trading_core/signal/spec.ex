@@ -149,6 +149,8 @@ defmodule TradingCore.Signal.Spec do
           | :spread
           | :book_imbalance
           | :two_scale_rv
+          | :quoted_spread
+          | :effective_spread
 
   @type t :: %__MODULE__{
           kind: kind(),
@@ -180,7 +182,7 @@ defmodule TradingCore.Signal.Spec do
   # its own feed (top-of-book quotes arriving on the tick) and wraps no
   # parent node. Its input is quote state rather than a price series,
   # which is a difference in tick shape, not in parentage.
-  @base_kinds ~w(plain momentum volume vwap donchian rolling_volume spread book_imbalance two_scale_rv)a
+  @base_kinds ~w(plain momentum volume vwap donchian rolling_volume spread book_imbalance two_scale_rv quoted_spread effective_spread)a
 
   # Mirrors @single_parent_kinds: wrap exactly one parent's own value
   # stream over time.

@@ -8,7 +8,7 @@ defmodule TradingCore.Signal.SpecTest do
              Enum.sort(~w(
                plain momentum derivative second_derivative wavelet volume vwap donchian
                rolling_volume self_zscore percent_deviation zscore regime ratio spread
-               book_imbalance two_scale_rv
+               book_imbalance two_scale_rv quoted_spread effective_spread
              )a)
   end
 
