@@ -132,7 +132,8 @@ defmodule TradingCore.Signal.Compute do
       `:volume`, `:vwap`, `:donchian`, `:rolling_volume`, `:spread` (owns
       *two* symbols — see `Spec`'s own moduledoc, "Why `:spread` is a base
       kind"), `:book_imbalance` (reads top-of-book quote fields rather
-      than a price series — see "Quote merging" above), `:two_scale_rv`
+      than a price series — see "Quote merging" above), `:two_scale_rv`,
+      `:signed_volume`
       kind"), `:book_imbalance`, `:quoted_spread`,
       `:effective_spread` (read top-of-book quote fields rather than a
       price series — see "Quote merging" above)
@@ -277,6 +278,20 @@ defmodule TradingCore.Signal.Compute do
   def init(%Spec{kind: :regime}), do: {:ok, %{direction: nil, gate: nil}}
 
   def init(%Spec{kind: :book_imbalance}), do: {:ok, %{quote: new_quote_state()}}
+
+  def init(%Spec{kind: :signed_volume} = spec) do
+    # Validate the classifier at init, same reasoning as :two_scale_rv's
+    # subsample_mode — a misconfigured spec should fail where it is built.
+    _ = classifier!(spec)
+
+    {:ok,
+     %{
+       quote: new_quote_state(),
+       last_price: nil,
+       last_sign: nil,
+       history: []
+     }}
+  end
 
   def init(%Spec{kind: :two_scale_rv} = spec) do
     # Validate the mode at init rather than on the first tick, so a
@@ -563,6 +578,40 @@ defmodule TradingCore.Signal.Compute do
   # snapshot feed both sides always share a timestamp so the bound never
   # bites; on a partial-update feed it is what stops a fresh bid being
   # paired against a stale ask — see quote_ready?/2's own doc.
+  # Signed volume: buyer-initiated minus seller-initiated volume over the
+  # window. Complements :ofi — that measures quote revisions, this
+  # measures the executions that actually happened.
+  #
+  # params "classifier":
+  #
+  #   "tick_rule" (default) — sign from this trade's price against the
+  #     PREVIOUS TRADE's price. Up = buy, down = sell, unchanged = carry
+  #     the previous sign forward (a zero-tick inherits, it does not
+  #     count as neutral). Needs no quote data at all.
+  #
+  #   "lee_ready" — trade above the prevailing mid = buy, below = sell,
+  #     exactly at mid = fall back to the tick rule. More accurate when a
+  #     good quote is available, which is why it is not the default: it
+  #     silently degrades to tick_rule without one.
+  #
+  # The classifier is a computation this kind performs, never an input.
+  # A caller-supplied trade side would move the logic out of here and
+  # lose replay equivalence — the same reason quote merging lives in this
+  # module rather than in each consumer.
+  def step(%Spec{kind: :signed_volume} = spec, state, %{at: now} = tick) do
+    quote_state = merge_quote(state.quote, tick, now)
+    state = %{state | quote: quote_state}
+    price = Map.get(tick, :value)
+
+    if price == nil do
+      # A quote-only tick refreshes the book for a later lee_ready
+      # classification but is not itself an execution.
+      {state, :warming_up}
+    else
+      classify_trade(spec, state, quote_state, to_decimal(price), tick, now)
+    end
+  end
+
   # Two-scale realized volatility (Zhang/Mykland/Aït-Sahalia). Emits the
   # noise-corrected variance over the window — see
   # TradingCore.Signals.two_scale_rv/2 for why naive tick RV is not an
@@ -880,6 +929,72 @@ defmodule TradingCore.Signal.Compute do
     case Map.get(params, "precision") do
       nil -> value
       precision -> Decimal.round(value, precision)
+    end
+  end
+
+  defp classifier!(%Spec{params: params}) do
+    case Map.get(params, "classifier", "tick_rule") do
+      "tick_rule" -> :tick_rule
+      "lee_ready" -> :lee_ready
+      other -> raise ArgumentError, ":signed_volume unknown classifier #{inspect(other)}"
+    end
+  end
+
+  defp classify_trade(spec, state, quote_state, price, tick, now) do
+    sign = trade_sign(classifier!(spec), price, quote_state, state)
+
+    state = %{state | last_price: price, last_sign: sign || state.last_sign}
+
+    case sign do
+      nil ->
+        # No predecessor and no prevailing quote: nothing to sign this
+        # trade against. It updates last_price so the NEXT trade has a
+        # reference, but contributes no volume.
+        {state, :warming_up}
+
+      sign ->
+        size = tick |> Map.get(:volume, 1) |> to_decimal()
+        signed = Decimal.mult(size, Decimal.new(sign))
+        opts = window_opts(spec)
+        history = trim_price_window([{now, signed} | state.history], now, opts)
+        state = %{state | history: history}
+
+        total = Enum.reduce(history, Decimal.new(0), fn {_at, v}, acc -> Decimal.add(acc, v) end)
+
+        {state, round_to_precision(total, spec.params)}
+    end
+  end
+
+  # Lee-Ready: compare against the prevailing mid, falling back to the
+  # tick rule exactly at mid (or with no usable quote).
+  defp trade_sign(:lee_ready, price, %{bid: bid, ask: ask} = quote_state, state)
+       when not is_nil(bid) and not is_nil(ask) do
+    if quoted_spread(quote_state, %Spec{kind: :quoted_spread, params: %{}}) == nil do
+      trade_sign(:tick_rule, price, quote_state, state)
+    else
+      case Decimal.compare(price, mid_price(bid, ask)) do
+        :gt -> 1
+        :lt -> -1
+        :eq -> trade_sign(:tick_rule, price, quote_state, state)
+      end
+    end
+  end
+
+  defp trade_sign(:lee_ready, price, quote_state, state),
+    do: trade_sign(:tick_rule, price, quote_state, state)
+
+  # Tick rule: up = buy, down = sell, unchanged = carry the previous sign
+  # forward. A zero-tick inherits rather than counting as neutral — a
+  # trade at an unchanged price is conventionally attributed to whichever
+  # side was pressing last, and treating it as 0 would systematically
+  # understate flow on a quiet tape where most prints repeat.
+  defp trade_sign(:tick_rule, _price, _quote_state, %{last_price: nil}), do: nil
+
+  defp trade_sign(:tick_rule, price, _quote_state, %{last_price: last, last_sign: last_sign}) do
+    case Decimal.compare(price, last) do
+      :gt -> 1
+      :lt -> -1
+      :eq -> last_sign
     end
   end
 
