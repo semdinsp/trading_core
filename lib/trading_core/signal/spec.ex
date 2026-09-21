@@ -147,6 +147,7 @@ defmodule TradingCore.Signal.Spec do
           | :regime
           | :ratio
           | :spread
+          | :book_imbalance
 
   @type t :: %__MODULE__{
           kind: kind(),
@@ -174,7 +175,11 @@ defmodule TradingCore.Signal.Spec do
   # :spread is base-like despite comparing two symbols — see "Why :spread
   # is a base kind" above — so it belongs in this list, not
   # @dual_parent_kinds, even though its Spec.t() carries a second symbol.
-  @base_kinds ~w(plain momentum volume vwap donchian rolling_volume spread)a
+  # :book_imbalance is base-like for the same reason :spread is — it owns
+  # its own feed (top-of-book quotes arriving on the tick) and wraps no
+  # parent node. Its input is quote state rather than a price series,
+  # which is a difference in tick shape, not in parentage.
+  @base_kinds ~w(plain momentum volume vwap donchian rolling_volume spread book_imbalance)a
 
   # Mirrors @single_parent_kinds: wrap exactly one parent's own value
   # stream over time.
