@@ -182,6 +182,13 @@ within the window and retail-size prints do not move the most liquid ETF
 in the world. Read the magnitude; do not read the sign of a near-zero
 slope as direction.
 
+This generalises, and is worth stating plainly: **a signal being
+uninformative on SPY is not evidence the signal is broken.** The most
+liquid instrument available is the hardest place to measure impact,
+reversion, or imbalance, precisely because it is efficient. Validate a
+microstructure signal on something thinner before concluding it does not
+work.
+
 ---
 
 ## Family 3: derived kinds
