@@ -133,6 +133,9 @@ defmodule TradingCore.Signal.Compute do
       *two* symbols — see `Spec`'s own moduledoc, "Why `:spread` is a base
       kind"), `:book_imbalance` (reads top-of-book quote fields rather
       than a price series — see "Quote merging" above), `:two_scale_rv`
+      kind"), `:book_imbalance`, `:quoted_spread`,
+      `:effective_spread` (read top-of-book quote fields rather than a
+      price series — see "Quote merging" above)
     * single-parent (wraps `:parent`'s emitted values): `:derivative`,
       `:second_derivative`, `:wavelet`, `:self_zscore`
     * dual-parent (`:parent` vs. `:reference`): `:percent_deviation`,
@@ -282,6 +285,9 @@ defmodule TradingCore.Signal.Compute do
     _ = subsample_mode!(spec)
     {:ok, %{prices: []}}
   end
+  def init(%Spec{kind: :quoted_spread}), do: {:ok, %{quote: new_quote_state()}}
+
+  def init(%Spec{kind: :effective_spread}), do: {:ok, %{quote: new_quote_state()}}
 
   def init(%Spec{kind: :spread} = spec) do
     beta_mode = Map.get(spec.params, "beta_mode", "static")
@@ -589,6 +595,43 @@ defmodule TradingCore.Signal.Compute do
     {state, warm(two_scale_rv_value(ordered, prices, spec))}
   end
 
+
+  # Quoted spread: ask - bid, or (ask - bid) / mid when params
+  # "relative" is true. Both a cost input and a liquidity-regime feature
+  # — a widening spread is a tradeable state change, not just a fee.
+  def step(%Spec{kind: :quoted_spread} = spec, state, %{at: now} = tick) do
+    quote_state = merge_quote(state.quote, tick, now)
+    state = %{state | quote: quote_state}
+
+    if quote_ready?(quote_state, Map.get(spec.params, "max_quote_staleness_ms")) do
+      {state, warm(quoted_spread(quote_state, spec))}
+    else
+      {state, :warming_up}
+    end
+  end
+
+  # Effective spread: 2 * |trade_price - mid|, the cost a taker actually
+  # paid relative to the midpoint, which is what quoted spread only
+  # approximates once you account for where inside (or outside) the
+  # spread a print lands.
+  #
+  # Emits only on a tick carrying a trade (:value). A quote-only tick
+  # updates the book and stays :warming_up — there is no execution to
+  # measure. See effective_spread/3 for the timestamp caveat.
+  def step(%Spec{kind: :effective_spread} = spec, state, %{at: now} = tick) do
+    quote_state = merge_quote(state.quote, tick, now)
+    state = %{state | quote: quote_state}
+    trade_price = Map.get(tick, :value)
+
+    ready? = quote_ready?(quote_state, Map.get(spec.params, "max_quote_staleness_ms"))
+
+    if ready? and trade_price != nil do
+      {state, warm(effective_spread(quote_state, trade_price, spec))}
+    else
+      {state, :warming_up}
+    end
+  end
+
   def step(%Spec{kind: :book_imbalance} = spec, state, %{at: now} = tick) do
     quote_state = merge_quote(state.quote, tick, now)
     state = %{state | quote: quote_state}
@@ -739,6 +782,76 @@ defmodule TradingCore.Signal.Compute do
 
   def quote_ready?(%{bid_at: bid_at, ask_at: ask_at}, max_ms) do
     abs(DateTime.diff(bid_at, ask_at, :millisecond)) <= max_ms
+  end
+
+  # A crossed or locked book (ask <= bid) yields nil rather than a zero
+  # or negative spread. Negative is arithmetically impossible for a real
+  # spread, so it is bad data — a stale side, a mis-paired quote, or a
+  # genuine crossed market mid-auction — and none of those are a
+  # tradeable liquidity reading. Emitting 0.0 for a locked book would be
+  # worse still: indistinguishable from an infinitely tight real market.
+  defp quoted_spread(%{bid: bid, ask: ask}, spec) do
+    spread = Decimal.sub(ask, bid)
+
+    if Decimal.compare(spread, 0) != :gt do
+      nil
+    else
+      spread
+      |> maybe_relative_to_mid(bid, ask, spec)
+      |> round_to_precision(spec.params)
+    end
+  end
+
+  # 2 * |trade_price - mid|.
+  #
+  # ## The timestamp caveat — do not let a caller assume more precision
+  #
+  # Effective spread is defined against the mid *prevailing at the
+  # moment of execution*. This function uses the mid from the most
+  # recently merged quote, which is exact only when the caller feeds
+  # ticks in true event order and the quote preceding a trade is the one
+  # that was live when it printed.
+  #
+  # That holds on a real-time WebSocket feed delivering trades and quotes
+  # as separate messages in arrival order (measured 2026-09-21: Polygon's
+  # WS gives ~88 quotes/sec with a sub-millisecond median gap, so the
+  # prevailing quote is rarely more than a millisecond stale). It does
+  # NOT hold when replaying rows joined by a coarse timestamp, or on a
+  # throttled snapshot feed where the "current" quote may be up to a
+  # bucket-width old — IBKR's is ~250 ms.
+  #
+  # So this is exact under event-ordered streaming and an approximation
+  # otherwise. Bound it with "max_quote_staleness_ms" when the feed does
+  # not guarantee ordering; the value is then refused rather than
+  # silently computed against a stale mid.
+  defp effective_spread(%{bid: bid, ask: ask} = quote_state, trade_price, spec) do
+    # A crossed book makes the mid meaningless too, so reuse that guard.
+    if quoted_spread(quote_state, %{spec | params: %{}}) == nil do
+      nil
+    else
+      mid = mid_price(bid, ask)
+
+      trade_price
+      |> to_decimal()
+      |> Decimal.sub(mid)
+      |> Decimal.abs()
+      |> Decimal.mult(2)
+      |> maybe_relative_to_mid(bid, ask, spec)
+      |> round_to_precision(spec.params)
+    end
+  end
+
+  defp mid_price(bid, ask), do: bid |> Decimal.add(ask) |> Decimal.div(2)
+
+  # Both spreads are reported in price terms by default, or as a fraction
+  # of mid when params "relative" is true — the relative form is what
+  # compares meaningfully across instruments at different price levels.
+  defp maybe_relative_to_mid(value, bid, ask, spec) do
+    if Map.get(spec.params, "relative", false) do
+      Decimal.div(value, mid_price(bid, ask))
+    else
+      value
+    end
   end
 
   # nil rather than a number whenever the ratio would be meaningless:

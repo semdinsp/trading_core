@@ -317,7 +317,7 @@ sum over a window.
 >
 > **Done when:** the standard bar, pushed on `claude/ofi`.
 
-### Phase 3 — `:quoted_spread` / `:effective_spread`
+### Phase 3 — `:quoted_spread` / `:effective_spread` — **DONE**
 
 - **Quoted**: `ask − bid`, or relative to mid. Trivial from a merged
   quote.
