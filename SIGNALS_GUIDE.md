@@ -189,11 +189,31 @@ instant — and that failure is **silent**: valid arithmetic, an
 ordinary-looking number, undetectable downstream. Unbounded is right only
 for a snapshot feed where both sides share a timestamp.
 
-**3. A near-zero or negative `:kyle_lambda` is a real reading.** On live
-SPY over 60-second windows it sits around `−4e-7`: the mid mean-reverts
-within the window and retail-size prints do not move the most liquid ETF
-in the world. Read the magnitude; do not read the sign of a near-zero
-slope as direction.
+**3. `:kyle_lambda`'s sign depends on the classifier, and near zero it
+carries no information.** Measured on 10,772 live SPY ticks (90s, market
+hours), same data, same window, only `classifier` differing:
+
+| classifier | mean | readings positive |
+|---|---|---|
+| `"lee_ready"` | **−2.5e-7** | 25.6% |
+| `"tick_rule"` | **+5.3e-7** | 99.7% |
+
+Both are "correct"; they classify different trades as buys. `tick_rule`
+signs off the previous *trade* price, which on a fast tape correlates
+with the mid move it is being regressed against — so it recovers a
+positive slope almost always. `lee_ready` signs off the *quote*
+independently of the price path, and on SPY the residual is
+mean-reverting noise around zero.
+
+The magnitudes agree (both ~1e-7 to 1e-6, i.e. essentially no impact);
+only the sign diverges, and it diverges because a near-zero slope has no
+stable sign to report. **Read the magnitude. Do not read the sign of a
+near-zero lambda as direction, and do not compare lambdas fitted with
+different classifiers.**
+
+This was surfaced by two sessions measuring the same signal and getting
+opposite signs — worth stating explicitly so the next person does not
+spend time hunting a bug that is a configuration difference.
 
 This generalises, and is worth stating plainly: **a signal being
 uninformative on SPY is not evidence the signal is broken.** The most
