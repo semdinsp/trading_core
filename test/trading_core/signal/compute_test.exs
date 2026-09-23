@@ -632,12 +632,108 @@ defmodule TradingCore.Signal.ComputeTest do
 
       {_state, second} =
         Compute.step(spec, state, %{
-          at: DateTime.add(@now, 1, :second),
+          at: DateTime.add(@now, 2, :second),
           value: 110,
           reference: 100
         })
 
       assert %Decimal{} = second
+    end
+
+    test "samples both the beta window and the z-score window on a busy feed" do
+      # 2h windows => 30s intervals; ticks 100ms apart for 60s fill two
+      # buckets in each window instead of 600 points.
+      spec = %Spec{
+        kind: :spread,
+        window_ms: :timer.hours(2),
+        params: %{"beta_mode" => "rolling_ols", "beta_window_ms" => :timer.hours(2)}
+      }
+
+      {:ok, state} = Compute.init(spec)
+
+      state =
+        Enum.reduce(0..599, state, fn i, acc ->
+          {next, _} =
+            Compute.step(spec, acc, %{
+              at: DateTime.add(@now, i * 100, :millisecond),
+              value: 100 + rem(i * 7, 13),
+              reference: 50 + rem(i * 5, 11)
+            })
+
+          next
+        end)
+
+      assert length(state.beta_state.history) == 2
+      # Beta warms at the second bucket (30s), so the z-score window has
+      # one bucket so far.
+      assert length(state.spread_history) == 1
+      refute Map.has_key?(state, :cap_bound_drops)
+    end
+
+    test "beta_sample_interval_ms and sample_interval_ms override each window's interval" do
+      spec = %Spec{
+        kind: :spread,
+        window_ms: :timer.hours(2),
+        params: %{
+          "beta_mode" => "rolling_ols",
+          "beta_window_ms" => :timer.hours(2),
+          "beta_sample_interval_ms" => 10_000,
+          "sample_interval_ms" => 5_000
+        }
+      }
+
+      {:ok, state} = Compute.init(spec)
+
+      state =
+        Enum.reduce(0..599, state, fn i, acc ->
+          {next, _} =
+            Compute.step(spec, acc, %{
+              at: DateTime.add(@now, i * 100, :millisecond),
+              value: 100 + rem(i * 7, 13),
+              reference: 50 + rem(i * 5, 11)
+            })
+
+          next
+        end)
+
+      assert length(state.beta_state.history) == 6
+      # The z-score window starts once beta is warm (2 beta points, at
+      # 10s), so 10s..60s at 5s.
+      assert length(state.spread_history) == 10
+    end
+
+    test "counts in-window points either window's cap drops" do
+      spec = %Spec{
+        kind: :spread,
+        window_ms: :timer.hours(2),
+        params: %{
+          "beta_mode" => "rolling_ols",
+          "beta_window_ms" => :timer.hours(2),
+          "beta_sample_interval_ms" => 1_000,
+          "sample_interval_ms" => 1_000,
+          "max_history_samples" => 10
+        }
+      }
+
+      {:ok, state} = Compute.init(spec)
+
+      state =
+        Enum.reduce(0..14, state, fn i, acc ->
+          {next, _} =
+            Compute.step(spec, acc, %{
+              at: DateTime.add(@now, i, :second),
+              value: 100 + rem(i * 7, 13),
+              reference: 50 + rem(i * 5, 11)
+            })
+
+          next
+        end)
+
+      assert length(state.beta_state.history) == 10
+      assert length(state.spread_history) == 10
+      # 5 from the beta window (15 points, cap 10); 4 from the z-score
+      # window, which starts a tick later, once beta is warm.
+      assert state.cap_bound_drops == 9
     end
 
     test "static beta_mode never re-estimates beta/alpha across ticks" do
