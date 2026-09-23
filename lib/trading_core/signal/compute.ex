@@ -376,7 +376,8 @@ defmodule TradingCore.Signal.Compute do
     {%{state | prices: prices}, warm(result)}
   end
 
-  # :derivative, :second_derivative, :self_zscore and :zscore sample their
+  # :derivative, :second_derivative, :self_zscore, :zscore and :spread
+  # (both its beta and z-score windows; see beta_window_opts/1) sample their
   # history at a fixed interval (params["sample_interval_ms"], else
   # TradingCore.Signals.default_sample_interval_ms/1 of window_ms) and
   # count any in-window points the max_history_samples cap drops into
@@ -825,16 +826,18 @@ defmodule TradingCore.Signal.Compute do
 
     beta_opts = beta_window_opts(spec)
 
-    {beta_state, beta_alpha} =
+    {beta_state, beta_alpha, beta_drops} =
       case state.beta_mode do
         "static" ->
-          {state.beta_state, state.beta_state}
+          {state.beta_state, state.beta_state, 0}
 
         "rolling_ols" ->
-          {history, result} =
-            Signals.rolling_ols_beta(state.beta_state.history, {log_x, log_y}, now, beta_opts)
+          old_history = state.beta_state.history
 
-          {%{history: history}, result}
+          {history, result} =
+            Signals.rolling_ols_beta(old_history, {log_x, log_y}, now, beta_opts)
+
+          {%{history: history}, result, beta_cap_drops(old_history, history, now, beta_opts)}
 
         "kalman" ->
           sample_count = state.beta_state.sample_count
@@ -842,21 +845,23 @@ defmodule TradingCore.Signal.Compute do
           {filter_state, result} =
             Signals.kalman_beta(state.beta_state.filter, {log_x, log_y}, sample_count, beta_opts)
 
-          {%{filter: filter_state, sample_count: sample_count + 1}, result}
+          {%{filter: filter_state, sample_count: sample_count + 1}, result, 0}
       end
+
+    state = add_cap_drops(state, beta_drops)
 
     case beta_alpha do
       nil ->
         {%{state | beta_state: beta_state}, :warming_up}
 
       {beta, alpha} ->
-        # One point per tick, as before: fixed-interval sampling (see
-        # sampled_window_opts/1) is not applied to :spread yet.
-        opts = Keyword.put_new(window_opts(spec), :sample_interval_ms, 0)
+        opts = sampled_window_opts(spec)
         spread = Signals.log_spread(log_x, log_y, beta, alpha, opts)
 
         {spread_history, welford, zscore} =
           Signals.self_zscore(state.spread_history, state.welford, spread, now, opts)
+
+        state = track_cap_drops(state, state.spread_history, spread_history, now, opts)
 
         new_state = %{
           state
@@ -1643,7 +1648,8 @@ defmodule TradingCore.Signal.Compute do
   end
 
   # window_opts/1 plus the fixed sampling interval for the kinds that
-  # sample: derivative, second_derivative, self_zscore and zscore.
+  # sample: derivative, second_derivative, self_zscore, zscore and
+  # :spread's z-score window.
   # params["sample_interval_ms"] overrides TradingCore.Signals'
   # default_sample_interval_ms/1. It's a precomputed integer, for the same
   # reason window_ms is (see Spec's "Why window_ms is precomputed").
@@ -1670,22 +1676,34 @@ defmodule TradingCore.Signal.Compute do
     if length(new_history) < max_history_samples do
       state
     else
-      {oldest_kept_at, _} = List.last(new_history)
+      oldest_kept_at = new_history |> List.last() |> elem(0)
       window_ms = Keyword.get(opts, :window_ms, :timer.minutes(5))
       cutoff = DateTime.add(now, -window_ms, :millisecond)
 
       dropped =
-        Enum.count(older, fn {at, _} ->
+        Enum.count(older, fn entry ->
+          at = elem(entry, 0)
           DateTime.compare(at, oldest_kept_at) == :lt and DateTime.compare(at, cutoff) != :lt
         end)
 
-      if dropped > 0,
-        do: Map.update(state, :cap_bound_drops, dropped, &(&1 + dropped)),
-        else: state
+      add_cap_drops(state, dropped)
     end
   end
 
   defp track_cap_drops(state, [], _new_history, _now, _opts), do: state
+
+  # track_cap_drops/5's count for :spread's rolling-OLS beta window, whose
+  # entries are {at, log_x, log_y}.
+  defp beta_cap_drops(old_history, new_history, now, opts) do
+    %{}
+    |> track_cap_drops(old_history, new_history, now, opts)
+    |> Map.get(:cap_bound_drops, 0)
+  end
+
+  defp add_cap_drops(state, 0), do: state
+
+  defp add_cap_drops(state, dropped),
+    do: Map.update(state, :cap_bound_drops, dropped, &(&1 + dropped))
 
   defp maybe_put_precision(opts, params) do
     case Map.get(params, "precision") do
@@ -1708,11 +1726,27 @@ defmodule TradingCore.Signal.Compute do
   # own window: a precomputed millisecond value on params, never a
   # duration string (see Spec's "Why window_ms is precomputed" section —
   # the same reasoning applies to this second window).
+  #
+  # The beta window is sampled at a fixed interval like the z-score window:
+  # params["beta_sample_interval_ms"], else
+  # Signals.default_sample_interval_ms/1 of the beta window. Passed
+  # explicitly because rolling_ols_beta/4 defaults to one point per tick
+  # (kyle_lambda's behavior).
   defp beta_window_opts(%Spec{params: params}) do
-    []
-    |> maybe_put_beta_window_ms(params)
-    |> maybe_put_precision(params)
-    |> maybe_put_max_history_samples(params)
+    opts =
+      []
+      |> maybe_put_beta_window_ms(params)
+      |> maybe_put_precision(params)
+      |> maybe_put_max_history_samples(params)
+
+    interval_ms =
+      Map.get_lazy(params, "beta_sample_interval_ms", fn ->
+        opts
+        |> Keyword.get(:window_ms, :timer.minutes(5))
+        |> Signals.default_sample_interval_ms()
+      end)
+
+    Keyword.put(opts, :sample_interval_ms, interval_ms)
   end
 
   defp maybe_put_beta_window_ms(opts, params) do

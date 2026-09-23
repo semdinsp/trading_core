@@ -85,7 +85,7 @@ defmodule TradingCore.Signals do
   own logic) is pure "compute a value from a window of samples" math, and
   that shape is what `momentum/4` below covers for both callers.
 
-  ## Fixed-interval sampling (`derivative/4`, `self_zscore/5`, `spread_zscore/6`)
+  ## Fixed-interval sampling (`derivative/4`, `self_zscore/5`, `spread_zscore/6`; opt-in for `rolling_ols_beta/4`)
 
   These three keep a history of past samples over `:window_ms`. They used
   to add one point per tick and trim by both `:window_ms` and
@@ -824,6 +824,12 @@ defmodule TradingCore.Signals do
   function here (see this module's moduledoc, "Rounding/precision
   discipline").
 
+  Unlike `derivative/4`, `self_zscore/5` and `spread_zscore/6`, this keeps
+  one point per tick by default. Passing `:sample_interval_ms` (and
+  optionally `:on_cap_bound`) opts into the same fixed-interval sampling
+  (see "Fixed-interval sampling" in the moduledoc). `:spread` opts in;
+  `:kyle_lambda` does not.
+
   Returns `{new_history, nil}` until at least 2 samples are in the window,
   or when `log_x`'s variance in the window is exactly zero (a vertical/
   undefined regression line — every `log_x` sample identical).
@@ -842,12 +848,15 @@ defmodule TradingCore.Signals do
     rounded_x = log_x |> to_decimal() |> Decimal.round(precision)
     rounded_y = log_y |> to_decimal() |> Decimal.round(precision)
 
-    new_history =
-      [{now, rounded_x, rounded_y} | history]
-      |> Enum.filter(fn {at, _x, _y} ->
-        DateTime.compare(at, DateTime.add(now, -window_ms, :millisecond)) != :lt
-      end)
-      |> Enum.take(max_history_samples)
+    # Per tick unless the caller asks for sampling: kyle_lambda relies on
+    # one point per tick here, and only :spread opts in.
+    trim_opts =
+      opts
+      |> Keyword.put(:window_ms, window_ms)
+      |> Keyword.put(:max_history_samples, max_history_samples)
+      |> Keyword.put_new(:sample_interval_ms, 0)
+
+    new_history = sample_and_trim(history, {now, rounded_x, rounded_y}, now, trim_opts)
 
     value =
       case ols(new_history) do
@@ -1116,7 +1125,10 @@ defmodule TradingCore.Signals do
   # which derivative/4's slope reads directly.
   #
   # `sample_interval_ms: 0` turns sampling off (one point per tick).
-  defp sample_and_trim(history, {now_at, _value} = entry, now, opts) do
+  # Entries are any tuple whose first element is its timestamp:
+  # `{at, value}` here, `{at, x, y}` for rolling_ols_beta/4.
+  defp sample_and_trim(history, entry, now, opts) do
+    now_at = elem(entry, 0)
     window_ms = Keyword.get(opts, :window_ms, @default_window_ms)
     max_history_samples = Keyword.get(opts, :max_history_samples, @default_max_history_samples)
 
@@ -1125,8 +1137,8 @@ defmodule TradingCore.Signals do
 
     sampled =
       case history do
-        [{head_at, _} | rest] when interval_ms > 0 ->
-          if bucket(head_at, interval_ms) == bucket(now_at, interval_ms),
+        [head | rest] when interval_ms > 0 ->
+          if bucket(elem(head, 0), interval_ms) == bucket(now_at, interval_ms),
             do: [entry | rest],
             else: [entry | history]
 
@@ -1135,7 +1147,7 @@ defmodule TradingCore.Signals do
       end
 
     cutoff = DateTime.add(now, -window_ms, :millisecond)
-    in_window = Enum.filter(sampled, fn {at, _value} -> DateTime.compare(at, cutoff) != :lt end)
+    in_window = Enum.filter(sampled, &(DateTime.compare(elem(&1, 0), cutoff) != :lt))
     {kept, dropped} = Enum.split(in_window, max_history_samples)
 
     if dropped != [] do

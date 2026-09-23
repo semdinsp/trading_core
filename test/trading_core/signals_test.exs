@@ -240,6 +240,31 @@ defmodule TradingCore.SignalsTest do
     end
   end
 
+  describe "rolling_ols_beta/4 sampling is opt-in" do
+    defp run_ols(ticks, opts) do
+      Enum.reduce(ticks, [], fn {at, x, y}, history ->
+        {history, _} = Signals.rolling_ols_beta(history, {x, y}, at, opts)
+        history
+      end)
+    end
+
+    test "one point per tick by default (kyle_lambda's behavior)" do
+      ticks = for i <- 0..99, do: {DateTime.add(@base, i * 10, :millisecond), 1.0 + i, 2.0 + i}
+      assert length(run_ols(ticks, window_ms: :timer.hours(2))) == 100
+    end
+
+    test "samples at :sample_interval_ms when given" do
+      ticks = for i <- 0..99, do: {DateTime.add(@base, i * 100, :millisecond), 1.0 + i, 2.0 + i}
+
+      history = run_ols(ticks, window_ms: :timer.hours(2), sample_interval_ms: 1_000)
+
+      assert length(history) == 10
+      assert [{at, x, _y} | _] = history
+      assert at == DateTime.add(@base, 9_900, :millisecond)
+      assert Decimal.equal?(x, Decimal.new("100.0"))
+    end
+  end
+
   describe "vwap/3" do
     test "matches a hand-computed weighted average of known price/volume pairs" do
       # 100 shares @ 10.00 + 200 shares @ 13.00 => (1000 + 2600) / 300 = 12.0
