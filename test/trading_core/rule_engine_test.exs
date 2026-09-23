@@ -140,6 +140,97 @@ defmodule TradingCore.RuleEngineTest do
     end
   end
 
+  describe "evaluate/2 — \"not\" fails closed on missing signals" do
+    @volume_gt %{"signal" => "polygon_volume", "op" => "gt", "value" => 48_000}
+
+    test "not over an absent key is false, not true" do
+      refute RuleEngine.evaluate(%{"not" => @volume_gt}, %{})
+    end
+
+    test "not over a present key whose condition is false is true" do
+      assert RuleEngine.evaluate(%{"not" => @volume_gt}, %{"polygon_volume" => 10_000})
+    end
+
+    test "not over an absent value_signal comparand is false" do
+      rule = %{
+        "not" => %{"signal" => "current_price", "op" => "lte", "value_signal" => "run_stop"}
+      }
+
+      refute RuleEngine.evaluate(rule, %{"current_price" => 90})
+    end
+
+    test "a nil value counts as absent under not" do
+      refute RuleEngine.evaluate(%{"not" => @volume_gt}, %{"polygon_volume" => nil})
+    end
+
+    test "not inside all with an absent key fails the all" do
+      rule = %{
+        "all" => [
+          %{"signal" => "vix_last", "op" => "lt", "value" => 18},
+          %{"not" => @volume_gt}
+        ]
+      }
+
+      refute RuleEngine.evaluate(rule, %{"vix_last" => 16})
+      assert RuleEngine.evaluate(rule, %{"vix_last" => 16, "polygon_volume" => 10_000})
+    end
+
+    test "not inside any with an absent key does not carry the any" do
+      rule = %{
+        "any" => [
+          %{"signal" => "vix_last", "op" => "gt", "value" => 30},
+          %{"not" => @volume_gt}
+        ]
+      }
+
+      refute RuleEngine.evaluate(rule, %{"vix_last" => 16})
+      # A definitely-true leg still carries the any past an unknown one.
+      assert RuleEngine.evaluate(rule, %{"vix_last" => 35})
+    end
+
+    test "not over all/any containing an absent key is false" do
+      snapshot = %{"vix_last" => 16}
+      vix_gt = %{"signal" => "vix_last", "op" => "gt", "value" => 30}
+
+      refute RuleEngine.evaluate(%{"not" => %{"any" => [vix_gt, @volume_gt]}}, snapshot)
+      # all of [true, unknown] is unknown, so its negation is too.
+      vix_lt = %{"signal" => "vix_last", "op" => "lt", "value" => 18}
+      refute RuleEngine.evaluate(%{"not" => %{"all" => [vix_lt, @volume_gt]}}, snapshot)
+      # all of [false, unknown] is definitely false, so its negation passes.
+      assert RuleEngine.evaluate(%{"not" => %{"all" => [vix_gt, @volume_gt]}}, snapshot)
+    end
+
+    test "not over a transition op whose prev_ key is missing is false" do
+      rule = %{"not" => %{"signal" => "deriv", "op" => "sign_flip"}}
+
+      refute RuleEngine.evaluate(rule, %{"deriv" => 0.5})
+      assert RuleEngine.evaluate(rule, %{"deriv" => 0.5, "prev_deriv" => 0.4})
+    end
+
+    test "double negation over an absent key stays false" do
+      refute RuleEngine.evaluate(%{"not" => %{"not" => @volume_gt}}, %{})
+
+      assert RuleEngine.evaluate(%{"not" => %{"not" => @volume_gt}}, %{"polygon_volume" => 50_000})
+    end
+
+    test "not over a malformed condition is false" do
+      refute RuleEngine.evaluate(%{"not" => %{"nonsense" => true}}, %{})
+
+      refute RuleEngine.evaluate(%{"not" => %{"signal" => "vix_last", "op" => "lt"}}, %{
+               "vix_last" => 16
+             })
+
+      refute RuleEngine.evaluate(
+               %{"not" => %{"signal" => "vix_last", "op" => "between", "value" => 18}},
+               %{"vix_last" => 16}
+             )
+    end
+
+    test "not over a vacuous rule is false" do
+      refute RuleEngine.evaluate(%{"not" => %{}}, %{})
+    end
+  end
+
   describe "evaluate/2 — malformed rules fail closed" do
     test "unrecognized op is not met" do
       rule = %{"signal" => "vix_last", "op" => "between", "value" => 18}
@@ -770,7 +861,11 @@ defmodule TradingCore.RuleEngineTest do
     end
 
     test "signal_names/1 shape is unchanged for a stateless rule" do
-      rule = %{"signal" => "current_price", "op" => "lte", "value_signal" => "run_stop_loss_price"}
+      rule = %{
+        "signal" => "current_price",
+        "op" => "lte",
+        "value_signal" => "run_stop_loss_price"
+      }
 
       assert RuleEngine.signal_names(rule) == ["current_price", "run_stop_loss_price"]
     end
@@ -802,7 +897,10 @@ defmodule TradingCore.RuleEngineTest do
                snapshot
              )
 
-      refute RuleEngine.evaluate(%{"not" => %{"signal" => "deriv", "op" => "sign_flip"}}, snapshot)
+      refute RuleEngine.evaluate(
+               %{"not" => %{"signal" => "deriv", "op" => "sign_flip"}},
+               snapshot
+             )
     end
   end
 end

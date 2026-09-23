@@ -128,21 +128,59 @@ defmodule TradingCore.RuleEngine do
   is vacuously satisfied (no condition to fail) — this is what lets a version
   with no `rules` configured fall back to "always true" at the entry side and
   rely on the caller's own fallback at the exit side.
+
+  A condition that reads a signal missing from `snapshot` (including a
+  `"value_signal"` comparand or a transition op's `prev_<signal>`) has no
+  determinable truth. Internally it is *unknown*, not false, and unknown
+  propagates through the combinators with three-valued (Kleene) logic:
+
+    * `"not"` of unknown is unknown — so negating a condition over absent
+      data does **not** pass. `{"not": {"signal": "x", "op": "gt", ...}}`
+      is `false` when `x` is missing, not `true`.
+    * `"all"` is false if any leg is false, else unknown if any leg is
+      unknown, else true.
+    * `"any"` is true if any leg is true, else unknown if any leg is
+      unknown, else false.
+
+  Only the final answer collapses unknown to `false`. Without `"not"` this
+  is indistinguishable from treating a missing leaf as `false`; the
+  distinction only matters under a negation, which would otherwise turn
+  "no data" into a pass. A malformed node is likewise unknown, so it fails
+  closed under `"not"` too. `margin_or_nil/2` handles `"not"` the same way
+  (it propagates absence rather than inverting it).
   """
   @spec evaluate(rule() | nil, snapshot()) :: boolean()
-  def evaluate(nil, _snapshot), do: true
-  def evaluate(rule, _snapshot) when map_size(rule) == 0, do: true
+  def evaluate(rule, snapshot), do: eval3(rule, snapshot) == true
 
-  def evaluate(%{"all" => conditions}, snapshot) when is_list(conditions) do
-    Enum.all?(conditions, &evaluate(&1, snapshot))
+  # Three-valued evaluation: `true | false | :unknown`. See evaluate/2's doc.
+  defp eval3(nil, _snapshot), do: true
+  defp eval3(rule, _snapshot) when map_size(rule) == 0, do: true
+
+  defp eval3(%{"all" => conditions}, snapshot) when is_list(conditions) do
+    Enum.reduce_while(conditions, true, fn condition, acc ->
+      case eval3(condition, snapshot) do
+        false -> {:halt, false}
+        :unknown -> {:cont, :unknown}
+        true -> {:cont, acc}
+      end
+    end)
   end
 
-  def evaluate(%{"any" => conditions}, snapshot) when is_list(conditions) do
-    Enum.any?(conditions, &evaluate(&1, snapshot))
+  defp eval3(%{"any" => conditions}, snapshot) when is_list(conditions) do
+    Enum.reduce_while(conditions, false, fn condition, acc ->
+      case eval3(condition, snapshot) do
+        true -> {:halt, true}
+        :unknown -> {:cont, :unknown}
+        false -> {:cont, acc}
+      end
+    end)
   end
 
-  def evaluate(%{"not" => condition}, snapshot) when is_map(condition) do
-    not evaluate(condition, snapshot)
+  defp eval3(%{"not" => condition}, snapshot) when is_map(condition) do
+    case eval3(condition, snapshot) do
+      :unknown -> :unknown
+      value -> not value
+    end
   end
 
   # Transition operators need both edges (the prior value as well as the
@@ -150,27 +188,27 @@ defmodule TradingCore.RuleEngine do
   # rather than a comparand-vs-level pair. Matched ahead of the general
   # leaf clause below; the stateless ops never reach here, so their
   # behavior is bit-identical to before this clause existed.
-  def evaluate(%{"signal" => signal_name, "op" => op} = condition, snapshot)
-      when op in @transition_ops do
+  defp eval3(%{"signal" => signal_name, "op" => op} = condition, snapshot)
+       when op in @transition_ops do
     with {:ok, now} <- fetch_signal(snapshot, signal_name),
          {:ok, prev} <- fetch_signal(snapshot, prev_key(signal_name)),
          {:ok, threshold} <- fetch_transition_comparand(op, condition, snapshot) do
       transition(op, prev, now, threshold)
     else
-      :error -> false
+      :error -> :unknown
     end
   end
 
-  def evaluate(%{"signal" => signal_name, "op" => op} = condition, snapshot) do
+  defp eval3(%{"signal" => signal_name, "op" => op} = condition, snapshot) do
     with {:ok, left} <- fetch_signal(snapshot, signal_name),
          {:ok, right} <- fetch_comparand(condition, snapshot) do
       compare(op, left, right)
     else
-      :error -> false
+      :error -> :unknown
     end
   end
 
-  def evaluate(_malformed, _snapshot), do: false
+  defp eval3(_malformed, _snapshot), do: :unknown
 
   @doc """
   How strongly `rule` passed against `snapshot`, as a `0.0..1.0` score —
@@ -442,7 +480,8 @@ defmodule TradingCore.RuleEngine do
   defp compare("lt", left, right), do: Decimal.compare(left, right) == :lt
   defp compare("lte", left, right), do: Decimal.compare(left, right) != :gt
   defp compare("eq", left, right), do: Decimal.compare(left, right) == :eq
-  defp compare(_unrecognized_op, _left, _right), do: false
+  # Unknown rather than false, so a typo'd op fails closed under "not" too.
+  defp compare(_unrecognized_op, _left, _right), do: :unknown
 
   defp to_decimal(%Decimal{} = value), do: value
   defp to_decimal(value) when is_float(value), do: Decimal.from_float(value)
