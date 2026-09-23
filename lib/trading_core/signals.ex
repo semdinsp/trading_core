@@ -307,7 +307,7 @@ defmodule TradingCore.Signals do
   def self_zscore(history, _welford, new_sample, now, opts \\ []) do
     precision = Keyword.get(opts, :precision, @default_precision)
     sample = new_sample |> to_decimal() |> Decimal.round(precision)
-    new_history = sample_and_trim(history, {now, sample}, now, opts)
+    new_history = sample_and_trim(history, history_entry(now, sample, opts), now, opts)
 
     new_welford = rebuild_welford(new_history)
     value = zscore(sample, new_welford)
@@ -316,10 +316,25 @@ defmodule TradingCore.Signals do
   end
 
   defp rebuild_welford(history) do
-    Enum.reduce(history, WelfordAcc.new(), fn {_at, sample}, acc ->
-      WelfordAcc.add(acc, Decimal.to_float(sample))
+    Enum.reduce(history, WelfordAcc.new(), fn entry, acc ->
+      WelfordAcc.add(acc, entry_float(entry))
     end)
   end
+
+  # With `cache_floats: true`, a history entry carries its float next to
+  # the rounded Decimal, `{at, decimal, float}`, so the float is computed
+  # once at insert instead of on every later tick the entry stays in the
+  # window. It is `Decimal.to_float/1` of that same rounded Decimal, so
+  # every result is bit-for-bit what the plain `{at, decimal}` entry gives.
+  # Readers accept either shape, so a history can mix them.
+  defp history_entry(at, decimal, opts) do
+    if Keyword.get(opts, :cache_floats, false),
+      do: {at, decimal, Decimal.to_float(decimal)},
+      else: {at, decimal}
+  end
+
+  defp entry_float({_at, _decimal, float}), do: float
+  defp entry_float({_at, decimal}), do: Decimal.to_float(decimal)
 
   # Relative floor on the standard deviation, below which a z-score is
   # reported as `nil` rather than as a number.
@@ -856,7 +871,12 @@ defmodule TradingCore.Signals do
       |> Keyword.put(:max_history_samples, max_history_samples)
       |> Keyword.put_new(:sample_interval_ms, 0)
 
-    new_history = sample_and_trim(history, {now, rounded_x, rounded_y}, now, trim_opts)
+    entry =
+      if Keyword.get(opts, :cache_floats, false),
+        do: {now, rounded_x, rounded_y, Decimal.to_float(rounded_x), Decimal.to_float(rounded_y)},
+        else: {now, rounded_x, rounded_y}
+
+    new_history = sample_and_trim(history, entry, now, trim_opts)
 
     value =
       case ols(new_history) do
@@ -870,8 +890,8 @@ defmodule TradingCore.Signals do
   defp ols(history) when length(history) < 2, do: nil
 
   defp ols(history) do
-    xs = Enum.map(history, fn {_at, x, _y} -> Decimal.to_float(x) end)
-    ys = Enum.map(history, fn {_at, _x, y} -> Decimal.to_float(y) end)
+    xs = Enum.map(history, &ols_x/1)
+    ys = Enum.map(history, &ols_y/1)
     n = length(xs)
 
     mean_x = Enum.sum(xs) / n
@@ -892,6 +912,13 @@ defmodule TradingCore.Signals do
       {Decimal.from_float(beta), Decimal.from_float(alpha)}
     end
   end
+
+  # {at, x, y} or, with `cache_floats: true`, {at, x, y, x_float, y_float}.
+  # See history_entry/3.
+  defp ols_x({_at, _x, _y, x_float, _y_float}), do: x_float
+  defp ols_x({_at, x, _y}), do: Decimal.to_float(x)
+  defp ols_y({_at, _x, _y, _x_float, y_float}), do: y_float
+  defp ols_y({_at, _x, y}), do: Decimal.to_float(y)
 
   @doc """
   Kalman-filter estimate of `(beta, alpha)` in `log_y = beta * log_x +
@@ -1031,7 +1058,7 @@ defmodule TradingCore.Signals do
   def spread_half_life(history) when length(history) < 3, do: nil
 
   def spread_half_life(history) do
-    values = history |> Enum.map(fn {_at, v} -> Decimal.to_float(v) end) |> Enum.reverse()
+    values = history |> Enum.map(&entry_float/1) |> Enum.reverse()
 
     laggeds = Enum.slice(values, 0, length(values) - 1)
     currents = Enum.slice(values, 1, length(values) - 1)
@@ -1080,7 +1107,7 @@ defmodule TradingCore.Signals do
 
   def spread_crossings(history, mean) do
     history
-    |> Enum.map(fn {_at, v} -> Decimal.to_float(v) - mean end)
+    |> Enum.map(&(entry_float(&1) - mean))
     |> Enum.reverse()
     |> Enum.map(&sign/1)
     |> Enum.reject(&(&1 == 0))
