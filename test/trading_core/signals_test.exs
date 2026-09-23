@@ -6,6 +6,10 @@ defmodule TradingCore.SignalsTest do
 
   @base ~U[2026-01-01 09:30:00.000000Z]
 
+  # Turns fixed-interval sampling off: one history point per tick. For
+  # tests of the per-tick math and of the max_history_samples cap.
+  @per_tick [sample_interval_ms: 0]
+
   # history() is newest-first everywhere in this module (trim_window/4
   # prepends each new sample) — builds that shape from a chronologically
   # ordered list of values, oldest last.
@@ -40,8 +44,8 @@ defmodule TradingCore.SignalsTest do
       t0 = @base
       t1 = DateTime.add(@base, 1, :second)
 
-      {history, nil} = Signals.derivative([], Decimal.new(20), t0)
-      {_history, value} = Signals.derivative(history, Decimal.new(10), t1)
+      {history, nil} = Signals.derivative([], Decimal.new(20), t0, @per_tick)
+      {_history, value} = Signals.derivative(history, Decimal.new(10), t1, @per_tick)
 
       assert Decimal.compare(value, 0) == :lt
       assert Decimal.equal?(value, Decimal.new("-10.00000000"))
@@ -58,8 +62,10 @@ defmodule TradingCore.SignalsTest do
       t0 = @base
       t1 = DateTime.add(@base, 1, :second)
 
-      {history, _} = Signals.derivative([], Decimal.new("10.00000000001"), t0)
-      {_history, value} = Signals.derivative(history, Decimal.new("20.00000000003"), t1)
+      {history, _} = Signals.derivative([], Decimal.new("10.00000000001"), t0, @per_tick)
+
+      {_history, value} =
+        Signals.derivative(history, Decimal.new("20.00000000003"), t1, @per_tick)
 
       assert Decimal.scale(value) <= 8
     end
@@ -78,7 +84,9 @@ defmodule TradingCore.SignalsTest do
       # only the hard @max_history_samples cap can be shrinking it.
       final_history =
         Enum.reduce(1..1000, [], fn i, history ->
-          {new_history, _value} = Signals.derivative(history, Decimal.new(100 + i), @base)
+          {new_history, _value} =
+            Signals.derivative(history, Decimal.new(100 + i), @base, @per_tick)
+
           new_history
         end)
 
@@ -89,10 +97,146 @@ defmodule TradingCore.SignalsTest do
       t0 = @base
       t1 = DateTime.add(@base, 1, :second)
 
-      {history, _} = Signals.derivative([], Decimal.new(10), t0, precision: 2)
-      {_history, value} = Signals.derivative(history, Decimal.new(20), t1, precision: 2)
+      opts = [precision: 2, sample_interval_ms: 0]
+      {history, _} = Signals.derivative([], Decimal.new(10), t0, opts)
+      {_history, value} = Signals.derivative(history, Decimal.new(20), t1, opts)
 
       assert Decimal.scale(value) <= 2
+    end
+  end
+
+  describe "fixed-interval sampling (derivative/4, self_zscore/5, spread_zscore/6)" do
+    @two_hours :timer.hours(2)
+
+    defp run_derivative(ticks, opts) do
+      Enum.reduce(ticks, {[], []}, fn {at, v}, {history, values} ->
+        {history, value} = Signals.derivative(history, v, at, opts)
+        {history, [value | values]}
+      end)
+    end
+
+    defp run_self_zscore(ticks, opts) do
+      Enum.reduce(ticks, {[], WelfordAcc.new(), []}, fn {at, v}, {history, welford, values} ->
+        {history, welford, value} = Signals.self_zscore(history, welford, v, at, opts)
+        {history, welford, [value | values]}
+      end)
+    end
+
+    defp run_spread_zscore(ticks, opts) do
+      Enum.reduce(ticks, {[], WelfordAcc.new(), []}, fn {at, v}, {history, welford, values} ->
+        {history, welford, value} =
+          Signals.spread_zscore(history, welford, Decimal.new(v), Decimal.new(0), at, opts)
+
+        {history, welford, [value | values]}
+      end)
+    end
+
+    # A wandering but deterministic price, so windows have real variance.
+    defp tick(i, spacing_ms),
+      do: {DateTime.add(@base, i * spacing_ms, :millisecond), 100 + rem(i * 7, 13)}
+
+    test "default interval is derived from the window" do
+      assert Signals.default_sample_interval_ms(:timer.hours(2)) == 30_000
+      assert Signals.default_sample_interval_ms(:timer.minutes(5)) == 1_250
+      assert Signals.default_sample_interval_ms(:timer.minutes(1)) == 1_000
+    end
+
+    test "10,000 ticks 10ms apart keep one point per 30s bucket, not one per tick" do
+      ticks = Enum.map(0..9_999, &tick(&1, 10))
+      {history, values} = run_derivative(ticks, window_ms: @two_hours)
+
+      # 100s of ticks => 4 buckets of 30s (09:30:00 is bucket-aligned).
+      assert length(history) == 4
+      # Still one value per tick once warm.
+      assert length(values) == 10_000
+      # Warming up only while every tick is still in the first bucket.
+      assert Enum.count(values, &is_nil/1) == 3_000
+    end
+
+    test "a 2h window on a busy feed spans the full 2h within the ~240-point budget" do
+      # 2.5h of ticks at 1s: 9,000 ticks, far past the old 500-sample cap,
+      # which would have held only the last ~8 minutes.
+      ticks = Enum.map(0..8_999, &tick(&1, 1_000))
+      opts = [window_ms: @two_hours]
+      {now, _} = List.last(ticks)
+
+      {derivative_history, _} = run_derivative(ticks, opts)
+      {self_zscore_history, _, _} = run_self_zscore(ticks, opts)
+      {spread_zscore_history, _, _} = run_spread_zscore(ticks, opts)
+
+      for history <- [derivative_history, self_zscore_history, spread_zscore_history] do
+        {oldest_at, _} = List.last(history)
+        span_ms = DateTime.diff(now, oldest_at, :millisecond)
+
+        assert length(history) <= 241
+        assert span_ms > @two_hours - 30_000
+        assert span_ms <= @two_hours
+      end
+    end
+
+    test "the newest point is the latest tick, so each tick is scored against the window" do
+      t0 = @base
+      t1 = DateTime.add(@base, 100, :millisecond)
+
+      {history, _} = Signals.derivative([], Decimal.new(10), t0, window_ms: @two_hours)
+      {history, _} = Signals.derivative(history, Decimal.new(12), t1, window_ms: @two_hours)
+
+      assert [{^t1, latest}] = history
+      assert Decimal.equal?(latest, Decimal.new(12))
+    end
+
+    test "ticks slower than the interval behave exactly as with sampling off" do
+      # 5m window => 1.25s interval; ticks 2s apart all land in their own bucket.
+      ticks = Enum.map(0..400, &tick(&1, 2_000))
+      sampled = [window_ms: :timer.minutes(5)]
+      per_tick = [window_ms: :timer.minutes(5), sample_interval_ms: 0]
+
+      assert run_derivative(ticks, sampled) == run_derivative(ticks, per_tick)
+      assert run_self_zscore(ticks, sampled) == run_self_zscore(ticks, per_tick)
+      assert run_spread_zscore(ticks, sampled) == run_spread_zscore(ticks, per_tick)
+    end
+
+    test "sample_interval_ms overrides the derived default" do
+      ticks = Enum.map(0..599, &tick(&1, 1_000))
+      {history, _} = run_derivative(ticks, window_ms: @two_hours, sample_interval_ms: 60_000)
+
+      assert length(history) == 10
+    end
+
+    test "a cap that binds inside the window is reported through :on_cap_bound" do
+      test_pid = self()
+      report = fn info -> send(test_pid, {:cap_bound, info}) end
+
+      ticks = Enum.map(0..20, &tick(&1, 1_000))
+
+      run_self_zscore(ticks,
+        window_ms: @two_hours,
+        sample_interval_ms: 1_000,
+        max_history_samples: 10,
+        on_cap_bound: report
+      )
+
+      assert_received {:cap_bound,
+                       %{dropped: 1, max_history_samples: 10, window_ms: @two_hours} = info}
+
+      assert info.sample_interval_ms == 1_000
+      assert %DateTime{} = info.oldest_kept_at
+    end
+
+    test "points leaving by the time window are not reported as a binding cap" do
+      test_pid = self()
+      report = fn info -> send(test_pid, {:cap_bound, info}) end
+
+      ticks = Enum.map(0..50, &tick(&1, 1_000))
+
+      run_derivative(ticks,
+        window_ms: :timer.seconds(5),
+        sample_interval_ms: 1_000,
+        max_history_samples: 10,
+        on_cap_bound: report
+      )
+
+      refute_received {:cap_bound, _}
     end
   end
 
@@ -169,7 +313,7 @@ defmodule TradingCore.SignalsTest do
             history,
             welford,
             Decimal.from_float(sample),
-            DateTime.add(@base, i, :second)
+            DateTime.add(@base, 2 * i, :second)
           )
         end)
 
@@ -243,7 +387,7 @@ defmodule TradingCore.SignalsTest do
       # shrinking history.
       {final_history, _welford, _value} =
         Enum.reduce(1..1000, {[], WelfordAcc.new(), nil}, fn i, {history, welford, _value} ->
-          Signals.self_zscore(history, welford, Decimal.new(100 + i), @base)
+          Signals.self_zscore(history, welford, Decimal.new(100 + i), @base, @per_tick)
         end)
 
       assert length(final_history) == 500
@@ -313,7 +457,7 @@ defmodule TradingCore.SignalsTest do
             welford,
             Decimal.from_float(spread),
             Decimal.new(0),
-            DateTime.add(@base, i, :second)
+            DateTime.add(@base, 2 * i, :second)
           )
         end)
 
@@ -340,7 +484,7 @@ defmodule TradingCore.SignalsTest do
             welford,
             Decimal.from_float(spread),
             Decimal.new(0),
-            DateTime.add(@base, i, :second)
+            DateTime.add(@base, 2 * i, :second)
           )
         end)
 
@@ -749,7 +893,7 @@ defmodule TradingCore.SignalsTest do
         history,
         welford,
         Decimal.from_float(sample),
-        DateTime.add(@base, i, :second)
+        DateTime.add(@base, 2 * i, :second)
       )
     end)
   end

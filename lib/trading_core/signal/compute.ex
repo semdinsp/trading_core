@@ -376,15 +376,17 @@ defmodule TradingCore.Signal.Compute do
     {%{state | prices: prices}, warm(result)}
   end
 
-  def step(%Spec{kind: :derivative} = spec, state, %{at: now, value: value}) do
-    opts = window_opts(spec)
+  # :derivative, :second_derivative, :self_zscore and :zscore sample their
+  # history at a fixed interval (params["sample_interval_ms"], else
+  # TradingCore.Signals.default_sample_interval_ms/1 of window_ms) and
+  # count any in-window points the max_history_samples cap drops into
+  # state[:cap_bound_drops]. See "Fixed-interval sampling" in
+  # TradingCore.Signals' moduledoc.
+  def step(%Spec{kind: kind} = spec, state, %{at: now, value: value})
+      when kind in [:derivative, :second_derivative] do
+    opts = sampled_window_opts(spec)
     {history, result} = Signals.derivative(state.history, value, now, opts)
-    {%{state | history: history}, warm(result)}
-  end
-
-  def step(%Spec{kind: :second_derivative} = spec, state, %{at: now, value: value}) do
-    opts = window_opts(spec)
-    {history, result} = Signals.derivative(state.history, value, now, opts)
+    state = track_cap_drops(state, state.history, history, now, opts)
     {%{state | history: history}, warm(result)}
   end
 
@@ -475,11 +477,12 @@ defmodule TradingCore.Signal.Compute do
   end
 
   def step(%Spec{kind: :self_zscore} = spec, state, %{at: now, value: value}) do
-    opts = window_opts(spec)
+    opts = sampled_window_opts(spec)
 
     {history, welford, result} =
       Signals.self_zscore(state.history, state.welford, value, now, opts)
 
+    state = track_cap_drops(state, state.history, history, now, opts)
     {%{state | history: history, welford: welford}, warm(result)}
   end
 
@@ -512,7 +515,7 @@ defmodule TradingCore.Signal.Compute do
         now = Map.fetch!(tick, :at)
         session_reset = Map.get(spec.params, "session_reset")
         state = maybe_reset_zscore_session(state, now, session_reset)
-        opts = window_opts(spec)
+        opts = sampled_window_opts(spec)
 
         {history, welford, result} =
           Signals.spread_zscore(
@@ -524,6 +527,7 @@ defmodule TradingCore.Signal.Compute do
             opts
           )
 
+        state = track_cap_drops(state, state.history, history, now, opts)
         {%{state | history: history, welford: welford}, warm(result)}
     end
   end
@@ -846,7 +850,9 @@ defmodule TradingCore.Signal.Compute do
         {%{state | beta_state: beta_state}, :warming_up}
 
       {beta, alpha} ->
-        opts = window_opts(spec)
+        # One point per tick, as before: fixed-interval sampling (see
+        # sampled_window_opts/1) is not applied to :spread yet.
+        opts = Keyword.put_new(window_opts(spec), :sample_interval_ms, 0)
         spread = Signals.log_spread(log_x, log_y, beta, alpha, opts)
 
         {spread_history, welford, zscore} =
@@ -1635,6 +1641,51 @@ defmodule TradingCore.Signal.Compute do
     |> maybe_put_precision(params)
     |> maybe_put_max_history_samples(params)
   end
+
+  # window_opts/1 plus the fixed sampling interval for the kinds that
+  # sample: derivative, second_derivative, self_zscore and zscore.
+  # params["sample_interval_ms"] overrides TradingCore.Signals'
+  # default_sample_interval_ms/1. It's a precomputed integer, for the same
+  # reason window_ms is (see Spec's "Why window_ms is precomputed").
+  defp sampled_window_opts(%Spec{params: params} = spec) do
+    case Map.get(params, "sample_interval_ms") do
+      nil -> window_opts(spec)
+      interval_ms -> Keyword.put(window_opts(spec), :sample_interval_ms, interval_ms)
+    end
+  end
+
+  # Counts history points the max_history_samples cap dropped while they
+  # were still inside the window, into state[:cap_bound_drops]. The key is
+  # only added once the cap has bound, so read it with Map.get(state,
+  # :cap_bound_drops, 0).
+  #
+  # The cap can only have bound if the new history is full. Then any point
+  # of the old history that is older than the oldest point kept, yet still
+  # inside the window, was removed by the cap. The old head is left out: it
+  # is either still kept or was replaced by this tick's sample (see
+  # TradingCore.Signals' fixed-interval sampling), never dropped by the cap.
+  defp track_cap_drops(state, [_old_head | older], new_history, now, opts) do
+    max_history_samples = Keyword.get(opts, :max_history_samples, 500)
+
+    if length(new_history) < max_history_samples do
+      state
+    else
+      {oldest_kept_at, _} = List.last(new_history)
+      window_ms = Keyword.get(opts, :window_ms, :timer.minutes(5))
+      cutoff = DateTime.add(now, -window_ms, :millisecond)
+
+      dropped =
+        Enum.count(older, fn {at, _} ->
+          DateTime.compare(at, oldest_kept_at) == :lt and DateTime.compare(at, cutoff) != :lt
+        end)
+
+      if dropped > 0,
+        do: Map.update(state, :cap_bound_drops, dropped, &(&1 + dropped)),
+        else: state
+    end
+  end
+
+  defp track_cap_drops(state, [], _new_history, _now, _opts), do: state
 
   defp maybe_put_precision(opts, params) do
     case Map.get(params, "precision") do
