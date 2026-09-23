@@ -147,7 +147,9 @@ defmodule TradingCore.Backtest do
     wraps another named signal via `parent: "other_signal_name"`.
     `:derivative`/`:momentum` additionally accept `window_ms:` (passed to
     `TradingCore.Signals.derivative/4`/`momentum/4`'s `opts`); `:self_zscore`
-    likewise. `:wavelet` takes no extra options (fixed window/level, see
+    likewise. `:derivative`, `:self_zscore` and `:spread_zscore` also take
+    `sample_interval_ms:` and `on_cap_bound:` (see "Fixed-interval
+    sampling" in `TradingCore.Signals`). `:wavelet` takes no extra options (fixed window/level, see
     `TradingCore.Signals.wavelet/2`).
   - `kind: :percent_deviation` / `:ratio` — wraps two named signals,
     `value: "signal_a"` and `reference: "signal_b"` (both looked up in the
@@ -1025,7 +1027,13 @@ defmodule TradingCore.Backtest do
 
   defp signal_opts(spec) do
     spec
-    |> Map.take([:window_ms, :precision, :max_history_samples])
+    |> Map.take([
+      :window_ms,
+      :precision,
+      :max_history_samples,
+      :sample_interval_ms,
+      :on_cap_bound
+    ])
     |> Enum.into([])
   end
 

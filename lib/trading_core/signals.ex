@@ -85,6 +85,41 @@ defmodule TradingCore.Signals do
   own logic) is pure "compute a value from a window of samples" math, and
   that shape is what `momentum/4` below covers for both callers.
 
+  ## Fixed-interval sampling (`derivative/4`, `self_zscore/5`, `spread_zscore/6`)
+
+  These three keep a history of past samples over `:window_ms`. They used
+  to add one point per tick and trim by both `:window_ms` and
+  `:max_history_samples` (500). On a busy feed (Polygon SPY/QQQ trades,
+  and ratios built from them) 500 ticks cover only a few seconds, so the
+  cap, not `:window_ms`, set the window. A "2h" VWAP z-score was really a
+  z-score over the last few seconds. trading_signal saw this on
+  2026-09-22 as near-zero minute-to-minute autocorrelation on those rows,
+  while the same kinds on slow feeds looked normal.
+
+  History is now sampled at a fixed interval, `:sample_interval_ms`
+  (default `default_sample_interval_ms/1`: `window_ms / 240`, at least
+  1s). Time is cut into interval-wide buckets. A tick in the same bucket
+  as the newest point *replaces* it, and a tick in a new bucket adds a
+  point. The window then holds about 240 points however fast ticks
+  arrive, and `:window_ms` is the real window. A value is still emitted
+  on every tick: the newest point is always the current tick, scored
+  against the window. `sample_interval_ms: 0` turns sampling off.
+
+  A feed whose ticks are at least one interval apart gets exactly the
+  same history and values as before. A feed faster than that gets
+  **different values, for every row that reads it**, so a series
+  recorded before this change and one recorded after it are not
+  comparable across that boundary.
+
+  `:max_history_samples` stays as a safety net. If it ever drops points
+  that are still inside `:window_ms`, the window is short again. That is
+  reported rather than silent: the three functions call
+  `opts[:on_cap_bound]` (a 1-arity function, if given) with
+  `%{dropped:, max_history_samples:, window_ms:, sample_interval_ms:,
+  oldest_kept_at:}`, and `TradingCore.Signal.Compute` counts those drops
+  into its state's `:cap_bound_drops`. With the default interval, the
+  default cap never binds.
+
   ## Spread (pairs trading): new math, not extracted from anywhere
 
   Unlike every function above, `rolling_ols_beta/4`, `kalman_beta/4`,
@@ -131,6 +166,12 @@ defmodule TradingCore.Signals do
   # extracted signal kind already used.
   @default_max_history_samples 500
 
+  # Fixed-interval sampling budget for derivative/4, self_zscore/5 and
+  # spread_zscore/6: about this many points per window, never sampled
+  # faster than once a second. See "Fixed-interval sampling" in the moduledoc.
+  @samples_per_window 240
+  @min_sample_interval_ms 1_000
+
   ## ---------------------------------------------------------------------
   ## Derivative / second_derivative
   ## ---------------------------------------------------------------------
@@ -139,9 +180,10 @@ defmodule TradingCore.Signals do
   One tick of `derivative`/`second_derivative`-kind signal state:
   extracted from `TradingSignal.Signals.Derivative`. Rounds `new_sample`
   to `:precision` (default #{@default_precision}) before it enters
-  `history`, trims `history` to the `:window_ms` (default
-  #{inspect(@default_window_ms)}) trailing `now`, capped at
-  `:max_history_samples` (default #{@default_max_history_samples}), then
+  `history`, samples it at `:sample_interval_ms` and trims it to the
+  `:window_ms` (default #{inspect(@default_window_ms)}) trailing `now`,
+  capped at `:max_history_samples` (default #{@default_max_history_samples};
+  see "Fixed-interval sampling" in the moduledoc), then
   computes the slope — `(newest - oldest) / seconds_elapsed` — of the
   resulting window, rounded again to `:precision` on the way out.
 
@@ -158,13 +200,8 @@ defmodule TradingCore.Signals do
   @spec derivative(history(), sample(), DateTime.t(), keyword()) :: {history(), Decimal.t() | nil}
   def derivative(history, new_sample, now, opts \\ []) do
     precision = Keyword.get(opts, :precision, @default_precision)
-    window_ms = Keyword.get(opts, :window_ms, @default_window_ms)
-    max_history_samples = Keyword.get(opts, :max_history_samples, @default_max_history_samples)
-
     rounded = new_sample |> to_decimal() |> Decimal.round(precision)
-
-    new_history =
-      trim_window([{now, rounded} | history], now, window_ms, max_history_samples)
+    new_history = sample_and_trim(history, {now, rounded}, now, opts)
 
     value =
       case slope(new_history) do
@@ -247,10 +284,11 @@ defmodule TradingCore.Signals do
   @doc """
   One tick of `self_zscore`-kind signal state: extracted from
   `TradingSignal.Signals.SelfZscore`. Rounds `new_sample` to `:precision`
-  (default #{@default_precision}) before it enters `history`, trims to
-  `:window_ms` (default #{inspect(@default_window_ms)}) trailing `now`
-  (capped at `:max_history_samples`, default
-  #{@default_max_history_samples}), rebuilds a fresh `TradingCore.WelfordAcc`
+  (default #{@default_precision}) before it enters `history`, samples it at
+  `:sample_interval_ms` and trims to `:window_ms` (default
+  #{inspect(@default_window_ms)}) trailing `now` (capped at
+  `:max_history_samples`, default #{@default_max_history_samples}; see
+  "Fixed-interval sampling" in the moduledoc), rebuilds a fresh `TradingCore.WelfordAcc`
   from the trimmed window (same "no cheap batch-remove" reasoning
   `WelfordAcc`'s own moduledoc explains), then computes
   `(sample - mean) / stdev`.
@@ -268,13 +306,8 @@ defmodule TradingCore.Signals do
           {history(), WelfordAcc.t(), Decimal.t() | nil}
   def self_zscore(history, _welford, new_sample, now, opts \\ []) do
     precision = Keyword.get(opts, :precision, @default_precision)
-    window_ms = Keyword.get(opts, :window_ms, @default_window_ms)
-    max_history_samples = Keyword.get(opts, :max_history_samples, @default_max_history_samples)
-
     sample = new_sample |> to_decimal() |> Decimal.round(precision)
-
-    new_history =
-      trim_window([{now, sample} | history], now, window_ms, max_history_samples)
+    new_history = sample_and_trim(history, {now, sample}, now, opts)
 
     new_welford = rebuild_welford(new_history)
     value = zscore(sample, new_welford)
@@ -422,8 +455,8 @@ defmodule TradingCore.Signals do
   shape as `self_zscore/5` above, but over `value - reference`'s own
   history rather than a single parent's raw value stream — computes the
   spread (`Decimal.sub/2`), rounds it to `:precision` (default
-  #{@default_precision}), trims/rebuilds a `TradingCore.WelfordAcc` the
-  same way, and returns the zscore of the current spread against its own
+  #{@default_precision}), samples/trims/rebuilds a `TradingCore.WelfordAcc`
+  the same way, and returns the zscore of the current spread against its own
   rolling mean/stdev.
 
   Returns `{new_history, new_welford, nil}` under the same "fewer than 2
@@ -443,13 +476,8 @@ defmodule TradingCore.Signals do
           {history(), WelfordAcc.t(), Decimal.t() | nil}
   def spread_zscore(history, _welford, value, reference, now, opts \\ []) do
     precision = Keyword.get(opts, :precision, @default_precision)
-    window_ms = Keyword.get(opts, :window_ms, @default_window_ms)
-    max_history_samples = Keyword.get(opts, :max_history_samples, @default_max_history_samples)
-
     spread = value |> Decimal.sub(reference) |> Decimal.round(precision)
-
-    new_history =
-      trim_window([{now, spread} | history], now, window_ms, max_history_samples)
+    new_history = sample_and_trim(history, {now, spread}, now, opts)
 
     new_welford = rebuild_welford(new_history)
     value = zscore(spread, new_welford)
@@ -1058,6 +1086,80 @@ defmodule TradingCore.Signals do
   ## ---------------------------------------------------------------------
   ## Shared helpers
   ## ---------------------------------------------------------------------
+
+  @doc """
+  The default fixed sampling interval for a `window_ms` window, used by
+  `derivative/4`, `self_zscore/5` and `spread_zscore/6` when no
+  `:sample_interval_ms` is given: `max(div(window_ms, #{@samples_per_window}), #{@min_sample_interval_ms})`.
+  This keeps about #{@samples_per_window} points in any window, so a 2h
+  window samples every 30s and a 5m window every 1.25s. See "Fixed-interval
+  sampling" in this module's moduledoc.
+  """
+  @spec default_sample_interval_ms(pos_integer()) :: pos_integer()
+  def default_sample_interval_ms(window_ms) do
+    max(div(window_ms, @samples_per_window), @min_sample_interval_ms)
+  end
+
+  # Fixed-interval sampling plus the time trim and the hard cap, shared by
+  # derivative/4, self_zscore/5 and spread_zscore/6. Time is cut into
+  # buckets of `sample_interval_ms`, aligned to the Unix epoch. When `entry`
+  # lands in the same bucket as the newest history point, it replaces that
+  # point instead of adding a new one. The history then holds at most
+  # one point per bucket, the last tick seen in it, however fast ticks
+  # arrive. Two ticks at least one interval apart are always in different
+  # buckets, so a feed slower than the interval appends every tick, as before.
+  #
+  # Buckets, rather than "replace while the newest point is younger than the
+  # interval": a replaced point takes the new tick's timestamp, so under
+  # that rule the newest point would never age and history would never
+  # grow. Keeping the old timestamp instead would misdate the newest value,
+  # which derivative/4's slope reads directly.
+  #
+  # `sample_interval_ms: 0` turns sampling off (one point per tick).
+  defp sample_and_trim(history, {now_at, _value} = entry, now, opts) do
+    window_ms = Keyword.get(opts, :window_ms, @default_window_ms)
+    max_history_samples = Keyword.get(opts, :max_history_samples, @default_max_history_samples)
+
+    interval_ms =
+      Keyword.get_lazy(opts, :sample_interval_ms, fn -> default_sample_interval_ms(window_ms) end)
+
+    sampled =
+      case history do
+        [{head_at, _} | rest] when interval_ms > 0 ->
+          if bucket(head_at, interval_ms) == bucket(now_at, interval_ms),
+            do: [entry | rest],
+            else: [entry | history]
+
+        _ ->
+          [entry | history]
+      end
+
+    cutoff = DateTime.add(now, -window_ms, :millisecond)
+    in_window = Enum.filter(sampled, fn {at, _value} -> DateTime.compare(at, cutoff) != :lt end)
+    {kept, dropped} = Enum.split(in_window, max_history_samples)
+
+    if dropped != [] do
+      report_cap_bound(opts, %{
+        dropped: length(dropped),
+        max_history_samples: max_history_samples,
+        window_ms: window_ms,
+        sample_interval_ms: interval_ms,
+        oldest_kept_at: kept |> List.last() |> elem(0)
+      })
+    end
+
+    kept
+  end
+
+  defp bucket(at, interval_ms),
+    do: Integer.floor_div(DateTime.to_unix(at, :millisecond), interval_ms)
+
+  defp report_cap_bound(opts, info) do
+    case Keyword.get(opts, :on_cap_bound) do
+      nil -> :ok
+      callback when is_function(callback, 1) -> callback.(info)
+    end
+  end
 
   # Common shape every wrapping/window-based signal kind uses: filter out
   # anything older than `window_ms` before `now`, then hard-cap at

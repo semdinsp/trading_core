@@ -317,12 +317,65 @@ defmodule TradingCore.Signal.ComputeTest do
 
       {_state, w2} =
         Compute.step(spec, state, %{
-          at: DateTime.add(@now, 1, :second),
+          at: DateTime.add(@now, 2, :second),
           value: 105,
           reference: 90
         })
 
       assert %Decimal{} = w2
+    end
+
+    test "zscore samples a busy feed at a fixed interval, overridable via params" do
+      # 2h window => 30s interval by default; ticks 100ms apart for 60s
+      # fill two buckets.
+      ticks = for i <- 0..599, do: DateTime.add(@now, i * 100, :millisecond)
+
+      run = fn spec ->
+        {:ok, state} = Compute.init(spec)
+
+        Enum.reduce(ticks, state, fn at, acc ->
+          {next, _} =
+            Compute.step(spec, acc, %{at: at, value: 100 + rem(i_of(at), 7), reference: 90})
+
+          next
+        end)
+      end
+
+      default = run.(%Spec{kind: :zscore, window_ms: :timer.hours(2)})
+      assert length(default.history) == 2
+
+      override =
+        run.(%Spec{
+          kind: :zscore,
+          window_ms: :timer.hours(2),
+          params: %{"sample_interval_ms" => 10_000}
+        })
+
+      assert length(override.history) == 6
+      refute Map.has_key?(override, :cap_bound_drops)
+    end
+
+    test "self_zscore and derivative count in-window points the cap drops" do
+      for kind <- [:self_zscore, :derivative, :second_derivative] do
+        spec = %Spec{
+          kind: kind,
+          window_ms: :timer.hours(2),
+          params: %{"sample_interval_ms" => 1_000, "max_history_samples" => 10}
+        }
+
+        {:ok, state} = Compute.init(spec)
+
+        state =
+          Enum.reduce(0..14, state, fn i, acc ->
+            {next, _} =
+              Compute.step(spec, acc, %{at: DateTime.add(@now, i, :second), value: 100 + i})
+
+            next
+          end)
+
+        assert length(state.history) == 10
+        assert state.cap_bound_drops == 5
+      end
     end
 
     test "zscore honors its configured window_ms rather than the 5-minute internal default" do
@@ -395,7 +448,9 @@ defmodule TradingCore.Signal.ComputeTest do
       {:ok, state} = Compute.init(spec)
 
       day1 = @now
-      day1_later = DateTime.add(@now, 60, :second)
+      # Past the 48h window's 12-minute sampling interval, so it's a
+      # second point rather than replacing the first.
+      day1_later = DateTime.add(@now, 3600, :second)
       day2 = DateTime.add(@now, 86_400, :second)
 
       {state, _} = Compute.step(spec, state, %{at: day1, value: 100, reference: 90})
@@ -444,7 +499,9 @@ defmodule TradingCore.Signal.ComputeTest do
       plain_spec = %Spec{kind: :zscore, window_ms: window}
 
       day1 = @now
-      day1_later = DateTime.add(@now, 60, :second)
+      # Past the 48h window's 12-minute sampling interval, so it's a
+      # second point rather than replacing the first.
+      day1_later = DateTime.add(@now, 3600, :second)
       day2 = DateTime.add(@now, 86_400, :second)
 
       ticks = [
@@ -1010,4 +1067,6 @@ defmodule TradingCore.Signal.ComputeTest do
       assert resumed == one_pass
     end
   end
+
+  defp i_of(at), do: div(DateTime.diff(at, @now, :millisecond), 100)
 end
