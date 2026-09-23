@@ -859,7 +859,13 @@ defmodule TradingCore.Signal.Compute do
         spread = Signals.log_spread(log_x, log_y, beta, alpha, opts)
 
         {spread_history, welford, zscore} =
-          Signals.self_zscore(state.spread_history, state.welford, spread, now, opts)
+          Signals.self_zscore(
+            state.spread_history,
+            state.welford,
+            spread,
+            now,
+            Keyword.put(opts, :cache_floats, true)
+          )
 
         state = track_cap_drops(state, state.spread_history, spread_history, now, opts)
 
@@ -1746,7 +1752,11 @@ defmodule TradingCore.Signal.Compute do
         |> Signals.default_sample_interval_ms()
       end)
 
-    Keyword.put(opts, :sample_interval_ms, interval_ms)
+    # :spread's beta window caches each entry's floats; see
+    # Signals.self_zscore/5's history_entry/3.
+    opts
+    |> Keyword.put(:sample_interval_ms, interval_ms)
+    |> Keyword.put(:cache_floats, true)
   end
 
   defp maybe_put_beta_window_ms(opts, params) do
