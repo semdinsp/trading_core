@@ -736,6 +736,51 @@ defmodule TradingCore.Signal.ComputeTest do
       assert state.cap_bound_drops == 9
     end
 
+    test "rolling_ols :spread caches floats in both windows without changing values" do
+      spec = %Spec{
+        kind: :spread,
+        window_ms: :timer.minutes(5),
+        params: %{"beta_mode" => "rolling_ols", "beta_window_ms" => :timer.minutes(5)}
+      }
+
+      ticks =
+        for i <- 0..1_999 do
+          %{
+            at: DateTime.add(@now, i * 700, :millisecond),
+            value: 100 + :math.sin(i / 17) * 3 + rem(i * 7, 13) / 10,
+            reference: 50 + :math.cos(i / 23) * 2 + rem(i * 5, 11) / 10
+          }
+        end
+
+      {:ok, state} = Compute.init(spec)
+
+      {state, values} =
+        Enum.reduce(ticks, {state, []}, fn tick, {acc, values} ->
+          {next, value} = Compute.step(spec, acc, tick)
+          {next, [value | values]}
+        end)
+
+      assert Enum.all?(state.beta_state.history, &(tuple_size(&1) == 5))
+      assert Enum.all?(state.spread_history, &(tuple_size(&1) == 3))
+      assert Enum.count(values, &match?(%Decimal{}, &1)) > 1_900
+
+      # Replaying the same beta window without cached floats gives the
+      # same beta and alpha.
+      plain_beta_history =
+        Enum.map(state.beta_state.history, &Tuple.delete_at(Tuple.delete_at(&1, 4), 3))
+
+      [{_at, x, y} | older] = plain_beta_history
+      {newest_at, _, _, _, _} = hd(state.beta_state.history)
+
+      {_h, plain} =
+        TradingCore.Signals.rolling_ols_beta(older, {x, y}, newest_at,
+          window_ms: :timer.minutes(5),
+          sample_interval_ms: TradingCore.Signals.default_sample_interval_ms(:timer.minutes(5))
+        )
+
+      assert plain == {state.beta, state.alpha}
+    end
+
     test "static beta_mode never re-estimates beta/alpha across ticks" do
       spec = %Spec{kind: :spread, params: %{"beta_mode" => "static", "beta" => "2.0"}}
       {:ok, state} = Compute.init(spec)

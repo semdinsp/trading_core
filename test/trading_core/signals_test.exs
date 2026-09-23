@@ -265,6 +265,74 @@ defmodule TradingCore.SignalsTest do
     end
   end
 
+  describe "cache_floats: true gives bit-for-bit the same results" do
+    # A long pseudo-random walk, deterministic so a failure reproduces.
+    defp random_walk(n, seed) do
+      :rand.seed(:exsss, {seed, seed + 1, seed + 2})
+
+      Enum.map_reduce(0..(n - 1), 100.0, fn i, level ->
+        level = level + :rand.normal() * 0.37
+        {{DateTime.add(@base, i * 700, :millisecond), level}, level}
+      end)
+      |> elem(0)
+    end
+
+    defp strip_floats(history), do: Enum.map(history, &Tuple.delete_at(&1, 2))
+
+    test "self_zscore/5: same values, same Decimals, floats cached" do
+      ticks = random_walk(3_000, 11)
+      opts = [window_ms: :timer.minutes(5)]
+
+      run = fn opts ->
+        Enum.reduce(ticks, {[], WelfordAcc.new(), []}, fn {at, v}, {h, w, values} ->
+          {h, w, value} = Signals.self_zscore(h, w, v, at, opts)
+          {h, w, [value | values]}
+        end)
+      end
+
+      {plain_h, plain_w, plain_values} = run.(opts)
+      {cached_h, cached_w, cached_values} = run.([{:cache_floats, true} | opts])
+
+      assert cached_values == plain_values
+      assert cached_w == plain_w
+      assert strip_floats(cached_h) == plain_h
+      assert Enum.all?(cached_h, fn {_at, d, f} -> f === Decimal.to_float(d) end)
+
+      assert Signals.spread_half_life(cached_h) == Signals.spread_half_life(plain_h)
+
+      assert Signals.spread_crossings(cached_h, cached_w.mean) ==
+               Signals.spread_crossings(plain_h, plain_w.mean)
+    end
+
+    test "rolling_ols_beta/4: same betas and alphas, floats cached" do
+      xs = random_walk(3_000, 21)
+      ys = random_walk(3_000, 31)
+      opts = [window_ms: :timer.minutes(5), sample_interval_ms: 1_000]
+
+      run = fn opts ->
+        Enum.zip(xs, ys)
+        |> Enum.reduce({[], []}, fn {{at, x}, {_at, y}}, {h, values} ->
+          {h, value} = Signals.rolling_ols_beta(h, {:math.log(x), :math.log(y)}, at, opts)
+          {h, [value | values]}
+        end)
+      end
+
+      {plain_h, plain_values} = run.(opts)
+      {cached_h, cached_values} = run.([{:cache_floats, true} | opts])
+
+      assert cached_values == plain_values
+      assert Enum.any?(plain_values, &match?({%Decimal{}, %Decimal{}}, &1))
+      assert Enum.map(cached_h, &Tuple.delete_at(Tuple.delete_at(&1, 4), 3)) == plain_h
+    end
+
+    test "a history mixing cached and plain entries reads the same" do
+      plain = [{@base, Decimal.new("1.5")}, {DateTime.add(@base, 1), Decimal.new("-0.5")}]
+      mixed = [hd(plain), {DateTime.add(@base, 1), Decimal.new("-0.5"), -0.5}]
+
+      assert Signals.spread_crossings(mixed, 0.0) == Signals.spread_crossings(plain, 0.0)
+    end
+  end
+
   describe "vwap/3" do
     test "matches a hand-computed weighted average of known price/volume pairs" do
       # 100 shares @ 10.00 + 200 shares @ 13.00 => (1000 + 2600) / 300 = 12.0
