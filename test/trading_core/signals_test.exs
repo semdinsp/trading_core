@@ -6,9 +6,10 @@ defmodule TradingCore.SignalsTest do
 
   @base ~U[2026-01-01 09:30:00.000000Z]
 
-  # Turns fixed-interval sampling off: one history point per tick. For
-  # tests of the per-tick math and of the max_history_samples cap.
-  @per_tick [sample_interval_ms: 0]
+  # Turns fixed-interval sampling and derivative's minimum span off: one
+  # history point per tick, and a slope from any two points. For tests of
+  # the per-tick math and of the max_history_samples cap.
+  @per_tick [sample_interval_ms: 0, min_span_ms: 0]
 
   # history() is newest-first everywhere in this module (trim_window/4
   # prepends each new sample) — builds that shape from a chronologically
@@ -34,8 +35,8 @@ defmodule TradingCore.SignalsTest do
       t0 = @base
       t1 = DateTime.add(@base, 2, :second)
 
-      {history, nil} = Signals.derivative([], Decimal.new(10), t0)
-      {_history, value} = Signals.derivative(history, Decimal.new(20), t1)
+      {history, nil} = Signals.derivative([], Decimal.new(10), t0, @per_tick)
+      {_history, value} = Signals.derivative(history, Decimal.new(20), t1, @per_tick)
 
       assert Decimal.equal?(value, Decimal.new("5.00000000"))
     end
@@ -97,7 +98,7 @@ defmodule TradingCore.SignalsTest do
       t0 = @base
       t1 = DateTime.add(@base, 1, :second)
 
-      opts = [precision: 2, sample_interval_ms: 0]
+      opts = [precision: 2, sample_interval_ms: 0, min_span_ms: 0]
       {history, _} = Signals.derivative([], Decimal.new(10), t0, opts)
       {_history, value} = Signals.derivative(history, Decimal.new(20), t1, opts)
 
@@ -143,7 +144,8 @@ defmodule TradingCore.SignalsTest do
 
     test "10,000 ticks 10ms apart keep one point per 30s bucket, not one per tick" do
       ticks = Enum.map(0..9_999, &tick(&1, 10))
-      {history, values} = run_derivative(ticks, window_ms: @two_hours)
+      # min_span_ms: 0 isolates sampling from the 24-minute minimum span.
+      {history, values} = run_derivative(ticks, window_ms: @two_hours, min_span_ms: 0)
 
       # 100s of ticks => 4 buckets of 30s (09:30:00 is bucket-aligned).
       assert length(history) == 4
@@ -330,6 +332,63 @@ defmodule TradingCore.SignalsTest do
       mixed = [hd(plain), {DateTime.add(@base, 1), Decimal.new("-0.5"), -0.5}]
 
       assert Signals.spread_crossings(mixed, 0.0) == Signals.spread_crossings(plain, 0.0)
+    end
+  end
+
+  describe "derivative/4 minimum span" do
+    test "default is a fifth of the window, at least two sample intervals" do
+      assert Signals.default_min_span_ms(:timer.minutes(5)) == 60_000
+      assert Signals.default_min_span_ms(:timer.hours(2)) == 1_440_000
+      assert Signals.default_min_span_ms(:timer.seconds(5)) == 2_000
+      assert Signals.default_min_span_ms(:timer.minutes(5), 0) == 60_000
+    end
+
+    # The 2026-09-21 ibkr_vix_derivitive case: a stall empties the window,
+    # then the backlog drains in a burst of processing timestamps that
+    # straddles a sample bucket, carrying minutes of real movement.
+    test "a burst after an empty window gives nil until the span is reached" do
+      stale = [{DateTime.add(@base, -600, :second), Decimal.new("20.00000000")}]
+      burst_start = DateTime.add(@base, 1_200, :millisecond)
+
+      {history, values} =
+        Enum.reduce(0..20, {stale, []}, fn i, {h, values} ->
+          at = DateTime.add(burst_start, i * 10, :millisecond)
+          {h, value} = Signals.derivative(h, Decimal.new(24 + i), at)
+          {h, [value | values]}
+        end)
+
+      # Sampling alone keeps two points ~0.1s apart here, whose slope
+      # would be tens of units per second.
+      assert length(history) == 2
+      assert Enum.all?(values, &is_nil/1)
+
+      {_history, value} =
+        Signals.derivative(history, Decimal.new(30), DateTime.add(burst_start, 61, :second))
+
+      assert %Decimal{} = value
+    end
+
+    test "steady ticks across the window give the same values as before, once spanned" do
+      ticks = for i <- 0..600, do: {DateTime.add(@base, i * 2, :second), 100 + rem(i * 7, 13)}
+
+      run = fn opts ->
+        ticks
+        |> Enum.reduce({[], []}, fn {at, v}, {h, values} ->
+          {h, value} = Signals.derivative(h, v, at, opts)
+          {h, [value | values]}
+        end)
+        |> elem(1)
+        |> Enum.reverse()
+      end
+
+      guarded = run.([])
+      unguarded = run.(min_span_ms: 0)
+
+      # Ticks 2s apart first span 60s at the 31st tick; from there on
+      # nothing changes.
+      assert guarded |> Enum.take(30) |> Enum.all?(&is_nil/1)
+      assert Enum.drop(guarded, 30) == Enum.drop(unguarded, 30)
+      assert guarded |> Enum.drop(30) |> Enum.all?(&match?(%Decimal{}, &1))
     end
   end
 

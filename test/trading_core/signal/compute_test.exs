@@ -75,18 +75,39 @@ defmodule TradingCore.Signal.ComputeTest do
   end
 
   describe "derivative / second_derivative" do
-    test "warms up until 2 samples are in the window, then emits slope" do
+    test "warms up until the window spans the 60s minimum, then emits slope" do
       spec = %Spec{kind: :derivative, window_ms: :timer.minutes(5)}
       {:ok, state} = Compute.init(spec)
 
       {state, first} = Compute.step(spec, state, %{at: @now, value: 100})
       assert first == :warming_up
 
-      {_state, second} =
+      {state, short} =
         Compute.step(spec, state, %{at: DateTime.add(@now, 10, :second), value: 110})
 
-      assert %Decimal{} = second
-      assert Decimal.equal?(second, Decimal.new(1))
+      assert short == :warming_up
+
+      {_state, spanned} =
+        Compute.step(spec, state, %{at: DateTime.add(@now, 60, :second), value: 160})
+
+      assert Decimal.equal?(spanned, Decimal.new(1))
+    end
+
+    test "params min_span_ms overrides the minimum span" do
+      spec = %Spec{
+        kind: :derivative,
+        window_ms: :timer.minutes(5),
+        params: %{"min_span_ms" => 10_000}
+      }
+
+      {:ok, state} = Compute.init(spec)
+
+      {state, _} = Compute.step(spec, state, %{at: @now, value: 100})
+
+      {_state, value} =
+        Compute.step(spec, state, %{at: DateTime.add(@now, 10, :second), value: 110})
+
+      assert Decimal.equal?(value, Decimal.new(1))
     end
 
     test "second_derivative is a derivative of a derivative series" do
@@ -94,7 +115,7 @@ defmodule TradingCore.Signal.ComputeTest do
       deriv = %Spec{kind: :derivative, parent: base, window_ms: :timer.minutes(5)}
       accel = %Spec{kind: :second_derivative, parent: deriv, window_ms: :timer.minutes(5)}
 
-      values = ticks([100, 101, 103, 106, 110, 115], interval: 10)
+      values = ticks([100, 101, 103, 106, 110, 115], interval: 30)
 
       series = Compute.replay(accel, values, only: accel)
       assert Enum.any?(series, &(&1 != :warming_up))

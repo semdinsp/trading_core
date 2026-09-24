@@ -120,6 +120,17 @@ defmodule TradingCore.Signals do
   into its state's `:cap_bound_drops`. With the default interval, the
   default cap never binds.
 
+  ## Derivative minimum span
+
+  `derivative/4` (and so `second_derivative`) reports nothing until its
+  window spans at least `:min_span_ms` (default `default_min_span_ms/2`,
+  60s for a 5-minute window). Without that floor, a backlog that drains
+  in a burst after a stall produces a slope from points a second apart
+  carrying minutes of movement. See "Why a minimum span" on
+  `derivative/4`. Values change only for such short windows, during
+  warm-up and after a gap, so steady operation has no before/after
+  boundary.
+
   ## Spread (pairs trading): new math, not extracted from anywhere
 
   Unlike every function above, `rolling_ols_beta/4`, `kalman_beta/4`,
@@ -188,9 +199,26 @@ defmodule TradingCore.Signals do
   resulting window, rounded again to `:precision` on the way out.
 
   Returns `{new_history, nil}` when fewer than 2 samples are in the
-  window, or when the newest and oldest samples in the window share the
-  same timestamp (a zero-second denominator) — same "nothing to emit yet"
-  cases `Derivative.slope/1` guarded against live.
+  window, or when the newest and oldest samples in the window are less
+  than `:min_span_ms` apart (default `default_min_span_ms/2`). A span of
+  zero was always excluded (a zero-second denominator); the floor extends
+  that guard to spans that are merely tiny.
+
+  ### Why a minimum span
+
+  After a stall longer than the window (a dropped feed, or a consumer
+  that has fallen behind its mailbox), the history empties. The backlog
+  then drains within moments of processing time, so the first two points
+  can be a second or two apart while carrying minutes of real movement.
+  Dividing that by the tiny span gives a huge slope. trading_signal saw
+  this on 2026-09-21 as `ibkr_vix_derivitive` reading 4.0, about 850
+  times its previous max, the minute the IBKR feed dropped. Fixed-interval
+  sampling collapses a burst inside one bucket, but not one that
+  straddles a bucket boundary.
+
+  Values change only for these short windows: during warm-up, and after
+  a gap. A window that has spanned at least `:min_span_ms` gives the same
+  value as before, so steady operation has no before/after boundary.
 
   `second_derivative` needs no special handling: calling this again on a
   `derivative` signal's own emitted value stream computes the slope of the
@@ -204,12 +232,42 @@ defmodule TradingCore.Signals do
     new_history = sample_and_trim(history, {now, rounded}, now, opts)
 
     value =
-      case slope(new_history) do
-        nil -> nil
-        slope -> Decimal.round(slope, precision)
+      if span_ms(new_history) >= min_span_ms(opts) do
+        case slope(new_history) do
+          nil -> nil
+          slope -> Decimal.round(slope, precision)
+        end
       end
 
     {new_history, value}
+  end
+
+  @doc """
+  The default minimum span for `derivative/4`:
+  `max(div(window_ms, 5), 2 * sample_interval_ms)`, so 60s for a 5-minute
+  window. `sample_interval_ms` defaults to `default_sample_interval_ms/1`.
+  See "Why a minimum span" on `derivative/4`.
+  """
+  @spec default_min_span_ms(pos_integer(), non_neg_integer() | nil) :: non_neg_integer()
+  def default_min_span_ms(window_ms, sample_interval_ms \\ nil) do
+    interval_ms = sample_interval_ms || default_sample_interval_ms(window_ms)
+    max(div(window_ms, 5), 2 * interval_ms)
+  end
+
+  defp min_span_ms(opts) do
+    Keyword.get_lazy(opts, :min_span_ms, fn ->
+      default_min_span_ms(
+        Keyword.get(opts, :window_ms, @default_window_ms),
+        Keyword.get(opts, :sample_interval_ms)
+      )
+    end)
+  end
+
+  defp span_ms([]), do: 0
+
+  defp span_ms([{newest_at, _} | _] = history) do
+    {oldest_at, _} = List.last(history)
+    DateTime.diff(newest_at, oldest_at, :millisecond)
   end
 
   defp slope(history) when length(history) < 2, do: nil

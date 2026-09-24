@@ -383,9 +383,11 @@ defmodule TradingCore.Signal.Compute do
   # count any in-window points the max_history_samples cap drops into
   # state[:cap_bound_drops]. See "Fixed-interval sampling" in
   # TradingCore.Signals' moduledoc.
+  # :derivative and :second_derivative also stay :warming_up until their
+  # window spans params["min_span_ms"] (see derivative_opts/1).
   def step(%Spec{kind: kind} = spec, state, %{at: now, value: value})
       when kind in [:derivative, :second_derivative] do
-    opts = sampled_window_opts(spec)
+    opts = derivative_opts(spec)
     {history, result} = Signals.derivative(state.history, value, now, opts)
     state = track_cap_drops(state, state.history, history, now, opts)
     {%{state | history: history}, warm(result)}
@@ -1663,6 +1665,16 @@ defmodule TradingCore.Signal.Compute do
     case Map.get(params, "sample_interval_ms") do
       nil -> window_opts(spec)
       interval_ms -> Keyword.put(window_opts(spec), :sample_interval_ms, interval_ms)
+    end
+  end
+
+  # sampled_window_opts/1 plus derivative's minimum span:
+  # params["min_span_ms"], else Signals.default_min_span_ms/2. See
+  # "Why a minimum span" on TradingCore.Signals.derivative/4.
+  defp derivative_opts(%Spec{params: params} = spec) do
+    case Map.get(params, "min_span_ms") do
+      nil -> sampled_window_opts(spec)
+      min_span_ms -> Keyword.put(sampled_window_opts(spec), :min_span_ms, min_span_ms)
     end
   end
 
