@@ -61,6 +61,45 @@ defmodule TradingCore.Options.ContractSelectionTest do
     end
   end
 
+  describe "holiday third Fridays" do
+    test "a holiday third Friday expires the Thursday before" do
+      # Juneteenth 2026 is the third Friday of June.
+      assert CS.monthly_expiry(~D[2026-06-19]) == ~D[2026-06-18]
+      # Juneteenth 2027 is a Saturday, observed Friday 2027-06-18.
+      assert CS.monthly_expiry(~D[2027-06-18]) == ~D[2027-06-17]
+      assert CS.monthly_expiry(~D[2026-07-17]) == ~D[2026-07-17]
+    end
+
+    test "a dte_target landing on June 2026 probes Thursday 20260618" do
+      # 2026-05-01 + 45 = 2026-06-15 -> third Friday 2026-06-19 (holiday).
+      config = %{"expiry_selection" => "dte_target", "dte_target" => 45}
+
+      assert CS.expiry_candidates(config, ~D[2026-05-01]) ==
+               {:ok, ["20260618", "20260717", "20260821"]}
+    end
+
+    # The chain runs on the unadjusted third Fridays. Chaining from the
+    # adjusted Thursday would find the same month's Friday again, so a
+    # holiday month would fall through to itself.
+    test "a holiday first month falls through to the NEXT month" do
+      config = %{"expiry_selection" => "dte_target", "dte_target" => 45}
+
+      assert {:ok, ["20260618", second, third]} =
+               CS.expiry_candidates(config, ~D[2026-05-01])
+
+      assert second == "20260717"
+      assert third == "20260821"
+    end
+
+    test "a holiday in a fall-through month is adjusted too" do
+      # 2026-04-01 + 44 = 2026-05-15 -> May, then June (holiday), then July.
+      config = %{"expiry_selection" => "dte_target", "dte_target" => 44}
+
+      assert CS.expiry_candidates(config, ~D[2026-04-01]) ==
+               {:ok, ["20260515", "20260618", "20260717"]}
+    end
+  end
+
   describe "strike_increment/1" do
     test "SPY and QQQ on $5, XLF on $1, XLK and unknowns on the $1 default" do
       assert CS.strike_increment("SPY") == 5.0

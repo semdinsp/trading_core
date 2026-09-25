@@ -368,6 +368,26 @@ defmodule TradingCore.MarketHoursTest do
     end
   end
 
+  describe "US equities holiday calendar coverage" do
+    test "covers through the last listed year" do
+      assert MarketHours.UsEquitiesHolidays.covered_through() == ~D[2027-12-31]
+    end
+
+    # A deliberate tripwire: this goes red about 400 days before the
+    # calendar runs out, so it is extended before option expiries (up to
+    # ~120 DTE, via ContractSelection.monthly_expiry/1) or session checks
+    # reach a year where holiday?/2 silently answers false. Fix by adding
+    # the next published year to UsEquitiesHolidays, and update the
+    # covered_through assertion above.
+    test "extends at least 400 days past today" do
+      horizon = Date.add(Date.utc_today(), 400)
+      covered = MarketHours.UsEquitiesHolidays.covered_through()
+
+      assert Date.compare(covered, horizon) != :lt,
+             "US equities holiday calendar ends #{covered}; extend it past #{horizon}"
+    end
+  end
+
   describe "open?/2 on a holiday" do
     test "false on a holiday even during what would be session hours" do
       # 2026-09-07 (Labor Day) is a Monday -- would otherwise be a trading day.

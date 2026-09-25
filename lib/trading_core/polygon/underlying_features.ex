@@ -100,7 +100,8 @@ defmodule TradingCore.Polygon.UnderlyingFeatures do
 
     case to_float(Map.get(data, :last)) do
       price when is_float(price) and price > 0 ->
-        %{f | last_trade: price, last_trade_at: now}
+        f
+        |> update_last_trade(price, now)
         |> sample(price, now)
         |> accumulate_vwap(price, to_float(Map.get(data, :size)), Map.get(data, :timestamp))
 
@@ -206,6 +207,19 @@ defmodule TradingCore.Polygon.UnderlyingFeatures do
     %{f | imbalance_ema: ema + alpha * (x - ema), imbalance_at: now}
   end
 
+  # A trade older than the current last trade (a hub replaying after a
+  # reconnect, delivered out of order) must not move last_trade back to a
+  # stale price that still looks fresh. It still counts toward the VWAP:
+  # a late print is real volume, and VWAP doesn't depend on order. The
+  # return sampler ignores it too (sample/3's `now - last_sample_at >=
+  # 1000` guard fails for an older `now`), so a replay can't pull the
+  # returns back either.
+  defp update_last_trade(%{last_trade_at: at} = f, _price, now)
+       when is_integer(at) and now < at,
+       do: f
+
+  defp update_last_trade(f, price, now), do: %{f | last_trade: price, last_trade_at: now}
+
   defp sample(%{last_sample_at: last} = f, price, now)
        when is_nil(last) or now - last >= @sample_every_ms do
     samples = drop_old(:queue.in({now, price}, f.samples), now - @buffer_ms)
@@ -249,8 +263,12 @@ defmodule TradingCore.Polygon.UnderlyingFeatures do
       date when date == f.vwap_date ->
         %{f | vwap_pv: f.vwap_pv + price * size, vwap_v: f.vwap_v + size}
 
+      # Only a LATER session starts a new VWAP. A late or replayed print
+      # from an earlier session is ignored rather than wiping today's.
       date ->
-        %{f | vwap_date: date, vwap_pv: price * size, vwap_v: size}
+        if is_nil(f.vwap_date) or Date.compare(date, f.vwap_date) == :gt,
+          do: %{f | vwap_date: date, vwap_pv: price * size, vwap_v: size},
+          else: f
     end
   end
 
