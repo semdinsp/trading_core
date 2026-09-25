@@ -78,6 +78,19 @@ defmodule TradingCore.Options.ContractSelectionTest do
                {:ok, ["20260618", "20260717", "20260821"]}
     end
 
+    # The chain runs on the unadjusted third Fridays. Chaining from the
+    # adjusted Thursday would find the same month's Friday again, so a
+    # holiday month would fall through to itself.
+    test "a holiday first month falls through to the NEXT month" do
+      config = %{"expiry_selection" => "dte_target", "dte_target" => 45}
+
+      assert {:ok, ["20260618", second, third]} =
+               CS.expiry_candidates(config, ~D[2026-05-01])
+
+      assert second == "20260717"
+      assert third == "20260821"
+    end
+
     test "a holiday in a fall-through month is adjusted too" do
       # 2026-04-01 + 44 = 2026-05-15 -> May, then June (holiday), then July.
       config = %{"expiry_selection" => "dte_target", "dte_target" => 44}

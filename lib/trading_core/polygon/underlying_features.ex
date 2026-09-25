@@ -210,7 +210,10 @@ defmodule TradingCore.Polygon.UnderlyingFeatures do
   # A trade older than the current last trade (a hub replaying after a
   # reconnect, delivered out of order) must not move last_trade back to a
   # stale price that still looks fresh. It still counts toward the VWAP:
-  # a late print is real volume, and VWAP doesn't depend on order.
+  # a late print is real volume, and VWAP doesn't depend on order. The
+  # return sampler ignores it too (sample/3's `now - last_sample_at >=
+  # 1000` guard fails for an older `now`), so a replay can't pull the
+  # returns back either.
   defp update_last_trade(%{last_trade_at: at} = f, _price, now)
        when is_integer(at) and now < at,
        do: f
