@@ -184,6 +184,56 @@ defmodule TradingCore.Polygon.UnderlyingFeaturesTest do
     end
   end
 
+  describe "out-of-order delivery" do
+    # A hub replaying after a reconnect can deliver an older trade after
+    # a newer one; the older price must not become the last trade.
+    test "an older trade does not move last_trade back" do
+      f = F.new() |> trade("101.00", @t0 + 5_000) |> trade("99.00", @t0 + 1_000)
+
+      assert f.last_trade == 101.0
+      assert F.to_snapshot(f, @t0 + 5_000)["run_poly_last"] == 101.0
+    end
+
+    test "an older same-session sized trade still counts toward the VWAP" do
+      snap =
+        F.new()
+        |> trade("102.00", @t0 + 1_000, "100")
+        |> trade("100.00", @t0, "100")
+        |> F.to_snapshot(@t0 + 1_000)
+
+      # VWAP 101 from both prints, last 102.
+      assert_in_delta snap["run_poly_vwap_dev_bps"], 99.0099, 0.001
+    end
+
+    test "a late print from an earlier session does not wipe today's VWAP" do
+      yesterday_close = @t0 - 86_400_000 + 5 * 3_600_000
+
+      f =
+        F.new()
+        |> trade("100.00", @t0, "100")
+        |> trade("102.00", @t0 + 1_000, "100")
+        |> trade("50.00", yesterday_close, "1000")
+
+      assert f.vwap_date == ~D[2026-09-23]
+      assert f.vwap_v == 200.0
+
+      snap = f |> trade("102.00", @t0 + 2_000) |> F.to_snapshot(@t0 + 2_000)
+      assert_in_delta snap["run_poly_vwap_dev_bps"], 99.0099, 0.001
+    end
+
+    test "a later session still starts a new VWAP" do
+      next_day = @t0 + 86_400_000
+
+      f =
+        F.new()
+        |> trade("100.00", @t0, "100")
+        |> trade("110.00", next_day, "10")
+
+      assert f.vwap_date == ~D[2026-09-24]
+      assert f.vwap_v == 10.0
+    end
+  end
+
   describe "volume" do
     defp bars(f, volumes) do
       volumes

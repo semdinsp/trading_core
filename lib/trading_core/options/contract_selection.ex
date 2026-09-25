@@ -50,7 +50,9 @@ defmodule TradingCore.Options.ContractSelection do
   `"dte_target"` picks the nearest **third Friday** (the standard
   monthly expiry: the most liquid, and every listed underlying has one)
   on or after `today + dte_target` (default 45 days), then the next two
-  third Fridays as fall-through. That fall-through is not hypothetical:
+  third Fridays as fall-through. When a third Friday is a market holiday
+  (Good Friday, Juneteenth), that month expires on the Thursday before,
+  and the candidate is that Thursday (`monthly_expiry/1`). That fall-through is not hypothetical:
   on 2026-09-23 SPY listed Dec, Jan and Mar but not Feb 2027, so every
   120-DTE SPY leg (target 20270219) failed until the next months were
   tried.
@@ -76,6 +78,8 @@ defmodule TradingCore.Options.ContractSelection do
   Anything else, including `"right" => "either"`, returns
   `{:error, :unsupported_leg_config}`.
   """
+
+  alias TradingCore.MarketHours
 
   @type contract :: %{expiry: String.t(), strike: float(), right: String.t()}
 
@@ -163,7 +167,7 @@ defmodule TradingCore.Options.ContractSelection do
         first = third_friday_on_or_after(today, dte)
         second = third_friday_on_or_after(first, 1)
         third = third_friday_on_or_after(second, 1)
-        {:ok, Enum.map([first, second, third], &wire_format/1)}
+        {:ok, Enum.map([first, second, third], &(&1 |> monthly_expiry() |> wire_format()))}
 
       _invalid ->
         {:error, :unsupported_leg_config}
@@ -185,6 +189,24 @@ defmodule TradingCore.Options.ContractSelection do
     |> Date.add(dte)
     |> Stream.iterate(&Date.add(&1, 1))
     |> Enum.find(&third_friday?/1)
+  end
+
+  @doc """
+  The standard monthly expiry for the month whose third Friday is
+  `third_friday`: that Friday, or the Thursday before it when the Friday
+  is a US equities market holiday. On 2026-06-19 (Juneteenth, a third
+  Friday) the June monthly expires 20260618; probing 20260619 would cost
+  a 10s miss and fall through to July, a month longer-dated than asked.
+
+  Holidays come from `TradingCore.MarketHours.holiday?/2`, a hardcoded
+  calendar. For a year it doesn't list yet, this returns the Friday, as
+  before this check existed.
+  """
+  @spec monthly_expiry(Date.t()) :: Date.t()
+  def monthly_expiry(third_friday) do
+    if MarketHours.holiday?("US_EQUITIES", third_friday),
+      do: Date.add(third_friday, -1),
+      else: third_friday
   end
 
   @doc """
