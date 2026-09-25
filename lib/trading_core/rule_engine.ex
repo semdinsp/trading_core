@@ -146,8 +146,8 @@ defmodule TradingCore.RuleEngine do
   is indistinguishable from treating a missing leaf as `false`; the
   distinction only matters under a negation, which would otherwise turn
   "no data" into a pass. A malformed node is likewise unknown, so it fails
-  closed under `"not"` too. `margin_or_nil/2` handles `"not"` the same way
-  (it propagates absence rather than inverting it).
+  closed under `"not"` too. `margin_or_nil/2` gives `nil` (no margin) for
+  a `"not"` whose condition is unknown here, rather than inverting it.
   """
   @spec evaluate(rule() | nil, snapshot()) :: boolean()
   def evaluate(rule, snapshot), do: eval3(rule, snapshot) == true
@@ -267,6 +267,11 @@ defmodule TradingCore.RuleEngine do
       absence** — the inverse of "no meaningful margin" is still no
       meaningful margin, not `1.0 - nil`. Inverting an absent value would
       invent a reading the underlying leg never produced.
+    * `"not"` over a condition `evaluate/2` can't determine (it reads a
+      missing signal, or is malformed) is also `nil`. A missing leaf
+      scores `0.0`, so inverting it would give a full `1.0` margin from no
+      data, and an `"any"` would then report that `1.0` over a real
+      passing leg's smaller margin.
 
   A rule whose legs are all transitions therefore yields `nil` — "margin
   is not a meaningful question for this rule" — rather than a fire rate.
@@ -302,9 +307,13 @@ defmodule TradingCore.RuleEngine do
   end
 
   def margin_or_nil(%{"not" => condition}, snapshot) when is_map(condition) do
-    case margin_or_nil(condition, snapshot) do
-      nil -> nil
-      value -> 1.0 - value
+    if eval3(condition, snapshot) == :unknown do
+      nil
+    else
+      case margin_or_nil(condition, snapshot) do
+        nil -> nil
+        value -> 1.0 - value
+      end
     end
   end
 

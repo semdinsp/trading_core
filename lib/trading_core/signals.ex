@@ -148,8 +148,16 @@ defmodule TradingCore.Signals do
   alias TradingCore.WaveletTransform
 
   @type sample :: Decimal.t() | float() | integer() | String.t()
-  @type history_entry :: {DateTime.t(), Decimal.t()}
+  # The 3-tuple carries a cached float (`cache_floats: true`, see
+  # history_entry/3).
+  @type history_entry :: {DateTime.t(), Decimal.t()} | {DateTime.t(), Decimal.t(), float()}
   @type history :: [history_entry()]
+
+  # rolling_ols_beta/4's history entry; the 5-tuple carries cached floats
+  # (`cache_floats: true`, see history_entry/3).
+  @type ols_entry ::
+          {DateTime.t(), Decimal.t(), Decimal.t()}
+          | {DateTime.t(), Decimal.t(), Decimal.t(), float(), float()}
 
   # Same value/reasoning used by every wrapping signal kind in
   # trading_signal (Derivative, Vwap, SelfZscore, Deviation, Donchian,
@@ -245,13 +253,18 @@ defmodule TradingCore.Signals do
   @doc """
   The default minimum span for `derivative/4`:
   `max(div(window_ms, 5), 2 * sample_interval_ms)`, so 60s for a 5-minute
-  window. `sample_interval_ms` defaults to `default_sample_interval_ms/1`.
+  window, capped at `div(window_ms, 2)` so a short window or a coarse
+  sample interval can still emit. `sample_interval_ms` defaults to `default_sample_interval_ms/1`.
   See "Why a minimum span" on `derivative/4`.
   """
   @spec default_min_span_ms(pos_integer(), non_neg_integer() | nil) :: non_neg_integer()
   def default_min_span_ms(window_ms, sample_interval_ms \\ nil) do
     interval_ms = sample_interval_ms || default_sample_interval_ms(window_ms)
-    max(div(window_ms, 5), 2 * interval_ms)
+
+    # Capped at half the window: points inside the window can never span
+    # more than window_ms, so an uncapped floor (a 1s window's 2s, or a
+    # sample interval over half the window) would never emit at all.
+    min(max(div(window_ms, 5), 2 * interval_ms), div(window_ms, 2))
   end
 
   defp min_span_ms(opts) do
@@ -907,12 +920,8 @@ defmodule TradingCore.Signals do
   or when `log_x`'s variance in the window is exactly zero (a vertical/
   undefined regression line — every `log_x` sample identical).
   """
-  @spec rolling_ols_beta(
-          [{DateTime.t(), Decimal.t(), Decimal.t()}],
-          {sample(), sample()},
-          DateTime.t(),
-          keyword()
-        ) :: {[{DateTime.t(), Decimal.t(), Decimal.t()}], {Decimal.t(), Decimal.t()} | nil}
+  @spec rolling_ols_beta([ols_entry()], {sample(), sample()}, DateTime.t(), keyword()) ::
+          {[ols_entry()], {Decimal.t(), Decimal.t()} | nil}
   def rolling_ols_beta(history, {log_x, log_y}, now, opts \\ []) do
     precision = Keyword.get(opts, :precision, @default_precision)
     window_ms = Keyword.get(opts, :window_ms, @default_window_ms)
@@ -1211,7 +1220,9 @@ defmodule TradingCore.Signals do
   #
   # `sample_interval_ms: 0` turns sampling off (one point per tick).
   # Entries are any tuple whose first element is its timestamp:
-  # `{at, value}` here, `{at, x, y}` for rolling_ols_beta/4.
+  # `{at, value}` (or `{at, value, float}` with `cache_floats: true`) here,
+  # and `{at, x, y}` (or `{at, x, y, x_float, y_float}`) for
+  # rolling_ols_beta/4.
   defp sample_and_trim(history, entry, now, opts) do
     now_at = elem(entry, 0)
     window_ms = Keyword.get(opts, :window_ms, @default_window_ms)

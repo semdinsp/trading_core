@@ -343,6 +343,24 @@ defmodule TradingCore.SignalsTest do
       assert Signals.default_min_span_ms(:timer.minutes(5), 0) == 60_000
     end
 
+    test "the default is capped at half the window, so short windows still emit" do
+      assert Signals.default_min_span_ms(:timer.seconds(1)) == 500
+      assert Signals.default_min_span_ms(:timer.seconds(60), 40_000) == 30_000
+
+      ticks = for i <- 0..50, do: {DateTime.add(@base, i * 100, :millisecond), 100 + i}
+
+      {_history, values} =
+        Enum.reduce(ticks, {[], []}, fn {at, v}, {h, values} ->
+          {h, value} = Signals.derivative(h, v, at, window_ms: :timer.seconds(1))
+          {h, [value | values]}
+        end)
+
+      # Uncapped, the 2s floor exceeded the 1s window and this was nil on
+      # every tick. A 1s window samples at 1s, so it holds about two
+      # points and emits on the ticks where they are >= 0.5s apart.
+      assert Enum.count(values, &match?(%Decimal{}, &1)) > 20
+    end
+
     # The 2026-09-21 ibkr_vix_derivitive case: a stall empties the window,
     # then the backlog drains in a burst of processing timestamps that
     # straddles a sample bucket, carrying minutes of real movement.

@@ -643,5 +643,52 @@ defmodule TradingCore.BacktestTest do
 
       assert run.entry_price != nil
     end
+
+    test "min_span_ms is forwarded, as Compute does for a live derivative" do
+      strategy = %{
+        "direction" => "long",
+        "rules" => %{
+          "entry" => %{"signal" => "close_derivative", "op" => "gt", "value" => 0},
+          "exit" => nil
+        },
+        "params" => %{
+          "risk_controls" => %{
+            "method" => "percent_of_entry",
+            "stop_loss_percent" => 50,
+            "take_profit_percent" => 50
+          }
+        },
+        "position_sizing" => %{"method" => "fixed_qty", "qty" => 1}
+      }
+
+      specs = fn extra ->
+        %{
+          "close_price" => %{kind: :price},
+          "close_derivative" =>
+            Map.merge(
+              %{kind: :derivative, parent: "close_price", window_ms: :timer.hours(1)},
+              extra
+            )
+        }
+      end
+
+      bars = %{
+        "AAPL" => [
+          bar(0, 100, 101, 99, 100),
+          bar(1, 100, 106, 99, 105),
+          bar(2, 105, 107, 104, 106),
+          bar(3, 106, 108, 105, 107)
+        ]
+      }
+
+      # A 1h window's default minimum span is 12 minutes: 3 minutes of bars
+      # never reach it.
+      assert {:ok, []} = Backtest.run(strategy, bars, signal_specs: specs.(%{}))
+
+      assert {:ok, [run]} =
+               Backtest.run(strategy, bars, signal_specs: specs.(%{min_span_ms: 60_000}))
+
+      assert run.entry_price != nil
+    end
   end
 end

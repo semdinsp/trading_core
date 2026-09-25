@@ -120,6 +120,19 @@ defmodule TradingCore.Options.ContractSelectionTest do
              ]
     end
 
+    test "strikes at or below zero are never probed" do
+      config = atm(%{"strike_offset" => -5})
+
+      assert pairs(CS.candidates("XLF", config, 3.0, @today)) == []
+
+      assert pairs(CS.candidates("XLF", atm(%{"strike_offset" => -2}), 3.0, @today)) == [
+               {@feb, 1.0},
+               {@mar, 1.0},
+               {@apr, 1.0},
+               {@feb, 2.0}
+             ]
+    end
+
     test "no spot is :no_spot" do
       assert CS.candidates("SPY", atm(), nil, @today) == {:error, :no_spot}
       assert CS.candidates("SPY", atm(), 0.0, @today) == {:error, :no_spot}
@@ -167,6 +180,8 @@ defmodule TradingCore.Options.ContractSelectionTest do
       for config <- [
             fixed(%{"right" => "either"}),
             fixed(%{"expiry_selection" => "dte_target"}),
+            fixed(%{"fixed_strike" => "0"}),
+            fixed(%{"fixed_strike" => -5}),
             fixed(%{"fixed_strike" => "abc"}),
             Map.delete(fixed(%{}), "fixed_expiry"),
             %{"strike_selection" => "delta_target"}
