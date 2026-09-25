@@ -62,6 +62,19 @@ defmodule TradingCore.MarketHours.UsEquitiesHolidays do
               ~D[2027-12-24]
             ])
 
+  # Last day of the last calendar year listed in @holidays.
+  @covered_through @holidays |> Enum.map(& &1.year) |> Enum.max() |> Date.new!(12, 31)
+
+  @doc """
+  The last date this calendar covers: 31 December of the last year listed.
+  `holiday?/1` answers `false` for any later date, so a date past this is
+  unchecked rather than known not to be a holiday. A test fails when this
+  gets within about 400 days of today, so the calendar is extended before
+  option expiries (up to ~120 days out) reach an unchecked year.
+  """
+  @spec covered_through() :: Date.t()
+  def covered_through, do: @covered_through
+
   @doc "True if `date` is a US equities (NYSE/NASDAQ) market holiday."
   @spec holiday?(Date.t()) :: boolean()
   def holiday?(%Date{} = date), do: MapSet.member?(@holidays, date)
