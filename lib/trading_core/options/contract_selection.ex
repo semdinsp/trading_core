@@ -119,9 +119,14 @@ defmodule TradingCore.Options.ContractSelection do
         [rounded + increment, rounded - increment]
         |> Enum.map(&{first, Float.round(&1, 2)})
 
+      # A strike at or below zero can't be listed, and each probe of one
+      # costs a 10s miss (a cheap underlying with a large negative
+      # offset). Dropping them never changes which contract resolves; an
+      # empty list means :no_listed_contract to the caller.
       contracts =
         (Enum.map(expiries, &{&1, rounded}) ++ neighbours)
         |> Enum.uniq()
+        |> Enum.filter(fn {_expiry, strike} -> strike > 0 end)
         |> Enum.map(fn {expiry, strike} -> %{expiry: expiry, strike: strike, right: right} end)
 
       {:ok, contracts}
@@ -221,8 +226,14 @@ defmodule TradingCore.Options.ContractSelection do
   # Decimal.new(to_string(strike)), so "762.00", 762 and 762.0 agree.
   defp parse_strike(strike) when is_number(strike) or is_binary(strike) do
     case Decimal.parse(to_string(strike)) do
-      {decimal, ""} -> {:ok, decimal |> Decimal.round(2) |> Decimal.to_float()}
-      _invalid -> {:error, :unsupported_leg_config}
+      {decimal, ""} ->
+        case decimal |> Decimal.round(2) |> Decimal.to_float() do
+          strike when strike > 0 -> {:ok, strike}
+          _non_positive -> {:error, :unsupported_leg_config}
+        end
+
+      _invalid ->
+        {:error, :unsupported_leg_config}
     end
   end
 

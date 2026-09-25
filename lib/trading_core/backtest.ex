@@ -149,7 +149,8 @@ defmodule TradingCore.Backtest do
     `TradingCore.Signals.derivative/4`/`momentum/4`'s `opts`); `:self_zscore`
     likewise. `:derivative`, `:self_zscore` and `:spread_zscore` also take
     `sample_interval_ms:` and `on_cap_bound:` (see "Fixed-interval
-    sampling" in `TradingCore.Signals`). `:wavelet` takes no extra options (fixed window/level, see
+    sampling" in `TradingCore.Signals`), and `:derivative` takes
+    `min_span_ms:` (see "Derivative minimum span" there). `:wavelet` takes no extra options (fixed window/level, see
     `TradingCore.Signals.wavelet/2`).
   - `kind: :percent_deviation` / `:ratio` — wraps two named signals,
     `value: "signal_a"` and `reference: "signal_b"` (both looked up in the
@@ -1032,7 +1033,8 @@ defmodule TradingCore.Backtest do
       :precision,
       :max_history_samples,
       :sample_interval_ms,
-      :on_cap_bound
+      :on_cap_bound,
+      :min_span_ms
     ])
     |> Enum.into([])
   end

@@ -231,6 +231,30 @@ defmodule TradingCore.RuleEngineTest do
     end
   end
 
+  describe "margin_or_nil/2 — \"not\" over an unknown condition has no margin" do
+    @missing_leaf %{"signal" => "polygon_volume", "op" => "gt", "value" => 48_000}
+    @real_leaf %{"signal" => "vix_last", "op" => "gt", "value" => 100}
+
+    test "not over a missing signal is nil, not 1.0" do
+      assert RuleEngine.margin_or_nil(%{"not" => @missing_leaf}, %{}) == nil
+    end
+
+    test "a real passing leg's margin is not overridden by not(missing)" do
+      rule = %{"any" => [@real_leaf, %{"not" => @missing_leaf}]}
+      snapshot = %{"vix_last" => 110}
+
+      assert RuleEngine.evaluate(rule, snapshot)
+      assert_in_delta RuleEngine.margin(rule, snapshot), 0.1, 1.0e-9
+    end
+
+    test "not over a present, determinable condition still inverts" do
+      snapshot = %{"polygon_volume" => 10_000}
+      inner = RuleEngine.margin_or_nil(@missing_leaf, snapshot)
+
+      assert RuleEngine.margin_or_nil(%{"not" => @missing_leaf}, snapshot) == 1.0 - inner
+    end
+  end
+
   describe "evaluate/2 — malformed rules fail closed" do
     test "unrecognized op is not met" do
       rule = %{"signal" => "vix_last", "op" => "between", "value" => 18}
