@@ -21,6 +21,7 @@ defmodule TradingCore.MarketHours do
   """
 
   alias TradingCore.MarketHours.Session
+  alias TradingCore.MarketHours.UsEquitiesEarlyCloses
   alias TradingCore.MarketHours.UsEquitiesHolidays
 
   @doc """
@@ -33,6 +34,11 @@ defmodule TradingCore.MarketHours do
   the returned instant to be a close time on a day the market never
   actually opened; the caller only ever uses this as an upper bound, not a
   standalone gate. Returns `nil` if `session.enabled` is `false`.
+
+  Respects exchange early closes (see `early_close/2`): on an early-close
+  day for `session.market`, "today's close" is the earlier of `end_time`
+  and the early close, so a caller flattening at `next_close - N` does so
+  before the real bell rather than hours after it.
   """
   @spec next_close(Session.t(), DateTime.t()) :: DateTime.t() | nil
   def next_close(%Session{enabled: false}, _now), do: nil
@@ -41,19 +47,13 @@ defmodule TradingCore.MarketHours do
     {:ok, local_now} = DateTime.shift_zone(now, session.timezone)
     today = DateTime.to_date(local_now)
 
-    {:ok, close_today} = DateTime.new(today, session.end_time, session.timezone)
+    close_today = session_close(session, today)
 
-    close_today =
-      if DateTime.compare(local_now, close_today) == :gt do
-        {:ok, close_tomorrow} =
-          DateTime.new(Date.add(today, 1), session.end_time, session.timezone)
-
-        close_tomorrow
-      else
-        close_today
-      end
-
-    DateTime.shift_zone!(close_today, "Etc/UTC")
+    if DateTime.compare(now, close_today) == :gt do
+      session_close(session, Date.add(today, 1))
+    else
+      close_today
+    end
   end
 
   @doc """
@@ -102,6 +102,9 @@ defmodule TradingCore.MarketHours do
   midnight relative to UTC still resolves against the *session's* day, not
   UTC's. Returns `false` (i.e. "not open," so callers already treat it as
   time-to-deactivate) if `session.enabled` is `false`.
+
+  On an early-close day (see `early_close/2`) the session ends at the
+  early close, not `end_time`.
   """
   @spec open?(Session.t(), DateTime.t()) :: boolean()
   def open?(%Session{enabled: false}, _now), do: false
@@ -112,7 +115,7 @@ defmodule TradingCore.MarketHours do
 
     trading_day?(session, local_now) and
       Time.compare(local_time, session.start_time) != :lt and
-      Time.compare(local_time, session.end_time) == :lt
+      DateTime.compare(now, session_close(session, DateTime.to_date(local_now))) == :lt
   end
 
   @doc """
@@ -188,6 +191,9 @@ defmodule TradingCore.MarketHours do
   session as already finished for the day. Ordinary Saturday/Sunday
   daytime hours are unaffected — only the last ~1 hour of Sunday night (in
   this timezone) before the UTC date changes underneath it.
+
+  On an early-close day (see `early_close/2`) "closed" starts at the early
+  close, not `end_time`.
   """
   @spec closed_for_today?(Session.t(), DateTime.t()) :: boolean()
   def closed_for_today?(%Session{enabled: false}, _now), do: false
@@ -206,8 +212,7 @@ defmodule TradingCore.MarketHours do
     {:ok, now_utc} = DateTime.shift_zone(now, "Etc/UTC")
     reference_date = DateTime.to_date(now_utc)
 
-    {:ok, close_today} = DateTime.new(reference_date, session.end_time, session.timezone)
-    close_today_utc = DateTime.shift_zone!(close_today, "Etc/UTC")
+    close_today_utc = session_close(session, reference_date)
 
     weekday = Date.day_of_week(reference_date)
 
@@ -246,6 +251,60 @@ defmodule TradingCore.MarketHours do
   @spec holiday?(String.t(), Date.t()) :: boolean()
   def holiday?("US_EQUITIES", %Date{} = date), do: UsEquitiesHolidays.holiday?(date)
   def holiday?(_market, %Date{}), do: false
+
+  @doc """
+  The early close for `market` on `date` as `{time, timezone}` — the
+  exchange's own local close time and the IANA zone it is expressed in —
+  or `nil` if `date` is a normal full day (or `market` is unrecognized).
+  Backed by a static calendar (see
+  `TradingCore.MarketHours.UsEquitiesEarlyCloses`); currently only
+  `"US_EQUITIES"` is recognized, same as `holiday?/2`.
+
+  `next_close/2`, `open?/2` and `closed_for_today?/2` already apply this,
+  so most callers never need it directly.
+  """
+  @spec early_close(String.t(), Date.t()) :: {Time.t(), String.t()} | nil
+  def early_close("US_EQUITIES", %Date{} = date) do
+    case UsEquitiesEarlyCloses.close_time(date) do
+      nil -> nil
+      time -> {time, UsEquitiesEarlyCloses.timezone()}
+    end
+  end
+
+  def early_close(_market, %Date{}), do: nil
+
+  # The UTC instant `session` closes on local calendar day `date` (in
+  # `session.timezone`): `end_time`, or the exchange's early close if that
+  # is earlier. Compared as instants rather than local times so a session
+  # configured in a timezone other than the exchange's still lands on the
+  # real bell. The early-close lookup is keyed on the exchange-local date
+  # of the normal close, for the same reason. Only ever shortens a
+  # session — an early close later than `end_time` is ignored.
+  defp session_close(%Session{} = session, %Date{} = date) do
+    {:ok, normal_close} = DateTime.new(date, session.end_time, session.timezone)
+    normal_close = DateTime.shift_zone!(normal_close, "Etc/UTC")
+
+    with {:ok, exchange_close} <- early_close_instant(session.market, normal_close),
+         :lt <- DateTime.compare(exchange_close, normal_close) do
+      exchange_close
+    else
+      _ -> normal_close
+    end
+  end
+
+  defp early_close_instant(market, %DateTime{} = normal_close_utc) do
+    with zone when zone != nil <- exchange_timezone(market),
+         exchange_date = normal_close_utc |> DateTime.shift_zone!(zone) |> DateTime.to_date(),
+         {time, ^zone} <- early_close(market, exchange_date) do
+      {:ok, close} = DateTime.new(exchange_date, time, zone)
+      {:ok, DateTime.shift_zone!(close, "Etc/UTC")}
+    else
+      _ -> :none
+    end
+  end
+
+  defp exchange_timezone("US_EQUITIES"), do: UsEquitiesEarlyCloses.timezone()
+  defp exchange_timezone(_market), do: nil
 
   # `date` is a holiday for `session` — either a `holiday?/2` day on
   # `session.market`'s static calendar, or a date the caller listed in its
