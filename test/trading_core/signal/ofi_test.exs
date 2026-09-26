@@ -47,18 +47,18 @@ defmodule TradingCore.Signal.OfiTest do
       assert Decimal.equal?(value, Decimal.new(300))
     end
 
-    test "ask price falls: sellers undercutting is BUY-side pressure" do
-      # The sign inversion that makes OFI asymmetric. An ask falling
-      # subtracts a negative, so it contributes positively.
+    test "ask price falls: sellers improving is SELL-side pressure" do
+      # The new, better offer's whole size counts against OFI. Before
+      # 2026-09-25 this case was inverted (+500), biasing OFI positive.
       {_s, value} = run(%{}, [base(), book(1, 100.0, 500, 100.01, 200)])
 
-      assert Decimal.equal?(value, Decimal.new(500))
+      assert Decimal.equal?(value, Decimal.new(-200))
     end
 
-    test "ask price rises: new ask liquidity is sell-side pressure" do
+    test "ask price rises: the whole previous offer was lifted or pulled" do
       {_s, value} = run(%{}, [base(), book(1, 100.0, 500, 100.03, 700)])
 
-      assert Decimal.equal?(value, Decimal.new(-700))
+      assert Decimal.equal?(value, Decimal.new(500))
     end
 
     test "ask price unchanged: added ask size is sell-side pressure" do
@@ -69,18 +69,25 @@ defmodule TradingCore.Signal.OfiTest do
   end
 
   describe "both sides moving together" do
-    test "bid up and ask up nets the two contributions" do
-      # bid rises: +300. ask rises: -700. Net -400.
+    test "the whole book shifting up is buy pressure from both sides" do
+      # bid rises: +300. ask rises: +500 (old offer). Net +800.
       {_s, value} = run(%{}, [base(), book(1, 100.01, 300, 100.03, 700)])
 
-      assert Decimal.equal?(value, Decimal.new(-400))
+      assert Decimal.equal?(value, Decimal.new(800))
     end
 
-    test "a book tightening from both sides is strongly positive" do
-      # bid rises (+400), ask falls (+500 after inversion) = +900
+    test "the whole book shifting down is sell pressure from both sides" do
+      # bid falls: -500 (old bid). ask falls: -200 (new offer). Net -700.
+      {_s, value} = run(%{}, [base(), book(1, 99.99, 300, 100.01, 200)])
+
+      assert Decimal.equal?(value, Decimal.new(-700))
+    end
+
+    test "a book tightening from both sides nets buyers against sellers" do
+      # bid rises (+400), ask falls (-200) = +200
       {_s, value} = run(%{}, [base(), book(1, 100.01, 400, 100.01, 200)])
 
-      assert Decimal.equal?(value, Decimal.new(900))
+      assert Decimal.equal?(value, Decimal.new(200))
     end
 
     test "an unchanged book contributes exactly zero" do
@@ -89,6 +96,71 @@ defmodule TradingCore.Signal.OfiTest do
       assert Decimal.equal?(value, Decimal.new(0))
     end
   end
+
+  describe "symmetric random book" do
+    # The guard that would have caught the 2026-09 ask-side sign bug: with
+    # no drift and symmetric sizes, OFI has no reason to favour either
+    # sign, so windows should read positive about half the time. The
+    # inverted formula read positive in ~99.7% of these windows.
+    test "reads positive in roughly half of many windows" do
+      :rand.seed(:exsss, {20_260_925, 1, 1})
+
+      windows = 300
+      events_per_window = 200
+
+      positives =
+        Enum.count(1..windows, fn w ->
+          ticks = random_book_walk(w, events_per_window)
+          {_s, value} = run(%{}, ticks)
+          Decimal.compare(value, 0) == :gt
+        end)
+
+      share = positives / windows
+      assert share > 0.40 and share < 0.60, "positive share #{share}"
+    end
+  end
+
+  # A one-tick-spread queue model at integer cents. Each event adds or
+  # removes a lot on one side with equal probability; when a queue
+  # empties, the book shifts one tick toward it (bid emptied -> down, ask
+  # emptied -> up) with fresh sizes at the new levels. Symmetric by
+  # construction. Price moves driven by a depleted queue are what exposed
+  # the old ask-side inversion — a model that moves the book with fresh
+  # sizes on both sides cancels the error out and does not catch it.
+  defp random_book_walk(w, n) do
+    start = %{bid: 10_000, ask: 10_001, bid_size: rand_size(), ask_size: rand_size()}
+
+    {ticks, _} =
+      Enum.map_reduce(0..n, start, fn i, b ->
+        b = if i == 0, do: b, else: random_event(b)
+        at = DateTime.add(@now, w * 10_000 + i, :millisecond)
+        {book(0, b.bid / 100, b.bid_size, b.ask / 100, b.ask_size) |> Map.put(:at, at), b}
+      end)
+
+    ticks
+  end
+
+  defp random_event(b) do
+    lot = 100 * Enum.random([-1, 1])
+
+    b =
+      if :rand.uniform(2) == 1,
+        do: %{b | bid_size: max(b.bid_size + lot, 0)},
+        else: %{b | ask_size: max(b.ask_size + lot, 0)}
+
+    cond do
+      b.bid_size == 0 ->
+        %{b | bid: b.bid - 1, ask: b.ask - 1, bid_size: rand_size(), ask_size: rand_size()}
+
+      b.ask_size == 0 ->
+        %{b | bid: b.bid + 1, ask: b.ask + 1, bid_size: rand_size(), ask_size: rand_size()}
+
+      true ->
+        b
+    end
+  end
+
+  defp rand_size, do: :rand.uniform(5) * 100
 
   describe "windowing" do
     test "sums contributions across several updates" do
