@@ -93,6 +93,15 @@ defmodule TradingCore.Signal.Compute do
   `:spread`'s leg pairing for the same reasoning applied to two price
   feeds.
 
+  ## `:ofi` values before 2026-09-25 are wrong
+
+  Until 2026-09-25 `:ofi` applied the bid side's rule to the ask side and
+  subtracted, which inverts the ask's moved-price cases: a falling ask
+  (sellers improving) counted as buy pressure and a rising ask as sell
+  pressure. Live SPY/QQQ read positive 91-97% of the time as a result.
+  That is a bug, not an earlier definition — do not use `:ofi` history
+  computed before the fix. See the `:ofi` `step/2` clause for the formula.
+
   ## Session boundaries are injected, never derived from wall-clock
 
   A `:vwap`, `:volume`, or `:zscore` spec's `params` may include
@@ -319,6 +328,7 @@ defmodule TradingCore.Signal.Compute do
     _ = subsample_mode!(spec)
     {:ok, %{prices: []}}
   end
+
   def init(%Spec{kind: :quoted_spread}), do: {:ok, %{quote: new_quote_state()}}
 
   def init(%Spec{kind: :effective_spread}), do: {:ok, %{quote: new_quote_state()}}
@@ -658,9 +668,19 @@ defmodule TradingCore.Signal.Compute do
   #   bid price UNCHANGED -> +(bid_size delta)
   #   bid price FELL      -> -old_bid_size   (that bid was pulled)
   #
-  # The ask side mirrors with signs reversed: an ask price FALLING is
-  # buy-side pressure (sellers undercutting), so it subtracts, while an
-  # ask RISING adds. Summed over window_ms.
+  #   ask price FELL      -> -new_ask_size   (sellers improved: sell pressure)
+  #   ask price UNCHANGED -> -(ask_size delta)
+  #   ask price ROSE      -> +old_ask_size   (that offer was lifted or pulled)
+  #
+  # i.e. e_n = 1[b_n >= b_n-1]*qb_n - 1[b_n <= b_n-1]*qb_n-1
+  #          - 1[a_n <= a_n-1]*qa_n + 1[a_n >= a_n-1]*qa_n-1
+  # Summed over window_ms.
+  #
+  # Values emitted before 2026-09-25 are WRONG, not merely a different
+  # definition: the ask side's moved-price cases were inverted (a falling
+  # ask counted as buy pressure), which biased OFI positive ~85-97% of
+  # the time on live SPY/QQQ/XLE. Do not use :ofi history from before
+  # that fix.
   #
   # This is the single most-validated short-horizon predictor in the
   # microstructure literature, and it needs only L1. It is also the
@@ -762,8 +782,6 @@ defmodule TradingCore.Signal.Compute do
       value -> two_scale_rv_step(spec, state, now, value)
     end
   end
-
-
 
   # Quoted spread: ask - bid, or (ask - bid) / mid when params
   # "relative" is true. Both a cost input and a liquidity-regime feature
@@ -1079,11 +1097,6 @@ defmodule TradingCore.Signal.Compute do
     {state, warm(two_scale_rv_value(ordered, prices, spec))}
   end
 
-  # e_n = bid-side contribution - ask-side contribution, per CKS. A
-  # missing size is treated as zero rather than skipping the update: the
-  # price move itself is information, and dropping the tick would lose
-  # it. (On the measured Polygon feed sizes are always present; this is
-  # for a feed that omits them.)
   defp kyle_lambda_step(spec, state, quote_state, price, tick, now) do
     mid = mid_price(quote_state.bid, quote_state.ask)
     sign = trade_sign(classifier!(spec), price, quote_state, state)
@@ -1116,29 +1129,49 @@ defmodule TradingCore.Signal.Compute do
     end
   end
 
-  # Both sides use the identical rule; the asymmetry is the subtraction,
-  # not the per-side arithmetic. An ask price FALLING gives that side a
-  # negative delta, which subtracted becomes a positive OFI contribution
-  # — correct, since sellers undercutting is buy-side pressure.
+  # e_n = bid-side contribution + ask-side contribution, per CKS. The two
+  # sides are NOT mirror images under one rule with a subtraction: a
+  # moved price charges the NEW level's size on the side that improved
+  # (bid up, ask down) and the OLD level's size on the side that
+  # retreated (bid down, ask up). A falling ask is sellers improving —
+  # sell pressure — so it contributes -new_ask_size.
+  #
+  # A missing size is treated as zero rather than skipping the update:
+  # the price move itself is information, and dropping the tick would
+  # lose it. (On the measured Polygon feed sizes are always present; this
+  # is for a feed that omits them.)
   defp ofi_contribution(prev, curr) do
-    Decimal.sub(
-      side_delta(prev.bid, prev.bid_size, curr.bid, curr.bid_size),
-      side_delta(prev.ask, prev.ask_size, curr.ask, curr.ask_size)
+    Decimal.add(
+      bid_contribution(prev.bid, prev.bid_size, curr.bid, curr.bid_size),
+      ask_contribution(prev.ask, prev.ask_size, curr.ask, curr.ask_size)
     )
   end
 
-  defp side_delta(prev_price, prev_size, curr_price, curr_size) do
+  defp bid_contribution(prev_price, prev_size, curr_price, curr_size) do
     prev_size = prev_size || Decimal.new(0)
     curr_size = curr_size || Decimal.new(0)
 
     case Decimal.compare(curr_price, prev_price) do
-      # Price moved up: the size resting at the new level is wholly new
-      # liquidity on that side.
+      # Bid rose: the size at the new, better level is new buying interest.
       :gt -> curr_size
-      # Price unchanged: only the change in resting size is new.
+      # Unchanged: only the change in resting size is new.
       :eq -> Decimal.sub(curr_size, prev_size)
-      # Price moved down: the whole previous level was pulled or consumed.
+      # Bid fell: the whole previous level was pulled or hit.
       :lt -> Decimal.negate(prev_size)
+    end
+  end
+
+  defp ask_contribution(prev_price, prev_size, curr_price, curr_size) do
+    prev_size = prev_size || Decimal.new(0)
+    curr_size = curr_size || Decimal.new(0)
+
+    case Decimal.compare(curr_price, prev_price) do
+      # Ask fell: the size at the new, better offer is new selling interest.
+      :lt -> Decimal.negate(curr_size)
+      # Unchanged: added offer size is sell pressure, removed is buy.
+      :eq -> Decimal.sub(prev_size, curr_size)
+      # Ask rose: the whole previous offer was lifted or pulled.
+      :gt -> prev_size
     end
   end
 
