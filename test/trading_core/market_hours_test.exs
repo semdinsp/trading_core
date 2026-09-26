@@ -401,6 +401,111 @@ defmodule TradingCore.MarketHoursTest do
     end
   end
 
+  describe "early closes" do
+    # 2026-11-27 (day after Thanksgiving) closes at 13:00 ET.
+    @early ~D[2026-11-27]
+
+    defp et(date, time), do: DateTime.new!(date, time, "America/New_York")
+
+    test "early_close/2 reports the time and zone for a listed day" do
+      assert MarketHours.early_close("US_EQUITIES", @early) ==
+               {~T[13:00:00], "America/New_York"}
+    end
+
+    test "early_close/2 is nil on a normal day and for an unknown market" do
+      assert MarketHours.early_close("US_EQUITIES", ~D[2026-11-30]) == nil
+      assert MarketHours.early_close("FOREX", @early) == nil
+    end
+
+    test "next_close/2 returns the early close, not end_time" do
+      close = MarketHours.next_close(@us, et(@early, ~T[10:00:00]))
+
+      assert DateTime.compare(close, et(@early, ~T[13:00:00])) == :eq
+      assert close.time_zone == "Etc/UTC"
+    end
+
+    test "next_close/2 rolls to the next day once the early close has passed" do
+      # 14:00 on the early-close day is before the normal 16:00 end but
+      # after the real bell, so the next close is tomorrow's.
+      close = MarketHours.next_close(@us, et(@early, ~T[14:00:00]))
+
+      assert DateTime.compare(close, et(~D[2026-11-28], ~T[16:00:00])) == :eq
+    end
+
+    test "open?/2 is true before the early close and false from it" do
+      assert MarketHours.open?(@us, et(@early, ~T[12:59:59]))
+      refute MarketHours.open?(@us, et(@early, ~T[13:00:00]))
+      refute MarketHours.open?(@us, et(@early, ~T[15:00:00]))
+    end
+
+    test "closed_for_today?/2 flips at the early close" do
+      refute MarketHours.closed_for_today?(@us, et(@early, ~T[12:30:00]))
+      assert MarketHours.closed_for_today?(@us, et(@early, ~T[13:00:00]))
+    end
+
+    test "a normal day still closes at end_time" do
+      assert MarketHours.open?(@us, et(~D[2026-11-30], ~T[15:00:00]))
+
+      close = MarketHours.next_close(@us, et(~D[2026-11-30], ~T[10:00:00]))
+      assert DateTime.compare(close, et(~D[2026-11-30], ~T[16:00:00])) == :eq
+    end
+
+    test "a session whose end_time is already earlier is not extended" do
+      short = %{@us | end_time: ~T[12:00:00]}
+
+      close = MarketHours.next_close(short, et(@early, ~T[10:00:00]))
+      assert DateTime.compare(close, et(@early, ~T[12:00:00])) == :eq
+    end
+
+    test "an unrecognized market ignores the US early-close table" do
+      other = %{@us | market: "FOREX"}
+
+      assert MarketHours.open?(other, et(@early, ~T[15:00:00]))
+    end
+
+    test "a session configured in another timezone still closes at the real bell" do
+      # Same US session expressed in UTC (14:30-21:00 UTC in November).
+      utc_session = %{@us | timezone: "Etc/UTC", start_time: ~T[14:30:00], end_time: ~T[21:00:00]}
+
+      close = MarketHours.next_close(utc_session, et(@early, ~T[10:00:00]))
+      assert DateTime.compare(close, et(@early, ~T[13:00:00])) == :eq
+      refute MarketHours.open?(utc_session, et(@early, ~T[13:30:00]))
+    end
+
+    test "the listed 2026-2028 early closes are all weekdays and not holidays" do
+      dates =
+        Date.range(~D[2026-01-01], ~D[2028-12-31])
+        |> Enum.filter(&MarketHours.early_close("US_EQUITIES", &1))
+
+      assert dates == [
+               ~D[2026-11-27],
+               ~D[2026-12-24],
+               ~D[2027-11-26],
+               ~D[2028-07-03],
+               ~D[2028-11-24]
+             ]
+
+      for d <- dates do
+        assert Date.day_of_week(d) in 1..5
+        refute MarketHours.holiday?("US_EQUITIES", d)
+      end
+    end
+
+    test "covers through 2028" do
+      assert MarketHours.UsEquitiesEarlyCloses.covered_through() == ~D[2028-12-31]
+    end
+
+    # Same tripwire as the holiday calendar: goes red ~400 days before the
+    # early-close table runs out. Extend it alongside UsEquitiesHolidays.
+    test "extends at least 400 days past today" do
+      horizon = Date.add(Date.utc_today(), 400)
+      covered = MarketHours.UsEquitiesEarlyCloses.covered_through()
+
+      assert Date.compare(covered, horizon) != :lt,
+             "US equities early-close calendar ends #{covered}; extend it past #{horizon}"
+    end
+  end
+
   describe "open?/2 on a holiday" do
     test "false on a holiday even during what would be session hours" do
       # 2026-09-07 (Labor Day) is a Monday -- would otherwise be a trading day.
