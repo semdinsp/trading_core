@@ -127,9 +127,15 @@ the cheapest thing here. Positive means bid-side size dominates.
 
 **`:ofi`** — the most-validated short-horizon predictor in the
 literature, and it needs only L1. Per quote update: bid price rose →
-`+new size`, unchanged → `+size delta`, fell → `−old size`. The ask side
-mirrors with signs reversed, so an ask *falling* contributes
-**positively** (sellers undercutting is buy-side pressure).
+`+new size`, unchanged → `+size delta`, fell → `−old size`. Ask price
+fell → `−new size`, unchanged → `−size delta`, rose → `+old size`. An
+ask *falling* is sellers improving — sell pressure — so it contributes
+**negatively**; an ask *rising* contributes positively.
+
+`:ofi` values computed before trading_core `1b6c0e3` (2026-09-25) are
+**wrong**, not a different definition: the ask side's moved-price cases
+were inverted, biasing OFI positive ~85–97% of the time. Do not use that
+history.
 
 **`:quoted_spread` / `:effective_spread`** — a cost input *and* a
 liquidity-regime feature; a widening spread is a tradeable state change.
