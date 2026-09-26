@@ -370,7 +370,20 @@ defmodule TradingCore.MarketHoursTest do
 
   describe "US equities holiday calendar coverage" do
     test "covers through the last listed year" do
-      assert MarketHours.UsEquitiesHolidays.covered_through() == ~D[2027-12-31]
+      assert MarketHours.UsEquitiesHolidays.covered_through() == ~D[2028-12-31]
+    end
+
+    test "2028 has nine closures and no New Year's Day observance" do
+      holidays_2028 =
+        Date.range(~D[2028-01-01], ~D[2028-12-31])
+        |> Enum.filter(&MarketHours.holiday?("US_EQUITIES", &1))
+
+      assert length(holidays_2028) == 9
+      assert Enum.all?(holidays_2028, &(Date.day_of_week(&1) in 1..5))
+
+      # New Year's Day 2028 is a Saturday. NYSE does not shift it back to
+      # Friday 2027-12-31 because that Friday ends the year.
+      refute MarketHours.holiday?("US_EQUITIES", ~D[2027-12-31])
     end
 
     # A deliberate tripwire: this goes red about 400 days before the

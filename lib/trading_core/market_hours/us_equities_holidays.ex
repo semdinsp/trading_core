@@ -20,7 +20,10 @@ defmodule TradingCore.MarketHours.UsEquitiesHolidays do
   # Juneteenth, Independence Day, Labor Day, Thanksgiving, Christmas.
   # Observed-date rule already applied where a fixed-date holiday falls on
   # a weekend (Saturday -> observed the preceding Friday, Sunday ->
-  # observed the following Monday) — floating holidays (MLK, Presidents,
+  # observed the following Monday), except that NYSE does not close the
+  # Friday before a Saturday holiday when that Friday ends a month or
+  # year — so a Saturday New Year's Day is simply not observed (see
+  # 2028) — floating holidays (MLK, Presidents,
   # Memorial, Labor, Thanksgiving) are already always weekdays by
   # definition and never need this shift.
   @holidays MapSet.new([
@@ -59,7 +62,19 @@ defmodule TradingCore.MarketHours.UsEquitiesHolidays do
               ~D[2027-09-06],
               ~D[2027-11-25],
               # 2027-12-25 is a Saturday -> observed Friday 2027-12-24.
-              ~D[2027-12-24]
+              ~D[2027-12-24],
+              # 2028 (checked against nyse.com/markets/hours-calendars,
+              # 2026-09-25). 2028-01-01 is a Saturday; NYSE observes no
+              # New Year's Day holiday, so 2027-12-31 is a trading day.
+              ~D[2028-01-17],
+              ~D[2028-02-21],
+              ~D[2028-04-14],
+              ~D[2028-05-29],
+              ~D[2028-06-19],
+              ~D[2028-07-04],
+              ~D[2028-09-04],
+              ~D[2028-11-23],
+              ~D[2028-12-25]
             ])
 
   # Last day of the last calendar year listed in @holidays.
