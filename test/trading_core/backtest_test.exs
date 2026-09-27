@@ -466,7 +466,7 @@ defmodule TradingCore.BacktestTest do
   end
 
   describe "custom exit rule precedence" do
-    test "a non-empty custom exit rule takes precedence over stop/target" do
+    test "a non-empty custom exit rule fires when stop/target are not hit" do
       strategy = %{
         "direction" => "long",
         "rules" => %{
@@ -502,6 +502,218 @@ defmodule TradingCore.BacktestTest do
 
       assert run.exit_reason == "rule_exit"
       assert Decimal.equal?(run.exit_price, d("109"))
+    end
+  end
+
+  describe "stop/target checked unconditionally" do
+    # Regression: SL/TP used to be checked only inside a TRUE custom exit
+    # rule, so a strategy whose exit rule never fired never stopped out.
+    defp never_exits_strategy(direction \\ "long") do
+      %{
+        "direction" => direction,
+        "rules" => %{
+          "entry" => %{"signal" => "close_price", "op" => "gt", "value" => 100},
+          # Never true on these bars.
+          "exit" => %{"signal" => "close_price", "op" => "gt", "value" => 10_000}
+        },
+        "params" => %{
+          "risk_controls" => %{
+            "method" => "percent_of_entry",
+            "stop_loss_percent" => 2,
+            "take_profit_percent" => 4
+          }
+        },
+        "position_sizing" => %{"method" => "fixed_qty", "qty" => 1}
+      }
+    end
+
+    @specs %{"close_price" => %{kind: :price}}
+
+    test "a false custom exit rule no longer blocks the stop-loss" do
+      bars = [
+        bar(0, 100, 106, 99, 105),
+        # entry fills at 100 -> stop 98, target 104
+        bar(1, 100, 101, 99, 100),
+        # close 97 <= 98 -> stopped out, fills at next open
+        bar(2, 99, 99, 96, 97),
+        bar(3, 96, 97, 95, 96)
+      ]
+
+      assert {:ok, [run]} =
+               Backtest.run(never_exits_strategy(), %{"AAPL" => bars}, signal_specs: @specs)
+
+      assert run.exit_reason == "stopped_out"
+      assert Decimal.equal?(run.exit_price, d("96"))
+    end
+
+    test "a false custom exit rule no longer blocks the take-profit" do
+      bars = [
+        bar(0, 100, 106, 99, 105),
+        bar(1, 100, 101, 99, 100),
+        # close 105 >= 104 -> target hit, fills at next open
+        bar(2, 101, 106, 101, 105),
+        bar(3, 106, 107, 105, 106)
+      ]
+
+      assert {:ok, [run]} =
+               Backtest.run(never_exits_strategy(), %{"AAPL" => bars}, signal_specs: @specs)
+
+      assert run.exit_reason == "target_hit"
+    end
+
+    test "stop/target outrank a custom exit rule that is also true" do
+      strategy =
+        put_in(never_exits_strategy(), ["rules", "exit"], %{
+          "signal" => "close_price",
+          "op" => "lt",
+          "value" => 99
+        })
+
+      bars = [
+        bar(0, 100, 106, 99, 105),
+        bar(1, 100, 101, 99, 100),
+        # close 97: rule (<99) true AND stop (98) hit -> stopped_out
+        bar(2, 99, 99, 96, 97),
+        bar(3, 96, 97, 95, 96)
+      ]
+
+      assert {:ok, [run]} = Backtest.run(strategy, %{"AAPL" => bars}, signal_specs: @specs)
+      assert run.exit_reason == "stopped_out"
+    end
+  end
+
+  describe "intrabar: true" do
+    defp plain_strategy(direction) do
+      %{
+        "direction" => direction,
+        "rules" => %{
+          "entry" => %{"signal" => "close_price", "op" => "gt", "value" => 100},
+          "exit" => nil
+        },
+        "params" => %{
+          "risk_controls" => %{
+            "method" => "percent_of_entry",
+            "stop_loss_percent" => 2,
+            "take_profit_percent" => 4
+          }
+        },
+        "position_sizing" => %{"method" => "fixed_qty", "qty" => 1}
+      }
+    end
+
+    @specs %{"close_price" => %{kind: :price}}
+
+    test "a low that touches the stop exits on that bar at the stop price" do
+      bars = [
+        bar(0, 100, 106, 99, 105),
+        # entry 100 -> stop 98, target 104
+        bar(1, 100, 101, 99, 100),
+        # low 97.5 touches 98 but close 100 does not
+        bar(2, 100, 101, "97.5", 100),
+        bar(3, 100, 101, 99, 100)
+      ]
+
+      assert {:ok, [run]} =
+               Backtest.run(plain_strategy("long"), %{"AAPL" => bars},
+                 signal_specs: @specs,
+                 intrabar: true
+               )
+
+      assert run.exit_reason == "stopped_out"
+      assert Decimal.equal?(run.exit_price, d("98.00"))
+      assert run.exit_at == Enum.at(bars, 2).ts
+    end
+
+    test "the same bars without intrabar never stop out" do
+      bars = [
+        bar(0, 100, 106, 99, 105),
+        bar(1, 100, 101, 99, 100),
+        bar(2, 100, 101, "97.5", 100),
+        bar(3, 100, 101, 99, 100)
+      ]
+
+      assert {:ok, [run]} =
+               Backtest.run(plain_strategy("long"), %{"AAPL" => bars}, signal_specs: @specs)
+
+      assert run.exit_reason == "end_of_data"
+    end
+
+    test "a gap through the stop fills at the open, not the stop" do
+      bars = [
+        bar(0, 100, 106, 99, 105),
+        bar(1, 100, 101, 99, 100),
+        # opens at 95, already below the 98 stop
+        bar(2, 95, 96, 94, 95),
+        bar(3, 95, 96, 94, 95)
+      ]
+
+      assert {:ok, [run]} =
+               Backtest.run(plain_strategy("long"), %{"AAPL" => bars},
+                 signal_specs: @specs,
+                 intrabar: true
+               )
+
+      assert run.exit_reason == "stopped_out"
+      assert Decimal.equal?(run.exit_price, d("95"))
+    end
+
+    test "a high that touches the target exits at the target" do
+      bars = [
+        bar(0, 100, 106, 99, 105),
+        bar(1, 100, 101, 99, 100),
+        bar(2, 101, "104.5", 100, 102),
+        bar(3, 102, 103, 101, 102)
+      ]
+
+      assert {:ok, [run]} =
+               Backtest.run(plain_strategy("long"), %{"AAPL" => bars},
+                 signal_specs: @specs,
+                 intrabar: true
+               )
+
+      assert run.exit_reason == "target_hit"
+      assert Decimal.equal?(run.exit_price, d("104.00"))
+    end
+
+    test "a bar touching both levels counts as the stop" do
+      bars = [
+        bar(0, 100, 106, 99, 105),
+        bar(1, 100, 101, 99, 100),
+        bar(2, 100, 105, 97, 100),
+        bar(3, 100, 101, 99, 100)
+      ]
+
+      assert {:ok, [run]} =
+               Backtest.run(plain_strategy("long"), %{"AAPL" => bars},
+                 signal_specs: @specs,
+                 intrabar: true
+               )
+
+      assert run.exit_reason == "stopped_out"
+    end
+
+    test "short: a high touching the stop exits at the stop" do
+      strategy = %{
+        plain_strategy("short")
+        | "rules" => %{
+            "entry" => %{"signal" => "close_price", "op" => "lt", "value" => 100},
+            "exit" => nil
+          }
+      }
+
+      bars = [
+        bar(0, 100, 101, 94, 95),
+        # entry 100 short -> stop 102, target 96
+        bar(1, 100, 101, 99, 100),
+        bar(2, 100, "102.5", 99, 100),
+        bar(3, 100, 101, 99, 100)
+      ]
+
+      assert {:ok, [run]} =
+               Backtest.run(strategy, %{"AAPL" => bars}, signal_specs: @specs, intrabar: true)
+
+      assert run.exit_reason == "stopped_out"
+      assert Decimal.equal?(run.exit_price, d("102.00"))
     end
   end
 
