@@ -240,15 +240,12 @@ defmodule TradingCore.Signal.TickWindowTest do
     end
   end
 
-  describe "kinds not yet fixed report a binding cap" do
-    test ":momentum and :donchian" do
+  describe "kinds still on a per-tick cap report it binding" do
+    test ":momentum" do
       ticks = busy_ticks(2_000, fn i, at -> %{at: at, value: 100.0 + i * 0.001} end)
-
-      for kind <- [:momentum, :donchian] do
-        {state, _} = fold(%Spec{kind: kind, symbol: "SPY", window_ms: 300_000}, ticks)
-        # 2_000 ticks in window, default cap 500.
-        assert state.cap_bound_drops == 1_500, "#{kind}"
-      end
+      {state, _} = fold(%Spec{kind: :momentum, symbol: "SPY", window_ms: 300_000}, ticks)
+      # 2_000 ticks in window, default cap 500.
+      assert state.cap_bound_drops == 1_500
     end
 
     test ":rolling_volume" do
@@ -256,16 +253,142 @@ defmodule TradingCore.Signal.TickWindowTest do
       {state, _} = fold(%Spec{kind: :rolling_volume, symbol: "SPY", window_ms: 300_000}, ticks)
       assert state.cap_bound_drops == 1_500
     end
+  end
 
-    test ":kyle_lambda" do
+  describe "window extremes (donchian)" do
+    property "bands match a brute-force max/min over the window" do
+      check all(
+              gaps <- list_of(integer(0..3_000), min_length: 1, max_length: 200),
+              cents <- list_of(integer(9_000..11_000), length: length(gaps)),
+              window_ms <- integer(1..20_000)
+            ) do
+        stamps = Enum.scan(gaps, 0, &(&1 + &2))
+
+        Enum.zip(stamps, cents)
+        |> Enum.reduce({TickWindow.extremes_new(), []}, fn {ms, c}, {w, seen} ->
+          at = DateTime.add(@now, ms, :millisecond)
+          price = Decimal.new(c) |> Decimal.div(100)
+          {w, 0} = TickWindow.extremes_push(w, at, price, at, window_ms, 1_000_000)
+          seen = [{at, price} | seen]
+          cutoff = DateTime.add(at, -window_ms, :millisecond)
+          in_window = Enum.filter(seen, fn {t, _} -> DateTime.compare(t, cutoff) != :lt end)
+
+          assert TickWindow.extremes_bands(w) == Signals.donchian_bands(in_window)
+          assert TickWindow.extremes_size(w) == length(in_window)
+          {w, seen}
+        end)
+      end
+    end
+
+    test "a 20m window on a 10ms feed still sees a high set 15 minutes ago" do
+      # 20 minutes at 10ms = 120_000 ticks; a spike at minute 5, flat after.
+      spike = 30_000
+
       ticks =
-        busy_ticks(2_000, fn i, at ->
-          mid = 100.0 + :math.sin(i / 10)
-          %{at: at, value: mid + 0.01, volume: 1, bid: mid - 0.01, ask: mid + 0.01}
+        busy_ticks(120_001, fn i, at ->
+          %{at: at, value: if(i == spike, do: 150.0, else: 100.0 + rem(i, 3) * 0.01)}
         end)
 
-      {state, _} = fold(%Spec{kind: :kyle_lambda, symbol: "SPY", window_ms: 300_000}, ticks)
-      assert state.cap_bound_drops > 0
+      spec = %Spec{kind: :donchian, symbol: "SPY", window_ms: 1_200_000}
+      {state, value} = fold(spec, ticks)
+
+      assert {upper, _middle, lower} = Compute.donchian_bands(state)
+      assert Decimal.equal?(upper, Decimal.from_float(150.0))
+      assert Decimal.equal?(lower, Decimal.from_float(100.0))
+      # The last tick (100.00) sits on the window low.
+      assert Decimal.equal?(value, Decimal.new(-1))
+      assert Map.get(state, :cap_bound_drops, 0) == 0
+
+      {newest, oldest} = Compute.donchian_span(state)
+      assert DateTime.diff(newest, oldest, :millisecond) == 1_200_000
+    end
+
+    test "a binding cap is reported" do
+      ticks = busy_ticks(3_000, fn i, at -> %{at: at, value: 100.0 + i * 0.001} end)
+
+      spec = %Spec{
+        kind: :donchian,
+        symbol: "SPY",
+        window_ms: 1_200_000,
+        params: %{"max_history_samples" => 1_000}
+      }
+
+      {state, _} = fold(spec, ticks)
+      assert state.cap_bound_drops == 2_000
+    end
+
+    test "breakout on a slow feed matches Signals.donchian/4" do
+      prices = [100.0, 101.0, 100.5, 102.0, 99.0, 99.5, 103.0, 101.0, 98.0, 100.0]
+      spec = %Spec{kind: :donchian, symbol: "SPY", window_ms: 5_000}
+      {:ok, state} = Compute.init(spec)
+
+      prices
+      |> Enum.with_index()
+      |> Enum.reduce({state, []}, fn {p, i}, {s, hist} ->
+        at = DateTime.add(@now, i, :second)
+        {s, value} = Compute.step(spec, s, %{at: at, value: p})
+        {hist, expected} = Signals.donchian(hist, p, at, window_ms: 5_000)
+        assert value == if(expected, do: expected, else: :warming_up)
+        {s, hist}
+      end)
+    end
+  end
+
+  describe "rolling OLS (kyle_lambda)" do
+    property "matches the batch fit over the same window" do
+      check all(
+              gaps <- list_of(integer(0..2_000), min_length: 2, max_length: 200),
+              xs <- list_of(integer(-50..50), length: length(gaps)),
+              noise <- list_of(float(min: -1.0e-4, max: 1.0e-4), length: length(gaps)),
+              window_ms <- integer(1..20_000)
+            ) do
+        stamps = Enum.scan(gaps, 0, &(&1 + &2))
+
+        [stamps, xs, noise]
+        |> Enum.zip()
+        |> Enum.reduce({TickWindow.ols_new(), []}, fn {ms, x, e}, {o, hist} ->
+          at = DateTime.add(@now, ms, :millisecond)
+          x = x * 100.0
+          y = 2.0e-7 * x + e
+          {o, 0} = TickWindow.ols_push(o, at, x, y, at, window_ms, 1_000_000)
+
+          {hist, batch} =
+            Signals.rolling_ols_beta(hist, {x, y}, at,
+              window_ms: window_ms,
+              max_history_samples: 1_000_000,
+              precision: 12
+            )
+
+          case {TickWindow.ols_value(o), batch} do
+            {nil, nil} ->
+              :ok
+
+            {{beta, _}, {b, _}} ->
+              assert_in_delta beta,
+                              Decimal.to_float(b),
+                              1.0e-9 + abs(Decimal.to_float(b)) * 1.0e-6
+
+            other ->
+              flunk("mismatch: #{inspect(other)}")
+          end
+
+          {o, hist}
+        end)
+      end
+    end
+
+    test "a 1m window on a 10ms trade feed keeps every trade" do
+      ticks =
+        busy_ticks(12_000, fn i, at ->
+          mid = 100.0 + :math.sin(i / 10)
+          %{at: at, value: mid + 0.01, volume: 1 + rem(i, 5), bid: mid - 0.01, ask: mid + 0.01}
+        end)
+
+      {state, _} = fold(%Spec{kind: :kyle_lambda, symbol: "SPY", window_ms: 60_000}, ticks)
+
+      # 1m at 10ms = 6_001 points, both ends inclusive.
+      assert TickWindow.ols_size(state.ols) == 6_001
+      assert Map.get(state, :cap_bound_drops, 0) == 0
     end
   end
 end

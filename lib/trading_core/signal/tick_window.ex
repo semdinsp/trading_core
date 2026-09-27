@@ -2,15 +2,15 @@ defmodule TradingCore.Signal.TickWindow do
   @moduledoc """
   Time windows over tick-level data that hold on busy symbols.
 
-  `TradingCore.Signal.Compute`'s `:ofi`, `:signed_volume` and
-  `:two_scale_rv` used to keep a plain list, trimmed to `window_ms` and
-  then to a sample count (default 1,000). SPY and QQQ print thousands of
+  `TradingCore.Signal.Compute`'s `:ofi`, `:signed_volume`,
+  `:two_scale_rv`, `:donchian` and `:kyle_lambda` used to keep a plain
+  list, trimmed to `window_ms` and then to a sample count (1,000 or 500). SPY and QQQ print thousands of
   trades and tens of thousands of quotes in five minutes, so the count
   bound first: a "5m" window really covered the last 10-60 seconds, and
   nothing said so. Rescanning a full-size list on every tick instead would
   cost O(n) per tick, which a live loop cannot afford at ~100 quotes/sec.
 
-  Both structures here are updated in O(1) amortized time per tick:
+  Every structure here is updated in O(1) amortized time per tick:
 
     * `sum_*` — a running `Decimal` total of values in the window (for the
       additive kinds). Exact: values are added on arrival and subtracted
@@ -22,8 +22,16 @@ defmodule TradingCore.Signal.TickWindow do
       matches the batch estimator over the same window (to float rounding;
       the sums are rebuilt from scratch every #{4096} pushes so rounding
       cannot accumulate).
+    * `extremes_*` — the window's high and low (for `:donchian`), from
+      monotonic max/min deques: a new price evicts older ones it beats,
+      so the front of each deque is the extreme and expiry only ever
+      removes from the front.
+    * `ols_*` — a least-squares fit of y on x (for `:kyle_lambda`), from
+      running means and centred co-moments added and removed exactly
+      (Welford), rebuilt from the stored points every #{4096} updates.
 
-  Both keep a safety cap on the number of points (the caller passes it).
+  All of them keep a safety cap on the number of points (the caller
+  passes it).
   When the cap has to drop points that are still inside the window, the
   count is returned so the caller can report it (`state[:cap_bound_drops]`)
   — a shrunken window is never silent.
@@ -211,4 +219,327 @@ defmodule TradingCore.Signal.TickWindow do
   defp dk_at(entries, seq), do: entries |> Map.fetch!(seq) |> elem(3)
 
   defp sq(x), do: x * x
+
+  ## -------------------------------------------------------------------
+  ## Monotonic deques (shared by extremes and OLS)
+  ## -------------------------------------------------------------------
+
+  # A :queue of {seq, value}, oldest at the front, whose values are
+  # strictly decreasing (for :max) or increasing (for :min) toward the
+  # back. The front is the window's extreme. A new value evicts every
+  # entry at the back it beats or ties — those can never be the extreme
+  # again while it is in the window, since it is newer.
+  defp mono_push(q, seq, value, kind) do
+    case :queue.peek_r(q) do
+      {:value, {_s, v}} ->
+        if dominated?(v, value, kind),
+          do: mono_push(:queue.drop_r(q), seq, value, kind),
+          else: :queue.in({seq, value}, q)
+
+      :empty ->
+        :queue.in({seq, value}, q)
+    end
+  end
+
+  defp dominated?(old, new, :max), do: cmp(old, new) != :gt
+  defp dominated?(old, new, :min), do: cmp(old, new) != :lt
+
+  # Drops front entries whose seq has left the window (seq < lo).
+  defp mono_expire(q, lo) do
+    case :queue.peek(q) do
+      {:value, {s, _}} when s < lo -> mono_expire(:queue.drop(q), lo)
+      _ -> q
+    end
+  end
+
+  defp mono_front(q) do
+    {:value, {_s, v}} = :queue.peek(q)
+    v
+  end
+
+  defp cmp(%Decimal{} = a, %Decimal{} = b), do: Decimal.compare(a, b)
+  defp cmp(a, b) when a > b, do: :gt
+  defp cmp(a, b) when a < b, do: :lt
+  defp cmp(_a, _b), do: :eq
+
+  defp cap(q, lo, size, max, dropped) when size > max,
+    do: cap(:queue.drop(q), lo + 1, size - 1, max, dropped + 1)
+
+  defp cap(q, lo, size, _max, dropped), do: {q, lo, size, dropped}
+
+  ## -------------------------------------------------------------------
+  ## Window extremes (Donchian)
+  ## -------------------------------------------------------------------
+
+  @typedoc "High/low of the prices in a time window, via monotonic deques."
+  @type extremes :: %{
+          points: :queue.queue(),
+          lo: non_neg_integer(),
+          next: non_neg_integer(),
+          size: non_neg_integer(),
+          max: :queue.queue(),
+          min: :queue.queue(),
+          latest: Decimal.t() | nil
+        }
+
+  @spec extremes_new() :: extremes()
+  def extremes_new,
+    do: %{
+      points: :queue.new(),
+      lo: 0,
+      next: 0,
+      size: 0,
+      max: :queue.new(),
+      min: :queue.new(),
+      latest: nil
+    }
+
+  @doc """
+  Adds `price` at `at`, expires and caps like `sum_push/6`. Returns
+  `{extremes, cap_dropped}`. O(1) amortized per push.
+  """
+  @spec extremes_push(
+          extremes(),
+          DateTime.t(),
+          Decimal.t(),
+          DateTime.t(),
+          pos_integer() | nil,
+          pos_integer()
+        ) ::
+          {extremes(), non_neg_integer()}
+  def extremes_push(%{next: seq} = e, at, price, now, window_ms, max_samples) do
+    # Points are {seq, at_us}: integer microseconds, not DateTimes, so a
+    # long window on a busy symbol costs ~40 bytes a tick rather than
+    # ~200, and expiry is an integer compare.
+    now_us = DateTime.to_unix(now, :microsecond)
+    points = :queue.in({seq, DateTime.to_unix(at, :microsecond)}, e.points)
+
+    {points, lo, size} =
+      if window_ms,
+        do: expire_us(points, e.lo, e.size + 1, now_us - window_ms * 1_000),
+        else: {points, e.lo, e.size + 1}
+
+    {points, lo, size, dropped} = cap(points, lo, size, max_samples, 0)
+
+    e = %{
+      e
+      | points: points,
+        lo: lo,
+        next: seq + 1,
+        size: size,
+        max: e.max |> mono_push(seq, price, :max) |> mono_expire(lo),
+        min: e.min |> mono_push(seq, price, :min) |> mono_expire(lo),
+        latest: price
+    }
+
+    {e, dropped}
+  end
+
+  @doc """
+  `{upper, middle, lower}` over the window, or `nil` with fewer than two
+  prices — the same contract as `TradingCore.Signals.donchian_bands/1`.
+  """
+  @spec extremes_bands(extremes()) :: {Decimal.t(), Decimal.t(), Decimal.t()} | nil
+  def extremes_bands(%{size: size}) when size < 2, do: nil
+
+  def extremes_bands(%{max: max, min: min}) do
+    upper = mono_front(max)
+    lower = mono_front(min)
+    {upper, Decimal.div(Decimal.add(upper, lower), 2), lower}
+  end
+
+  @doc "`{newest_at, oldest_at}` of the prices in the window, or `nil` if empty."
+  @spec extremes_span(extremes()) :: {DateTime.t(), DateTime.t()} | nil
+  def extremes_span(%{size: 0}), do: nil
+
+  def extremes_span(%{points: points}) do
+    {:value, {_, oldest}} = :queue.peek(points)
+    {:value, {_, newest}} = :queue.peek_r(points)
+    {DateTime.from_unix!(newest, :microsecond), DateTime.from_unix!(oldest, :microsecond)}
+  end
+
+  defp expire_us(q, lo, size, cutoff_us) do
+    case :queue.peek(q) do
+      {:value, {_seq, at_us}} when at_us < cutoff_us ->
+        expire_us(:queue.drop(q), lo + 1, size - 1, cutoff_us)
+
+      _ ->
+        {q, lo, size}
+    end
+  end
+
+  @spec extremes_size(extremes()) :: non_neg_integer()
+  def extremes_size(%{size: size}), do: size
+
+  @spec extremes_latest(extremes()) :: Decimal.t() | nil
+  def extremes_latest(%{latest: latest}), do: latest
+
+  ## -------------------------------------------------------------------
+  ## Rolling OLS (kyle_lambda)
+  ## -------------------------------------------------------------------
+
+  @typedoc """
+  Least-squares fit of y on x over a time window, kept as running means
+  and centred co-moments (Welford), updated as points enter and leave.
+  `xmax`/`xmin` track the window's x range so "every x identical" (a
+  vertical line, no fit) is detected exactly rather than through a
+  rounding-sized variance.
+  """
+  @type ols :: %{
+          points: :queue.queue(),
+          lo: non_neg_integer(),
+          next: non_neg_integer(),
+          size: non_neg_integer(),
+          mx: float(),
+          my: float(),
+          cxy: float(),
+          mxx: float(),
+          xmax: :queue.queue(),
+          xmin: :queue.queue(),
+          ops: non_neg_integer()
+        }
+
+  @spec ols_new() :: ols()
+  def ols_new do
+    %{
+      points: :queue.new(),
+      lo: 0,
+      next: 0,
+      size: 0,
+      mx: 0.0,
+      my: 0.0,
+      cxy: 0.0,
+      mxx: 0.0,
+      xmax: :queue.new(),
+      xmin: :queue.new(),
+      ops: 0
+    }
+  end
+
+  @doc """
+  Adds the point `(x, y)` at `at`, expires and caps like `sum_push/6`.
+  Returns `{ols, cap_dropped}`. O(1) amortized; the moments are rebuilt
+  from the stored points every #{4096} updates so float error cannot
+  accumulate.
+  """
+  @spec ols_push(
+          ols(),
+          DateTime.t(),
+          float(),
+          float(),
+          DateTime.t(),
+          pos_integer() | nil,
+          pos_integer()
+        ) ::
+          {ols(), non_neg_integer()}
+  def ols_push(%{next: seq} = o, at, x, y, now, window_ms, max_samples) do
+    o = o |> ols_add(x, y) |> Map.update!(:points, &:queue.in({seq, at, {x, y}}, &1))
+
+    o = %{
+      o
+      | next: seq + 1,
+        xmax: mono_push(o.xmax, seq, x, :max),
+        xmin: mono_push(o.xmin, seq, x, :min)
+    }
+
+    {o, dropped} = ols_trim(o, now, window_ms, max_samples)
+
+    o = %{o | xmax: mono_expire(o.xmax, o.lo), xmin: mono_expire(o.xmin, o.lo), ops: o.ops + 1}
+    o = if rem(o.ops, @resync_every) == 0, do: ols_resync(o), else: o
+    {o, dropped}
+  end
+
+  @doc """
+  `{beta, alpha}` (floats) of `y = beta * x + alpha` over the window, or
+  `nil` with fewer than two points or when every x is identical — the
+  same contract as `TradingCore.Signals.rolling_ols_beta/4`'s fit.
+  """
+  @spec ols_value(ols()) :: {float(), float()} | nil
+  def ols_value(%{size: size}) when size < 2, do: nil
+
+  def ols_value(%{xmax: xmax, xmin: xmin} = o) do
+    if mono_front(xmax) == mono_front(xmin) or o.mxx <= 0.0 do
+      nil
+    else
+      beta = o.cxy / o.mxx
+      {beta, o.my - beta * o.mx}
+    end
+  end
+
+  @spec ols_size(ols()) :: non_neg_integer()
+  def ols_size(%{size: size}), do: size
+
+  # Pops expired, then capped, points off the front, removing each from
+  # the moments.
+  defp ols_trim(o, now, window_ms, max, dropped \\ 0) do
+    cutoff = if window_ms, do: DateTime.add(now, -window_ms, :millisecond)
+
+    case :queue.peek(o.points) do
+      {:value, {_seq, at, {x, y}}} ->
+        cond do
+          cutoff && DateTime.compare(at, cutoff) == :lt ->
+            o |> ols_pop(x, y) |> ols_trim(now, window_ms, max, dropped)
+
+          o.size > max ->
+            o |> ols_pop(x, y) |> ols_trim(now, window_ms, max, dropped + 1)
+
+          true ->
+            {o, dropped}
+        end
+
+      :empty ->
+        {o, dropped}
+    end
+  end
+
+  defp ols_pop(o, x, y) do
+    %{ols_remove(o, x, y) | points: :queue.drop(o.points), lo: o.lo + 1}
+  end
+
+  defp ols_add(%{size: n, mx: mx, my: my} = o, x, y) do
+    n1 = n + 1
+    dx = x - mx
+    mx1 = mx + dx / n1
+    my1 = my + (y - my) / n1
+    %{o | size: n1, mx: mx1, my: my1, cxy: o.cxy + dx * (y - my1), mxx: o.mxx + dx * (x - mx1)}
+  end
+
+  # The exact inverse of ols_add/3.
+  defp ols_remove(%{size: 1} = o, _x, _y),
+    do: %{o | size: 0, mx: 0.0, my: 0.0, cxy: 0.0, mxx: 0.0}
+
+  defp ols_remove(%{size: n, mx: mx, my: my} = o, x, y) do
+    n0 = n - 1
+    mx0 = (n * mx - x) / n0
+    my0 = (n * my - y) / n0
+
+    %{
+      o
+      | size: n0,
+        mx: mx0,
+        my: my0,
+        cxy: o.cxy - (x - mx0) * (y - my),
+        mxx: o.mxx - (x - mx0) * (x - mx)
+    }
+  end
+
+  defp ols_resync(%{points: points} = o) do
+    pairs = points |> :queue.to_list() |> Enum.map(&elem(&1, 2))
+    n = length(pairs)
+
+    if n == 0 do
+      %{o | mx: 0.0, my: 0.0, cxy: 0.0, mxx: 0.0}
+    else
+      mx = pairs |> Enum.map(&elem(&1, 0)) |> Enum.sum() |> Kernel./(n)
+      my = pairs |> Enum.map(&elem(&1, 1)) |> Enum.sum() |> Kernel./(n)
+
+      {cxy, mxx} =
+        Enum.reduce(pairs, {0.0, 0.0}, fn {x, y}, {c, v} ->
+          dx = x - mx
+          {c + dx * (y - my), v + dx * dx}
+        end)
+
+      %{o | mx: mx, my: my, cxy: cxy, mxx: mxx}
+    end
+  end
 end

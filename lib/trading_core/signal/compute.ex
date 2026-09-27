@@ -119,11 +119,22 @@ defmodule TradingCore.Signal.Compute do
   time mode now aligns its subsample buckets to the clock rather than to
   the first print in the window, which can also move its values slightly.
 
-  `:momentum`, `:donchian`, `:rolling_volume` and `:kyle_lambda` still keep
-  one point per tick under a 500-sample cap, so on a busy symbol the same
-  shrinking can happen there. Their windows are not fixed yet; they now
-  count the in-window points the cap drops in `state[:cap_bound_drops]`,
-  so it is visible instead of silent.
+  `:donchian` and `:kyle_lambda` had the same problem with a 500-sample
+  cap and were fixed the same way on 2026-09-27, one merge later: Donchian
+  keeps its window high/low in monotonic deques (safety cap 500,000
+  points), and `:kyle_lambda` fits its OLS from running moments over the
+  full window (default 5 minutes, safety cap 100,000). **Their values on
+  busy symbols before and after that change are not comparable either**:
+  a "20m" SPY Donchian had covered seconds, and a "1m" SPY/QQQ lambda the
+  last 500 trades. Read a Donchian's bands and window span through
+  `donchian_bands/1` and `donchian_span/1`; its state is no longer a
+  price list.
+
+  `:momentum` and `:rolling_volume` still keep one point per tick under a
+  500-sample cap. Their live feeds are slow enough that it doesn't bind
+  (NYSE TICK at ~1/sec; per-minute volume bars), and they count any
+  in-window points it drops in `state[:cap_bound_drops]`, so it would be
+  visible rather than silent.
 
   `:two_scale_rv` is raw variance of log price over the window — not a
   volatility and not annualized.
@@ -295,7 +306,7 @@ defmodule TradingCore.Signal.Compute do
      }}
   end
 
-  def init(%Spec{kind: :donchian}), do: {:ok, %{prices: []}}
+  def init(%Spec{kind: :donchian}), do: {:ok, %{window: TickWindow.extremes_new()}}
 
   def init(%Spec{kind: :rolling_volume}), do: {:ok, %{readings: []}}
 
@@ -325,7 +336,7 @@ defmodule TradingCore.Signal.Compute do
        last_mid: nil,
        last_price: nil,
        last_sign: nil,
-       ols_history: []
+       ols: TickWindow.ols_new()
      }}
   end
 
@@ -408,11 +419,11 @@ defmodule TradingCore.Signal.Compute do
     {state, to_decimal(value)}
   end
 
-  # :momentum, :donchian, :rolling_volume and :kyle_lambda still keep
-  # one point per tick under a max_history_samples cap (default 500), so
-  # on a busy symbol the cap, not window_ms, can set the span. They don't
-  # fix that yet, but they count the in-window points it drops into
-  # state[:cap_bound_drops], so a shrunken window is visible.
+  # :momentum and :rolling_volume still keep one point per tick under a
+  # max_history_samples cap (default 500), so on a busy symbol the cap,
+  # not window_ms, can set the span. Their live feeds are slow enough that
+  # it doesn't bind (NYSE TICK ~1/s; per-minute volume bars), and they
+  # count any in-window points it drops into state[:cap_bound_drops].
   def step(%Spec{kind: :momentum} = spec, state, %{at: now, value: value}) do
     opts = window_opts(spec)
     {prices, result} = Signals.momentum(state.prices, value, now, opts)
@@ -496,11 +507,32 @@ defmodule TradingCore.Signal.Compute do
     end
   end
 
+  # A Donchian point is ~40 bytes (TickWindow stores it as an integer
+  # timestamp), so its safety cap can sit well above the other tick
+  # kinds': 500k is a 20m window at ~400 ticks/sec, ~20MB.
+  @donchian_cap 500_000
+
+  # Donchian breakout over the full window: +1 at or above the window
+  # high, -1 at or below the low, else 0 — the same rule as
+  # TradingCore.Signals.donchian/4, but the high/low come from monotonic
+  # deques (TickWindow.extremes_*), so a 20m window holds on a busy symbol
+  # in O(1) amortized per tick. Read the bands and window span with
+  # donchian_bands/1 and donchian_span/1, not the state's internals.
   def step(%Spec{kind: :donchian} = spec, state, %{at: now, value: value}) do
     opts = window_opts(spec)
-    {prices, result} = Signals.donchian(state.prices, value, now, opts)
-    state = track_cap_drops(state, state.prices, prices, now, opts)
-    {%{state | prices: prices}, warm(result)}
+
+    {window, dropped} =
+      TickWindow.extremes_push(
+        state.window,
+        now,
+        to_decimal(value),
+        now,
+        Keyword.fetch!(opts, :window_ms),
+        Keyword.get(opts, :max_history_samples, @donchian_cap)
+      )
+
+    state = add_cap_drops(%{state | window: window}, dropped)
+    {state, warm(donchian_breakout(window))}
   end
 
   def step(%Spec{kind: :rolling_volume} = spec, state, %{at: now, value: raw_reading}) do
@@ -1178,18 +1210,36 @@ defmodule TradingCore.Signal.Compute do
       mid_return = mid |> Decimal.sub(state.last_mid) |> Decimal.div(state.last_mid)
 
       opts = window_opts(spec)
+      precision = Keyword.get(opts, :precision, 8)
 
-      {ols_history, result} =
-        Signals.rolling_ols_beta(state.ols_history, {signed_volume, mid_return}, now, opts)
+      # Same inputs as Signals.rolling_ols_beta/4: x and y rounded to
+      # :precision before they enter the fit, beta rounded on the way out.
+      # The fit itself is TickWindow's running OLS over the full window
+      # (default 5 minutes, as before) instead of the last 500 trades.
+      x = signed_volume |> Decimal.round(precision) |> Decimal.to_float()
+      y = mid_return |> Decimal.round(precision) |> Decimal.to_float()
+      window_ms = Keyword.get(opts, :window_ms, :timer.minutes(5))
 
-      state =
-        base
-        |> track_cap_drops(state.ols_history, ols_history, now, opts)
-        |> Map.put(:ols_history, ols_history)
+      {ols, dropped} =
+        TickWindow.ols_push(
+          state.ols,
+          now,
+          x,
+          y,
+          now,
+          window_ms,
+          tick_cap([{:window_ms, window_ms} | opts])
+        )
 
-      case result do
-        nil -> {state, :warming_up}
-        {beta, _alpha} -> {state, round_to_precision(beta, spec.params)}
+      state = add_cap_drops(%{base | ols: ols}, dropped)
+
+      case TickWindow.ols_value(ols) do
+        nil ->
+          {state, :warming_up}
+
+        {beta, _alpha} ->
+          beta = beta |> Decimal.from_float() |> Decimal.round(precision)
+          {state, round_to_precision(beta, spec.params)}
       end
     end
   end
@@ -1361,6 +1411,22 @@ defmodule TradingCore.Signal.Compute do
     Keyword.get_lazy(opts, :max_history_samples, fn ->
       if Keyword.get(opts, :window_ms), do: 100_000, else: 1_000
     end)
+  end
+
+  defp donchian_breakout(window) do
+    case TickWindow.extremes_bands(window) do
+      nil ->
+        nil
+
+      {upper, _middle, lower} ->
+        latest = TickWindow.extremes_latest(window)
+
+        cond do
+          Decimal.compare(latest, upper) != :lt -> Decimal.new(1)
+          Decimal.compare(latest, lower) != :gt -> Decimal.new(-1)
+          true -> Decimal.new(0)
+        end
+    end
   end
 
   # Newest-first list: drop entries older than window_ms, then cap.
@@ -1732,6 +1798,23 @@ defmodule TradingCore.Signal.Compute do
 
     kahn_sort(rest, dependents, indegree, Enum.reverse(ready) ++ acc)
   end
+
+  @doc """
+  A `:donchian` state's current `{upper, middle, lower}` bands over its
+  window, or `nil` with fewer than two prices — the same contract as
+  `TradingCore.Signals.donchian_bands/1`. Use this rather than reading the
+  state's internals, which are not a list of prices.
+  """
+  @spec donchian_bands(map()) :: {Decimal.t(), Decimal.t(), Decimal.t()} | nil
+  def donchian_bands(%{window: window}), do: TickWindow.extremes_bands(window)
+
+  @doc """
+  `{newest_at, oldest_at}` of the prices a `:donchian` state's window
+  currently holds, or `nil` if it holds none — for a "how much of the
+  window is filled" display.
+  """
+  @spec donchian_span(map()) :: {DateTime.t(), DateTime.t()} | nil
+  def donchian_span(%{window: window}), do: TickWindow.extremes_span(window)
 
   ## -----------------------------------------------------------------------
   ## Shared helpers
