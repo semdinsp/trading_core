@@ -804,6 +804,57 @@ defmodule TradingCore.BacktestTest do
     end
   end
 
+  describe "round_numbers option" do
+    defp rn_strategy do
+      %{
+        "direction" => "long",
+        "rules" => %{
+          "entry" => %{"signal" => "close_price", "op" => "gt", "value" => 100},
+          "exit" => nil
+        },
+        "params" => %{
+          "risk_controls" => %{
+            "method" => "percent_of_entry",
+            # entry 100 -> stop exactly on the round number 98.00
+            "stop_loss_percent" => 2,
+            "take_profit_percent" => 50
+          }
+        },
+        "position_sizing" => %{"method" => "fixed_qty", "qty" => 1}
+      }
+    end
+
+    defp rn_bars do
+      [
+        bar(0, 100, 106, 99, 105),
+        # entry fills at 100
+        bar(1, 100, 101, 99, 100),
+        # close 98.01: above the raw 98.00 stop, at a :near-adjusted 98.01
+        bar(2, 99, 99, 98, "98.01"),
+        bar(3, 98, 99, 97, 98)
+      ]
+    end
+
+    test "absent, levels are untouched" do
+      assert {:ok, [run]} =
+               Backtest.run(rn_strategy(), %{"AAPL" => rn_bars()},
+                 signal_specs: %{"close_price" => %{kind: :price}}
+               )
+
+      assert run.exit_reason == "end_of_data"
+    end
+
+    test ":near moves the stop in front of the round number, so it fires sooner" do
+      assert {:ok, [run]} =
+               Backtest.run(rn_strategy(), %{"AAPL" => rn_bars()},
+                 signal_specs: %{"close_price" => %{kind: :price}},
+                 round_numbers: [stop_zone: :near, buffer: "0.10"]
+               )
+
+      assert run.exit_reason == "stopped_out"
+    end
+  end
+
   describe "volatility_target sizing" do
     test "estimate_daily_vol/3 matches a hand-computed stdev of daily returns" do
       # Returns: (102-100)/100=0.02, (99-102)/102≈-0.029412, (105-99)/99≈0.060606

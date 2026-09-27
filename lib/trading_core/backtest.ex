@@ -68,6 +68,12 @@ defmodule TradingCore.Backtest do
       change them only to test sensitivity. Each run reports the
       `stop_method` actually applied and the `stop_daily_vol` used, since
       an entry with too little history falls back to `percent_of_entry`.
+    - `:round_numbers` — `TradingCore.RoundNumbers.adjust/4` options
+      (e.g. `[stop_zone: :near]` or `[stop_zone: :far, buffer_vol_frac:
+      0.2]`) to move both levels off round numbers at entry. Off when
+      absent. `:daily_vol`, `:price` and `:entry` default to the entry's
+      EWMA vol and entry price; with no vol history, levels are only
+      tick-snapped.
 
   ## Exits
 
@@ -391,7 +397,15 @@ defmodule TradingCore.Backtest do
     module doesn't enforce anything about *other* symbols or versions.
   """
 
-  alias TradingCore.{ExitStrategy, PositionSizing, RiskControls, RuleEngine, Signals, Volatility}
+  alias TradingCore.{
+    ExitStrategy,
+    PositionSizing,
+    RiskControls,
+    RoundNumbers,
+    RuleEngine,
+    Signals,
+    Volatility
+  }
 
   @type bar :: %{
           required(:ts) => DateTime.t(),
@@ -1099,14 +1113,18 @@ defmodule TradingCore.Backtest do
       entry_price = next_bar.open
       entry_at = next_bar.ts
 
-      %{stop_loss: stop_loss_price, take_profit: take_profit_price} =
-        levels =
+      entry_vol = entry_daily_vol(risk_controls_config, bars, index, opts)
+
+      levels =
         RiskControls.resolve_levels(
           entry_price,
           risk_controls_config,
           direction,
-          stop_level_opts(risk_controls_config, bars, index, opts)
+          if(entry_vol, do: [daily_vol: entry_vol], else: [])
         )
+
+      {stop_loss_price, take_profit_price} =
+        round_number_levels(levels, entry_price, direction, entry_vol, opts)
 
       sizing_context =
         build_sizing_context(position_sizing_config, entry_price, bars, index, opts)
@@ -1138,34 +1156,56 @@ defmodule TradingCore.Backtest do
     end
   end
 
-  # A "volatility_multiple" stop needs the same daily vol a live entry is
-  # handed: the hub's EWMA (Volatility.ewma_daily_vol/2), over bars up to
-  # and including the signal bar — what was known when the entry fired.
-  # With too little history it passes no daily_vol, so RiskControls falls
-  # back to percent_of_entry and the run records that.
-  defp stop_level_opts(%{"method" => "volatility_multiple"}, bars, index, opts) do
-    known = Enum.take(bars, index + 1)
+  # The daily vol a live entry would be handed: the hub's EWMA
+  # (Volatility.ewma_daily_vol/2) over bars up to and including the signal
+  # bar — what was known when the entry fired. Needed by a
+  # "volatility_multiple" stop and by the round-number buffer; nil when
+  # neither is in use or there is too little history (RiskControls then
+  # falls back to percent_of_entry and the run records that).
+  defp entry_daily_vol(risk_controls_config, bars, index, opts) do
+    needed? =
+      match?(%{"method" => "volatility_multiple"}, risk_controls_config) or
+        Keyword.get(opts, :round_numbers) != nil
 
-    as_of =
-      known
-      |> List.last()
-      |> Map.fetch!(:ts)
-      |> DateTime.shift_zone!("Etc/UTC")
-      |> DateTime.to_date()
+    if needed? do
+      known = Enum.take(bars, index + 1)
 
-    vol_opts = [
-      as_of: as_of,
-      lookback_days: Keyword.get(opts, :stop_vol_lookback_days, 14),
-      lambda: Keyword.get(opts, :stop_vol_lambda, 0.94)
-    ]
+      as_of =
+        known
+        |> List.last()
+        |> Map.fetch!(:ts)
+        |> DateTime.shift_zone!("Etc/UTC")
+        |> DateTime.to_date()
 
-    case Volatility.ewma_daily_vol(known, vol_opts) do
-      {:ok, daily_vol} -> [daily_vol: daily_vol]
-      :insufficient_data -> []
+      vol_opts = [
+        as_of: as_of,
+        lookback_days: Keyword.get(opts, :stop_vol_lookback_days, 14),
+        lambda: Keyword.get(opts, :stop_vol_lambda, 0.94)
+      ]
+
+      case Volatility.ewma_daily_vol(known, vol_opts) do
+        {:ok, daily_vol} -> daily_vol
+        :insufficient_data -> nil
+      end
     end
   end
 
-  defp stop_level_opts(_config, _bars, _index, _opts), do: []
+  # opts[:round_numbers] (a keyword list of RoundNumbers.adjust/4 options)
+  # moves both levels off the crowded side of round numbers; absent, the
+  # levels pass through untouched.
+  defp round_number_levels(levels, entry_price, direction, daily_vol, opts) do
+    case Keyword.get(opts, :round_numbers) do
+      nil ->
+        {levels.stop_loss, levels.take_profit}
+
+      rn_opts ->
+        rn_opts =
+          Keyword.merge([daily_vol: daily_vol, price: entry_price, entry: entry_price], rn_opts)
+
+        {RoundNumbers.adjust(levels.stop_loss, :stop_loss, direction, rn_opts),
+         RoundNumbers.adjust(levels.take_profit, :take_profit, direction, rn_opts)}
+    end
+  end
 
   defp build_sizing_context(%{"method" => "volatility_target"}, entry_price, bars, index, opts) do
     window = Keyword.get(opts, :volatility_window, @default_volatility_window)
