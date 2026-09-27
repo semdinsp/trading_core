@@ -102,6 +102,32 @@ defmodule TradingCore.Signal.Compute do
   That is a bug, not an earlier definition — do not use `:ofi` history
   computed before the fix. See the `:ofi` `step/2` clause for the formula.
 
+  ## Windows on busy symbols (changed 2026-09-27)
+
+  `:ofi`, `:signed_volume` and `:two_scale_rv` used to trim their
+  per-tick history to `window_ms` and then to 1,000 samples. On SPY/QQQ,
+  which print thousands of trades and tens of thousands of quotes in five
+  minutes, the sample count bound first, so a "5m" window really covered
+  the last 10-60 seconds. Measured on live persisted values: SPY/QQQ
+  `:two_scale_rv` came out ~30x too small in variance. They now hold the
+  whole configured window (see `TradingCore.Signal.TickWindow`), with a
+  100,000-point safety cap that is counted in `state[:cap_bound_drops]` if
+  it ever binds. **Values from these three kinds on busy symbols before
+  and after the change are not comparable** — don't mix their history.
+  A thin symbol whose window never reached the cap is unaffected, and a
+  spec with no `window_ms` still keeps its last 1,000 points. `:two_scale_rv`
+  time mode now aligns its subsample buckets to the clock rather than to
+  the first print in the window, which can also move its values slightly.
+
+  `:momentum`, `:donchian`, `:rolling_volume` and `:kyle_lambda` still keep
+  one point per tick under a 500-sample cap, so on a busy symbol the same
+  shrinking can happen there. Their windows are not fixed yet; they now
+  count the in-window points the cap drops in `state[:cap_bound_drops]`,
+  so it is visible instead of silent.
+
+  `:two_scale_rv` is raw variance of log price over the window — not a
+  volatility and not annualized.
+
   ## Session boundaries are injected, never derived from wall-clock
 
   A `:vwap`, `:volume`, or `:zscore` spec's `params` may include
@@ -176,7 +202,7 @@ defmodule TradingCore.Signal.Compute do
   to the value type, the DAG-composition rules, or `replay/3` itself.
   """
 
-  alias TradingCore.Signal.Spec
+  alias TradingCore.Signal.{Spec, TickWindow}
   alias TradingCore.{Signals, WelfordAcc}
 
   @typedoc """
@@ -304,7 +330,7 @@ defmodule TradingCore.Signal.Compute do
   end
 
   def init(%Spec{kind: :ofi}) do
-    {:ok, %{quote: new_quote_state(), prev: nil, history: []}}
+    {:ok, %{quote: new_quote_state(), prev: nil, window: TickWindow.sum_new()}}
   end
 
   def init(%Spec{kind: :signed_volume} = spec) do
@@ -317,7 +343,7 @@ defmodule TradingCore.Signal.Compute do
        quote: new_quote_state(),
        last_price: nil,
        last_sign: nil,
-       history: []
+       window: TickWindow.sum_new()
      }}
   end
 
@@ -325,8 +351,10 @@ defmodule TradingCore.Signal.Compute do
     # Validate the mode at init rather than on the first tick, so a
     # misconfigured spec fails where it is built rather than silently
     # warming up forever inside a live loop.
-    _ = subsample_mode!(spec)
-    {:ok, %{prices: []}}
+    case subsample_mode!(spec) do
+      :tick_count -> {:ok, %{rv: TickWindow.rv_new(Map.get(spec.params, "subsample_k", 5))}}
+      :time -> {:ok, %{buckets: [], value: nil}}
+    end
   end
 
   def init(%Spec{kind: :quoted_spread}), do: {:ok, %{quote: new_quote_state()}}
@@ -380,9 +408,15 @@ defmodule TradingCore.Signal.Compute do
     {state, to_decimal(value)}
   end
 
+  # :momentum, :donchian, :rolling_volume and :kyle_lambda still keep
+  # one point per tick under a max_history_samples cap (default 500), so
+  # on a busy symbol the cap, not window_ms, can set the span. They don't
+  # fix that yet, but they count the in-window points it drops into
+  # state[:cap_bound_drops], so a shrunken window is visible.
   def step(%Spec{kind: :momentum} = spec, state, %{at: now, value: value}) do
     opts = window_opts(spec)
     {prices, result} = Signals.momentum(state.prices, value, now, opts)
+    state = track_cap_drops(state, state.prices, prices, now, opts)
     {%{state | prices: prices}, warm(result)}
   end
 
@@ -465,6 +499,7 @@ defmodule TradingCore.Signal.Compute do
   def step(%Spec{kind: :donchian} = spec, state, %{at: now, value: value}) do
     opts = window_opts(spec)
     {prices, result} = Signals.donchian(state.prices, value, now, opts)
+    state = track_cap_drops(state, state.prices, prices, now, opts)
     {%{state | prices: prices}, warm(result)}
   end
 
@@ -481,7 +516,10 @@ defmodule TradingCore.Signal.Compute do
       end)
       |> Enum.take(max_history_samples)
 
-    new_state = %{state | readings: readings}
+    new_state =
+      state
+      |> track_cap_drops(state.readings, readings, now, opts)
+      |> Map.put(:readings, readings)
 
     case windowed_volume(readings) do
       nil -> {new_state, :warming_up}
@@ -710,12 +748,7 @@ defmodule TradingCore.Signal.Compute do
 
       true ->
         contribution = ofi_contribution(state.prev, quote_state)
-        opts = window_opts(spec)
-        history = trim_price_window([{now, contribution} | state.history], now, opts)
-        state = %{state | prev: quote_state, history: history}
-
-        total = Enum.reduce(history, Decimal.new(0), fn {_at, v}, acc -> Decimal.add(acc, v) end)
-
+        {state, total} = push_sum(%{state | prev: quote_state}, spec, now, contribution)
         {state, round_to_precision(total, spec.params)}
     end
   end
@@ -1082,19 +1115,51 @@ defmodule TradingCore.Signal.Compute do
     end
   end
 
-  defp two_scale_rv_step(spec, state, now, value) do
+  defp two_scale_rv_step(spec, %{rv: rv} = state, now, value) do
     opts = window_opts(spec)
+    price = value |> to_decimal() |> Decimal.to_float()
 
-    prices =
-      [{now, to_decimal(value)} | state.prices]
-      |> trim_price_window(now, opts)
+    {rv, dropped} =
+      TickWindow.rv_push(rv, now, price, now, Keyword.get(opts, :window_ms), tick_cap(opts))
 
-    state = %{state | prices: prices}
+    state = add_cap_drops(%{state | rv: rv}, dropped)
+    {state, warm(TickWindow.rv_value(rv))}
+  end
 
-    # Oldest first for the estimator; state holds newest first.
-    ordered = prices |> Enum.reverse() |> Enum.map(&elem(&1, 1))
+  # Time mode keeps the first print of each fixed subsample_ms clock
+  # bucket (buckets are aligned to the Unix epoch, not to the first print
+  # in the window, so they don't shift as the window slides). That bounds
+  # history at window_ms / subsample_ms + 1 points however busy the
+  # symbol is, and each print is a genuine observed price at roughly even
+  # spacing rather than a bucket-closing one.
+  defp two_scale_rv_step(spec, %{buckets: buckets} = state, now, value) do
+    opts = window_opts(spec)
+    bucket_ms = Map.get(spec.params, "subsample_ms", 1_000)
+    bucket = Integer.floor_div(DateTime.to_unix(now, :millisecond), bucket_ms)
 
-    {state, warm(two_scale_rv_value(ordered, prices, spec))}
+    {added, buckets} =
+      case buckets do
+        [{^bucket, _at, _price} | _] -> {false, buckets}
+        _ -> {true, [{bucket, now, to_decimal(value)} | buckets]}
+      end
+
+    {kept, dropped} = trim_by_time_and_cap(buckets, now, opts, &elem(&1, 1))
+    state = add_cap_drops(%{state | buckets: kept}, dropped)
+
+    # The estimate only changes when a bucket arrives or leaves, which is
+    # at most once per subsample_ms; recomputing it on every tick of a
+    # busy symbol would cost O(window / subsample_ms) each time.
+    value =
+      if added or length(kept) != length(buckets) or not Map.has_key?(state, :value) do
+        # On a time-thinned series the grid is already the slow scale, so
+        # a further tick-count factor of 2 gives the two scales the
+        # estimator needs without re-introducing a second tunable.
+        kept |> Enum.reverse() |> Enum.map(&elem(&1, 2)) |> Signals.two_scale_rv(2)
+      else
+        state.value
+      end
+
+    {Map.put(state, :value, value), warm(value)}
   end
 
   defp kyle_lambda_step(spec, state, quote_state, price, tick, now) do
@@ -1112,15 +1177,15 @@ defmodule TradingCore.Signal.Compute do
       signed_volume = Decimal.mult(size, Decimal.new(sign))
       mid_return = mid |> Decimal.sub(state.last_mid) |> Decimal.div(state.last_mid)
 
-      {ols_history, result} =
-        Signals.rolling_ols_beta(
-          state.ols_history,
-          {signed_volume, mid_return},
-          now,
-          window_opts(spec)
-        )
+      opts = window_opts(spec)
 
-      state = %{base | ols_history: ols_history}
+      {ols_history, result} =
+        Signals.rolling_ols_beta(state.ols_history, {signed_volume, mid_return}, now, opts)
+
+      state =
+        base
+        |> track_cap_drops(state.ols_history, ols_history, now, opts)
+        |> Map.put(:ols_history, ols_history)
 
       case result do
         nil -> {state, :warming_up}
@@ -1216,12 +1281,7 @@ defmodule TradingCore.Signal.Compute do
       sign ->
         size = trade_size(tick)
         signed = Decimal.mult(size, Decimal.new(sign))
-        opts = window_opts(spec)
-        history = trim_price_window([{now, signed} | state.history], now, opts)
-        state = %{state | history: history}
-
-        total = Enum.reduce(history, Decimal.new(0), fn {_at, v}, acc -> Decimal.add(acc, v) end)
-
+        {state, total} = push_sum(state, spec, now, signed)
         {state, round_to_precision(total, spec.params)}
     end
   end
@@ -1272,51 +1332,52 @@ defmodule TradingCore.Signal.Compute do
     end
   end
 
-  defp two_scale_rv_value(ordered_prices, stamped_prices, spec) do
-    case subsample_mode!(spec) do
-      :tick_count ->
-        Signals.two_scale_rv(ordered_prices, Map.get(spec.params, "subsample_k", 5))
+  # :ofi and :signed_volume: add this tick's value to the running window
+  # total (TickWindow), reporting any in-window points the safety cap
+  # drops. Returns {state, total}.
+  defp push_sum(state, spec, now, value) do
+    opts = window_opts(spec)
 
-      :time ->
-        bucket_ms = Map.get(spec.params, "subsample_ms", 1_000)
+    {window, dropped} =
+      TickWindow.sum_push(
+        state.window,
+        now,
+        value,
+        now,
+        Keyword.get(opts, :window_ms),
+        tick_cap(opts)
+      )
 
-        stamped_prices
-        |> Enum.reverse()
-        |> thin_by_time(bucket_ms)
-        # On a time-thinned series the grid is already the slow scale, so
-        # a further tick-count factor of 2 gives the two scales the
-        # estimator needs without re-introducing a second tunable.
-        |> Signals.two_scale_rv(2)
-    end
+    {add_cap_drops(%{state | window: window}, dropped), TickWindow.sum_total(window)}
   end
 
-  # One price per bucket_ms window, keeping the first print in each —
-  # first rather than last so the thinned series is a genuine subsample
-  # of observed prices at roughly even spacing, not a series of
-  # bucket-closing prints.
-  defp thin_by_time([], _bucket_ms), do: []
-
-  defp thin_by_time([{first_at, _} | _] = stamped, bucket_ms) do
-    stamped
-    |> Enum.group_by(fn {at, _} -> div(DateTime.diff(at, first_at, :millisecond), bucket_ms) end)
-    |> Enum.sort_by(fn {bucket, _} -> bucket end)
-    |> Enum.map(fn {_bucket, [{_at, price} | _]} -> price end)
-  end
-
-  defp trim_price_window(stamped, now, opts) do
-    window_ms = Keyword.get(opts, :window_ms)
-    max_samples = Keyword.get(opts, :max_history_samples, 1_000)
-
-    stamped
-    |> then(fn list ->
-      if window_ms do
-        cutoff = DateTime.add(now, -window_ms, :millisecond)
-        Enum.filter(list, fn {at, _} -> DateTime.compare(at, cutoff) != :lt end)
-      else
-        list
-      end
+  # The point cap for the tick-level kinds (:ofi, :signed_volume,
+  # :two_scale_rv). With a window_ms it is only a memory safety net
+  # (100_000 — about 17 minutes of SPY quotes at ~100/sec); a binding cap
+  # is counted in state[:cap_bound_drops]. With no window_ms the count IS
+  # the window, as it always was (1_000). params["max_history_samples"]
+  # overrides either.
+  defp tick_cap(opts) do
+    Keyword.get_lazy(opts, :max_history_samples, fn ->
+      if Keyword.get(opts, :window_ms), do: 100_000, else: 1_000
     end)
-    |> Enum.take(max_samples)
+  end
+
+  # Newest-first list: drop entries older than window_ms, then cap.
+  # Returns {kept, cap_dropped}.
+  defp trim_by_time_and_cap(list, now, opts, at_fun) do
+    in_window =
+      case Keyword.get(opts, :window_ms) do
+        nil ->
+          list
+
+        window_ms ->
+          cutoff = DateTime.add(now, -window_ms, :millisecond)
+          Enum.filter(list, &(DateTime.compare(at_fun.(&1), cutoff) != :lt))
+      end
+
+    {kept, dropped} = Enum.split(in_window, tick_cap(opts))
+    {kept, length(dropped)}
   end
 
   defp maybe_to_decimal(nil), do: nil
@@ -1731,11 +1792,18 @@ defmodule TradingCore.Signal.Compute do
       window_ms = Keyword.get(opts, :window_ms, :timer.minutes(5))
       cutoff = DateTime.add(now, -window_ms, :millisecond)
 
+      # Both lists are newest first, and at most max - 2 entries of
+      # `older` can have been kept (the new tick and the old head take
+      # the other slots), so only the tail past that point can hold drops.
+      # Skipping to it keeps this O(1) timestamp comparisons per tick in
+      # steady state rather than O(max) — it runs on every tick of the
+      # busiest feeds. Within the tail, entries are in-window until the
+      # first one older than the cutoff.
       dropped =
-        Enum.count(older, fn entry ->
-          at = elem(entry, 0)
-          DateTime.compare(at, oldest_kept_at) == :lt and DateTime.compare(at, cutoff) != :lt
-        end)
+        older
+        |> Enum.drop(max(max_history_samples - 2, 0))
+        |> Enum.take_while(&(DateTime.compare(elem(&1, 0), cutoff) != :lt))
+        |> Enum.count(&(DateTime.compare(elem(&1, 0), oldest_kept_at) == :lt))
 
       add_cap_drops(state, dropped)
     end
