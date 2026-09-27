@@ -58,6 +58,32 @@ defmodule TradingCore.Backtest do
     - `:target_dollar_volatility` — required only when
       `position_sizing["method"] == "volatility_target"`, same meaning as
       `TradingCore.PositionSizing.calculate_qty/2`'s context key.
+    - `:intrabar` — `true` to also check stop-loss/take-profit against
+      each bar's `high`/`low`, not just its `close` (default `false`). See
+      "Exits" below.
+
+  ## Exits
+
+  On every bar with an open position, stop-loss and take-profit are
+  checked **first and unconditionally**; a non-empty custom exit rule is
+  only consulted when neither was hit. This matches the live order in
+  `trading_system`'s `PositionExitCheck` and `trading_live`'s
+  `StrategyStockMonitor`. (Before 2026-09-26 the backtest checked SL/TP
+  only *inside* a true custom exit rule, so a strategy whose exit rule
+  stayed false never stopped out here — backtests of such strategies from
+  before then overstate their results.)
+
+  By default the check uses the bar's `close` and the exit fills at the
+  next bar's `open`, like any other signal. With `intrabar: true`, the
+  bar's `low`/`high` are checked against the levels as they stood when the
+  bar opened — before any `exit_strategy` ratchet moves them on this bar's
+  close, so the close never informs a check on prices that came before it.
+  An intrabar hit fills on that same bar at the level itself, or at the
+  bar's `open` if it opened already through the level (a gap). When a bar
+  touches both levels, the order inside the bar is unknown and the stop is
+  assumed to have come first (the conservative reading). Close-based
+  checks and the custom exit rule still run afterwards for a bar with no
+  intrabar hit.
 
   Returns `{:ok, [run]}` where each `run` is a plain map:
 
@@ -770,7 +796,8 @@ defmodule TradingCore.Backtest do
               position,
               exit_rule,
               exit_strategy_config,
-              direction
+              direction,
+              Keyword.get(opts, :intrabar, false)
             )
         end
       end)
@@ -1182,6 +1209,38 @@ defmodule TradingCore.Backtest do
          position,
          exit_rule,
          exit_strategy_config,
+         direction,
+         intrabar?
+       ) do
+    case intrabar? && intrabar_exit(position, bar, direction) do
+      {reason, fill_price} ->
+        run = close_run(symbol, position, position.direction, fill_price, bar.ts, reason)
+        %{acc | position: nil, runs: [run | acc.runs]}
+
+      _ ->
+        close_exit(
+          acc,
+          symbol,
+          bar,
+          next_bar,
+          snapshot,
+          position,
+          exit_rule,
+          exit_strategy_config,
+          direction
+        )
+    end
+  end
+
+  defp close_exit(
+         acc,
+         symbol,
+         bar,
+         next_bar,
+         snapshot,
+         position,
+         exit_rule,
+         exit_strategy_config,
          direction
        ) do
     current_price = bar.close
@@ -1233,26 +1292,53 @@ defmodule TradingCore.Backtest do
     end
   end
 
+  # SL/TP first, unconditionally; the custom exit rule only when neither
+  # was hit. See "Exits" in the moduledoc.
   defp exit_reason(position, exit_snapshot, exit_rule, current_price, direction) do
-    has_custom_rule? = is_map(exit_rule) and map_size(exit_rule) > 0
-
-    if has_custom_rule? do
-      if RuleEngine.evaluate(exit_rule, exit_snapshot) do
-        cond do
-          hit_stop_loss?(position, current_price, direction) -> "stopped_out"
-          hit_take_profit?(position, current_price, direction) -> "target_hit"
-          true -> "rule_exit"
-        end
-      else
-        nil
-      end
-    else
-      cond do
-        hit_stop_loss?(position, current_price, direction) -> "stopped_out"
-        hit_take_profit?(position, current_price, direction) -> "target_hit"
-        true -> nil
-      end
+    cond do
+      hit_stop_loss?(position, current_price, direction) -> "stopped_out"
+      hit_take_profit?(position, current_price, direction) -> "target_hit"
+      custom_rule?(exit_rule) and RuleEngine.evaluate(exit_rule, exit_snapshot) -> "rule_exit"
+      true -> nil
     end
+  end
+
+  # An empty/missing exit rule means "no custom exit," not "exit now" —
+  # RuleEngine.evaluate/2 would call it vacuously true.
+  defp custom_rule?(exit_rule), do: is_map(exit_rule) and map_size(exit_rule) > 0
+
+  # {reason, fill_price} if the bar's range reached a level, else nil. The
+  # stop wins a bar that touched both (order inside the bar is unknown).
+  defp intrabar_exit(position, bar, "short") do
+    cond do
+      hit_stop_loss?(position, bar.high, "short") ->
+        {"stopped_out", gap_fill(position.stop_loss_price, bar.open, :gt)}
+
+      hit_take_profit?(position, bar.low, "short") ->
+        {"target_hit", gap_fill(position.take_profit_price, bar.open, :lt)}
+
+      true ->
+        nil
+    end
+  end
+
+  defp intrabar_exit(position, bar, _long) do
+    cond do
+      hit_stop_loss?(position, bar.low, "long") ->
+        {"stopped_out", gap_fill(position.stop_loss_price, bar.open, :lt)}
+
+      hit_take_profit?(position, bar.high, "long") ->
+        {"target_hit", gap_fill(position.take_profit_price, bar.open, :gt)}
+
+      true ->
+        nil
+    end
+  end
+
+  # Fill at `level`, unless the bar opened already beyond it in the
+  # `beyond` direction — then at the open, the first price available.
+  defp gap_fill(level, open, beyond) do
+    if Decimal.compare(open, level) == beyond, do: open, else: level
   end
 
   defp hit_stop_loss?(position, current_price, direction),
