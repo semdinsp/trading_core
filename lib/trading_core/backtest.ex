@@ -61,6 +61,13 @@ defmodule TradingCore.Backtest do
     - `:intrabar` — `true` to also check stop-loss/take-profit against
       each bar's `high`/`low`, not just its `close` (default `false`). See
       "Exits" below.
+    - `:stop_vol_lookback_days` / `:stop_vol_lambda` — the EWMA window
+      (calendar days, default `14`) and decay (default `0.94`) for a
+      `"volatility_multiple"` risk_controls method. The defaults match the
+      hub's `trailing_ewma_vol_sync/4`, which is what the live apps pass;
+      change them only to test sensitivity. Each run reports the
+      `stop_method` actually applied and the `stop_daily_vol` used, since
+      an entry with too little history falls back to `percent_of_entry`.
 
   ## Exits
 
@@ -95,6 +102,8 @@ defmodule TradingCore.Backtest do
         exit_at: DateTime.t(),
         exit_price: Decimal.t(),
         exit_reason: "stopped_out" | "target_hit" | "rule_exit" | "end_of_data",
+        stop_method: "percent_of_entry" | "volatility_multiple",
+        stop_daily_vol: Decimal.t() | nil,
         qty: Decimal.t(),
         pnl: Decimal.t()
       }
@@ -382,7 +391,7 @@ defmodule TradingCore.Backtest do
     module doesn't enforce anything about *other* symbols or versions.
   """
 
-  alias TradingCore.{ExitStrategy, PositionSizing, RiskControls, RuleEngine, Signals}
+  alias TradingCore.{ExitStrategy, PositionSizing, RiskControls, RuleEngine, Signals, Volatility}
 
   @type bar :: %{
           required(:ts) => DateTime.t(),
@@ -401,6 +410,8 @@ defmodule TradingCore.Backtest do
           exit_at: DateTime.t(),
           exit_price: Decimal.t(),
           exit_reason: String.t(),
+          stop_method: String.t(),
+          stop_daily_vol: Decimal.t() | nil,
           qty: Decimal.t(),
           pnl: Decimal.t()
         }
@@ -1088,8 +1099,14 @@ defmodule TradingCore.Backtest do
       entry_price = next_bar.open
       entry_at = next_bar.ts
 
-      {stop_loss_price, take_profit_price} =
-        RiskControls.levels(entry_price, risk_controls_config, direction)
+      %{stop_loss: stop_loss_price, take_profit: take_profit_price} =
+        levels =
+        RiskControls.resolve_levels(
+          entry_price,
+          risk_controls_config,
+          direction,
+          stop_level_opts(risk_controls_config, bars, index, opts)
+        )
 
       sizing_context =
         build_sizing_context(position_sizing_config, entry_price, bars, index, opts)
@@ -1102,6 +1119,8 @@ defmodule TradingCore.Backtest do
             direction: direction,
             stop_loss_price: stop_loss_price,
             take_profit_price: take_profit_price,
+            stop_method: levels.method,
+            stop_daily_vol: levels.daily_vol,
             qty: qty,
             state: %{}
           }
@@ -1118,6 +1137,35 @@ defmodule TradingCore.Backtest do
       acc
     end
   end
+
+  # A "volatility_multiple" stop needs the same daily vol a live entry is
+  # handed: the hub's EWMA (Volatility.ewma_daily_vol/2), over bars up to
+  # and including the signal bar — what was known when the entry fired.
+  # With too little history it passes no daily_vol, so RiskControls falls
+  # back to percent_of_entry and the run records that.
+  defp stop_level_opts(%{"method" => "volatility_multiple"}, bars, index, opts) do
+    known = Enum.take(bars, index + 1)
+
+    as_of =
+      known
+      |> List.last()
+      |> Map.fetch!(:ts)
+      |> DateTime.shift_zone!("Etc/UTC")
+      |> DateTime.to_date()
+
+    vol_opts = [
+      as_of: as_of,
+      lookback_days: Keyword.get(opts, :stop_vol_lookback_days, 14),
+      lambda: Keyword.get(opts, :stop_vol_lambda, 0.94)
+    ]
+
+    case Volatility.ewma_daily_vol(known, vol_opts) do
+      {:ok, daily_vol} -> [daily_vol: daily_vol]
+      :insufficient_data -> []
+    end
+  end
+
+  defp stop_level_opts(_config, _bars, _index, _opts), do: []
 
   defp build_sizing_context(%{"method" => "volatility_target"}, entry_price, bars, index, opts) do
     window = Keyword.get(opts, :volatility_window, @default_volatility_window)
@@ -1372,6 +1420,8 @@ defmodule TradingCore.Backtest do
       exit_at: exit_at,
       exit_price: exit_price,
       exit_reason: exit_reason,
+      stop_method: Map.get(position, :stop_method),
+      stop_daily_vol: Map.get(position, :stop_daily_vol),
       qty: position.qty,
       pnl: pnl
     }

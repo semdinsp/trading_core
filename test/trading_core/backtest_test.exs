@@ -717,6 +717,93 @@ defmodule TradingCore.BacktestTest do
     end
   end
 
+  describe "volatility_multiple stops" do
+    defp daily(day, open, high, low, close) do
+      %{
+        ts: DateTime.new!(Date.add(~D[2026-09-01], day), ~T[20:00:00], "Etc/UTC"),
+        open: d(open),
+        high: d(high),
+        low: d(low),
+        close: d(close),
+        volume: d(1000)
+      }
+    end
+
+    defp vol_strategy do
+      %{
+        "direction" => "long",
+        "rules" => %{
+          "entry" => %{"signal" => "close_price", "op" => "gt", "value" => 100},
+          "exit" => nil
+        },
+        "params" => %{
+          "risk_controls" => %{
+            "method" => "volatility_multiple",
+            "sl_vol_mult" => 2,
+            "tp_vol_mult" => 3
+          }
+        },
+        "position_sizing" => %{"method" => "fixed_qty", "qty" => 1}
+      }
+    end
+
+    test "sizes the stop from the EWMA vol of bars up to the signal bar" do
+      bars = [
+        daily(0, 99, 99, 99, 99),
+        daily(1, 99, 99, 99, 98),
+        # signal bar: close 101 > 100
+        daily(2, 99, 101, 99, 101),
+        # entry at 100
+        daily(3, 100, 100, 100, 100),
+        daily(4, 100, 100, 100, 100)
+      ]
+
+      {:ok, expected_vol} = TradingCore.Volatility.ewma_daily_vol(Enum.take(bars, 3))
+
+      assert {:ok, [run]} =
+               Backtest.run(vol_strategy(), %{"AAPL" => bars},
+                 signal_specs: %{"close_price" => %{kind: :price}}
+               )
+
+      assert run.stop_method == "volatility_multiple"
+      assert Decimal.equal?(run.stop_daily_vol, expected_vol)
+    end
+
+    test "falls back to percent_of_entry, and says so, with too little history" do
+      bars = [
+        daily(0, 99, 101, 99, 101),
+        daily(1, 100, 100, 100, 100),
+        daily(2, 100, 100, 100, 100)
+      ]
+
+      assert {:ok, [run]} =
+               Backtest.run(vol_strategy(), %{"AAPL" => bars},
+                 signal_specs: %{"close_price" => %{kind: :price}}
+               )
+
+      assert run.stop_method == "percent_of_entry"
+      assert run.stop_daily_vol == nil
+    end
+
+    test "percent_of_entry runs report their method" do
+      strategy =
+        put_in(vol_strategy(), ["params", "risk_controls"], %{
+          "method" => "percent_of_entry",
+          "stop_loss_percent" => 2,
+          "take_profit_percent" => 4
+        })
+
+      bars = [daily(0, 99, 101, 99, 101), daily(1, 100, 100, 100, 100)]
+
+      assert {:ok, [run]} =
+               Backtest.run(strategy, %{"AAPL" => bars},
+                 signal_specs: %{"close_price" => %{kind: :price}}
+               )
+
+      assert run.stop_method == "percent_of_entry"
+    end
+  end
+
   describe "volatility_target sizing" do
     test "estimate_daily_vol/3 matches a hand-computed stdev of daily returns" do
       # Returns: (102-100)/100=0.02, (99-102)/102≈-0.029412, (105-99)/99≈0.060606
