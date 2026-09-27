@@ -2,15 +2,15 @@ defmodule TradingCore.Signal.TickWindow do
   @moduledoc """
   Time windows over tick-level data that hold on busy symbols.
 
-  `TradingCore.Signal.Compute`'s `:ofi`, `:signed_volume` and
-  `:two_scale_rv` used to keep a plain list, trimmed to `window_ms` and
-  then to a sample count (default 1,000). SPY and QQQ print thousands of
+  `TradingCore.Signal.Compute`'s `:ofi`, `:signed_volume`,
+  `:two_scale_rv`, `:donchian` and `:kyle_lambda` used to keep a plain
+  list, trimmed to `window_ms` and then to a sample count (1,000 or 500). SPY and QQQ print thousands of
   trades and tens of thousands of quotes in five minutes, so the count
   bound first: a "5m" window really covered the last 10-60 seconds, and
   nothing said so. Rescanning a full-size list on every tick instead would
   cost O(n) per tick, which a live loop cannot afford at ~100 quotes/sec.
 
-  Both structures here are updated in O(1) amortized time per tick:
+  Every structure here is updated in O(1) amortized time per tick:
 
     * `sum_*` — a running `Decimal` total of values in the window (for the
       additive kinds). Exact: values are added on arrival and subtracted
@@ -22,8 +22,16 @@ defmodule TradingCore.Signal.TickWindow do
       matches the batch estimator over the same window (to float rounding;
       the sums are rebuilt from scratch every #{4096} pushes so rounding
       cannot accumulate).
+    * `extremes_*` — the window's high and low (for `:donchian`), from
+      monotonic max/min deques: a new price evicts older ones it beats,
+      so the front of each deque is the extreme and expiry only ever
+      removes from the front.
+    * `ols_*` — a least-squares fit of y on x (for `:kyle_lambda`), from
+      running means and centred co-moments added and removed exactly
+      (Welford), rebuilt from the stored points every #{4096} updates.
 
-  Both keep a safety cap on the number of points (the caller passes it).
+  All of them keep a safety cap on the number of points (the caller
+  passes it).
   When the cap has to drop points that are still inside the window, the
   count is returned so the caller can report it (`state[:cap_bound_drops]`)
   — a shrunken window is never silent.
