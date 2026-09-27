@@ -198,4 +198,101 @@ defmodule TradingCore.RiskControlsTest do
                nil
     end
   end
+
+  describe "volatility_multiple" do
+    @config %{"method" => "volatility_multiple", "sl_vol_mult" => 2, "tp_vol_mult" => 3}
+
+    test "long: SL = entry - sl_mult*vol*entry, TP = entry + tp_mult*vol*entry" do
+      result = RiskControls.resolve_levels(Decimal.new("100"), @config, "long", daily_vol: 0.01)
+
+      assert Decimal.equal?(result.stop_loss, Decimal.new("98"))
+      assert Decimal.equal?(result.take_profit, Decimal.new("103"))
+      assert result.method == "volatility_multiple"
+      assert Decimal.equal?(result.daily_vol, Decimal.new("0.01"))
+      assert result.fallback_reason == nil
+    end
+
+    test "short mirrors: SL above, TP below" do
+      {sl, tp} =
+        RiskControls.levels(Decimal.new("100"), @config, "short", daily_vol: Decimal.new("0.01"))
+
+      assert Decimal.equal?(sl, Decimal.new("102"))
+      assert Decimal.equal?(tp, Decimal.new("97"))
+    end
+
+    test "accepts daily_vol and multiples as Decimal, float, integer or string" do
+      config = %{@config | "sl_vol_mult" => "2", "tp_vol_mult" => 3.0}
+      result = RiskControls.resolve_levels(Decimal.new("100"), config, "long", daily_vol: "0.01")
+
+      assert result.method == "volatility_multiple"
+      assert Decimal.equal?(result.stop_loss, Decimal.new("98"))
+    end
+
+    test "no daily_vol falls back to percent_of_entry defaults and says why" do
+      for opts <- [[], [daily_vol: nil], [daily_vol: 0], [daily_vol: -0.01], [daily_vol: "abc"]] do
+        result = RiskControls.resolve_levels(Decimal.new("100"), @config, "long", opts)
+
+        assert result.method == "percent_of_entry"
+        assert result.fallback_reason == :no_daily_vol
+        assert result.daily_vol == nil
+        assert Decimal.equal?(result.stop_loss, Decimal.new("95.0"))
+        assert Decimal.equal?(result.take_profit, Decimal.new("110.0"))
+      end
+    end
+
+    test "fallback uses the config's own percents when both are present" do
+      config = Map.merge(@config, %{"stop_loss_percent" => 3, "take_profit_percent" => 6})
+      result = RiskControls.resolve_levels(Decimal.new("100"), config, "long", [])
+
+      assert result.fallback_reason == :no_daily_vol
+      assert Decimal.equal?(result.stop_loss, Decimal.new("97"))
+      assert Decimal.equal?(result.take_profit, Decimal.new("106"))
+    end
+
+    test "missing or non-positive multiples fall back" do
+      for config <- [
+            Map.delete(@config, "sl_vol_mult"),
+            %{@config | "tp_vol_mult" => 0}
+          ] do
+        result = RiskControls.resolve_levels(Decimal.new("100"), config, "long", daily_vol: 0.01)
+        assert result.method == "percent_of_entry"
+        assert result.fallback_reason == :missing_multiples
+      end
+    end
+
+    test "a stop at or below zero falls back" do
+      result = RiskControls.resolve_levels(Decimal.new("100"), @config, "long", daily_vol: 0.5)
+
+      assert result.method == "percent_of_entry"
+      assert result.fallback_reason == :invalid_level
+    end
+
+    test "levels/3 with no opts falls back rather than crashing" do
+      {sl, _tp} = RiskControls.levels(Decimal.new("100"), @config)
+      assert Decimal.equal?(sl, Decimal.new("95.0"))
+    end
+  end
+
+  describe "resolve_levels/4 on existing methods" do
+    test "percent_of_entry reports its method and matches levels/3" do
+      config = %{
+        "method" => "percent_of_entry",
+        "stop_loss_percent" => 4.0,
+        "take_profit_percent" => 8.0
+      }
+
+      result = RiskControls.resolve_levels(Decimal.new("250"), config, "long")
+
+      assert result.method == "percent_of_entry"
+      assert result.fallback_reason == nil
+
+      assert {result.stop_loss, result.take_profit} ==
+               RiskControls.levels(Decimal.new("250"), config, "long")
+    end
+
+    test "an unknown method reports percent_of_entry" do
+      result = RiskControls.resolve_levels(Decimal.new("100"), %{"method" => "atr"}, "long")
+      assert result.method == "percent_of_entry"
+    end
+  end
 end
