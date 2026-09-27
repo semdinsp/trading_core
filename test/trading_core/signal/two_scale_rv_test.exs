@@ -215,7 +215,7 @@ defmodule TradingCore.Signal.TwoScaleRvTest do
         end)
 
       # One tick per second, 60s window: far fewer than 400 retained.
-      assert length(state.prices) <= 61
+      assert TradingCore.Signal.TickWindow.rv_size(state.rv) <= 61
     end
 
     test "max_history_samples caps retained prices" do
@@ -223,7 +223,10 @@ defmodule TradingCore.Signal.TwoScaleRvTest do
 
       {state, _value} = run(%{"subsample_k" => 5, "max_history_samples" => 50}, noisy)
 
-      assert length(state.prices) == 50
+      assert TradingCore.Signal.TickWindow.rv_size(state.rv) == 50
+      # No window_ms, so the count is the window and dropping is expected;
+      # it is still recorded rather than silent.
+      assert state.cap_bound_drops == 350
     end
   end
 

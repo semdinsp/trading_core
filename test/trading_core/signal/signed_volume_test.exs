@@ -197,7 +197,7 @@ defmodule TradingCore.Signal.SignedVolumeTest do
           Compute.step(spec, acc, tick)
         end)
 
-      assert length(state.history) == 1
+      assert TradingCore.Signal.TickWindow.sum_size(state.window) == 1
       assert Decimal.equal?(value, Decimal.new(100))
     end
   end

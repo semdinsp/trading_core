@@ -193,7 +193,7 @@ defmodule TradingCore.Signal.OfiTest do
           Compute.step(spec, acc, tick)
         end)
 
-      assert length(state.history) == 1
+      assert TradingCore.Signal.TickWindow.sum_size(state.window) == 1
     end
   end
 
