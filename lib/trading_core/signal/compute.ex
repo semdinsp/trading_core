@@ -733,8 +733,8 @@ defmodule TradingCore.Signal.Compute do
   # impact, and a slope fitted to it would be meaningless or explosive.
   #
   # A near-zero or NEGATIVE lambda is a real reading, not a fault.
-  # Measured on live SPY over 60s windows (old per-share unit, one trade
-  # counted as one share) it sat around -4e-7: the mid
+  # Measured on live SPY over 60s windows (before feeds carried trade
+  # sizes, so effectively per trade) it sat around -4e-7: the mid
   # mean-reverts within the window and retail-size prints do not move the
   # most liquid ETF in the world, so the fitted slope is noise around
   # zero. Lambda is informative where impact actually exists — a thin
@@ -1223,8 +1223,9 @@ defmodule TradingCore.Signal.Compute do
 
   # :kyle_lambda's volume unit: x is signed volume in thousands of shares.
   # Per single share, real-size prints on SPY/QQQ/XLE put lambda at ~1e-9,
-  # which the default 8 decimal places round to 0. Per 1,000 shares it
-  # sits around 1e-6 to 1e-5.
+  # which the default 8 decimal places round to 0. Per 1,000 shares the
+  # same readings land around 1e-6 (estimated from the per-share values
+  # that survived rounding, not yet measured in this unit).
   @kyle_volume_unit Decimal.new(1_000)
 
   defp kyle_lambda_step(spec, state, quote_state, price, tick, now) do

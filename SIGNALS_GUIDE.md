@@ -218,9 +218,9 @@ positive slope almost always. `lee_ready` signs off the *quote*
 independently of the price path, and on SPY the residual is
 mean-reverting noise around zero.
 
-The magnitudes agree (both ~1e-7 to 1e-6, i.e. essentially no impact.
-That was measured in the old per-share unit, when each trade counted as
-one share);
+The magnitudes agree (both ~1e-7 to 1e-6, i.e. essentially no impact;
+measured before feeds carried trade sizes, so effectively per trade, not
+in today's unit);
 only the sign diverges, and it diverges because a near-zero slope has no
 stable sign to report. **Read the magnitude. Do not read the sign of a
 near-zero lambda as direction, and do not compare lambdas fitted with
