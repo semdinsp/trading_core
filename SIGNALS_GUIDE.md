@@ -149,7 +149,14 @@ to tick rule at mid or on a crossed book).
 
 **`:kyle_lambda`** — price impact per unit of signed flow; **higher
 means thinner liquidity**. A conditioning variable (size down when
-impact is high), not a trade trigger.
+impact is high), not a trade trigger. **Unit: mid return per 1,000
+signed shares**, the same for every symbol. To compare names in dollar
+terms, convert: per $1M notional = `lambda * 1000 / price`.
+
+*Unit changed 2026-09-30.* It was mid return per signed share. Once
+feeds carried real trade sizes, that sat at ~1e-9 and the default 8
+decimal places rounded most readings to exactly 0. Lambda history from
+before and after the change is not comparable.
 
 **`:two_scale_rv`** — use this, not naive tick RV. Sampling faster makes
 naive RV *worse* because every print carries bid-ask bounce: on a
@@ -211,7 +218,9 @@ positive slope almost always. `lee_ready` signs off the *quote*
 independently of the price path, and on SPY the residual is
 mean-reverting noise around zero.
 
-The magnitudes agree (both ~1e-7 to 1e-6, i.e. essentially no impact);
+The magnitudes agree (both ~1e-7 to 1e-6, i.e. essentially no impact.
+That was measured in the old per-share unit, when each trade counted as
+one share);
 only the sign diverges, and it diverges because a near-zero slope has no
 stable sign to report. **Read the magnitude. Do not read the sign of a
 near-zero lambda as direction, and do not compare lambdas fitted with
