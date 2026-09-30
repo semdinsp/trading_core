@@ -40,7 +40,8 @@ defmodule TradingCore.Signal.KyleLambdaTest do
     do: %{at: DateTime.add(@now, i, :second), value: price, volume: volume}
 
   # Signed volume drives the mid linearly: ~0.1% mid move per 100 shares,
-  # so impact per share is ~1e-5 and lambda should recover that.
+  # so impact is ~1e-5 per share. Lambda is mid return per 1,000 signed
+  # shares, so it should recover ~0.01.
   defp linear_impact_ticks do
     [
       quote_at(0, 99.99, 100.01),
@@ -58,8 +59,8 @@ defmodule TradingCore.Signal.KyleLambdaTest do
     test "recovers the price impact per unit of signed volume" do
       {_state, value} = run(spec(), linear_impact_ticks())
 
-      # ~1e-5 mid-return per share.
-      assert_in_delta Decimal.to_float(value), 1.0e-5, 2.0e-6
+      # ~0.01 mid return per 1,000 signed shares.
+      assert_in_delta Decimal.to_float(value), 0.01, 0.002
     end
 
     test "is positive when buys push the mid up" do
@@ -108,7 +109,65 @@ defmodule TradingCore.Signal.KyleLambdaTest do
 
       assert Decimal.compare(value, Decimal.new(0)) == :gt
       # Matches the buy-side magnitude: impact is directionless.
-      assert_in_delta Decimal.to_float(value), 1.0e-5, 2.0e-6
+      assert_in_delta Decimal.to_float(value), 0.01, 0.002
+    end
+  end
+
+  describe "unit: mid return per 1,000 signed shares" do
+    # Buys at the ask, each preceded by a mid move of `half_cents` * $0.005
+    # (the mid of penny quotes moves in half cents). Each trade is paired
+    # with the mid move since the previous trade, as in
+    # linear_impact_ticks/0; the first trade only sets the starting mid.
+    defp impact_ticks(start_mid, steps) do
+      {ticks, _mid} =
+        steps
+        |> Enum.with_index()
+        |> Enum.reduce({[], start_mid}, fn {{size, half_cents}, i}, {acc, mid} ->
+          mid = mid + half_cents * 0.005
+          # A one-cent spread around a half-cent mid, two cents around a whole one.
+          half_spread = if rem(round(mid * 200), 2) == 1, do: 0.005, else: 0.01
+          bid = Float.round(mid - half_spread, 2)
+          ask = Float.round(mid + half_spread, 2)
+
+          {[trade_at(2 * i + 1, ask, size), quote_at(2 * i, bid, ask) | acc], mid}
+        end)
+
+      Enum.reverse(ticks)
+    end
+
+    # Regression: once trade sizes carried real share counts
+    # (trading_signal #157), a per-share lambda on a deep name was ~1e-9
+    # and the 8-decimal rounding turned it into exactly 0. Here a
+    # 2,000-share buy precedes a half-cent mid move on a $650 name, and a
+    # 4,000-share buy a full cent. Per share that's ~3.8e-9, which rounds
+    # to 0. Per 1,000 shares it's ~3.8e-6.
+    test "real-share-size trades with small impact give a nonzero lambda" do
+      steps = [{100, 0}, {2_000, 1}, {4_000, 2}, {2_000, 1}, {4_000, 2}, {2_000, 1}]
+
+      {_state, value} = run(spec(), impact_ticks(650.0, steps))
+
+      assert %Decimal{} = value
+      assert Decimal.compare(value, Decimal.new(0)) == :gt
+      assert_in_delta Decimal.to_float(value), 3.85e-6, 3.0e-7
+    end
+
+    test "one share unit on every instrument; dollar terms convert by 1000 / price" do
+      # The same dollar prints and the same mid RETURN on a $650 name and a
+      # $65 name, which needs 10x the shares. Per 1,000 shares the cheap
+      # name reads 1/10 the lambda. The documented conversion
+      # (lambda * 1000 / price = per $1M notional) brings them level.
+      expensive = [{100, 0}, {2_000, 10}, {4_000, 20}, {2_000, 10}, {4_000, 20}]
+      cheap = [{1_000, 0}, {20_000, 1}, {40_000, 2}, {20_000, 1}, {40_000, 2}]
+
+      {_s, expensive_value} = run(spec(), impact_ticks(650.0, expensive))
+      {_s, cheap_value} = run(spec(), impact_ticks(65.0, cheap))
+
+      e = Decimal.to_float(expensive_value)
+      c = Decimal.to_float(cheap_value)
+
+      assert e > 0
+      assert_in_delta c / e, 0.1, 0.005
+      assert_in_delta c * 1000 / 65 / (e * 1000 / 650), 1.0, 0.05
     end
   end
 

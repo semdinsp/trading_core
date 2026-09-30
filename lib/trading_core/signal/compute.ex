@@ -139,6 +139,16 @@ defmodule TradingCore.Signal.Compute do
   `:two_scale_rv` is raw variance of log price over the window — not a
   volatility and not annualized.
 
+  ## `:kyle_lambda` unit (changed 2026-09-30)
+
+  `:kyle_lambda` is mid return per **1,000 signed shares**, the same unit
+  for every symbol. It used to be per signed share. Once feeds carried
+  real trade sizes, that put lambda at ~1e-9, and the default 8 decimal
+  places rounded most live readings to exactly 0. **Lambda values before
+  and after this change are not comparable.** Per $1M notional is
+  `lambda * 1000 / price`; see the `:kyle_lambda` `step/2` clause for
+  why the regressor is shares rather than notional.
+
   ## Session boundaries are injected, never derived from wall-clock
 
   A `:vwap`, `:volume`, or `:zscore` spec's `params` may include
@@ -691,10 +701,26 @@ defmodule TradingCore.Signal.Compute do
   # (size smaller when impact is high), not a trade trigger.
   #
   # Each observation pairs one trade with the mid move since the previous
-  # trade: x = signed volume of this trade, y = mid return over the same
-  # interval. Reuses Signals.rolling_ols_beta/4 rather than a second
-  # regression implementation — it already fits a rolling OLS over a
-  # {x, y} window and returns {beta, alpha}, and lambda is that beta.
+  # trade: x = signed volume of this trade in THOUSANDS OF SHARES, y = mid
+  # return over the same interval. So lambda's unit is **mid return per
+  # 1,000 signed shares**, the same unit for every instrument. The fit is
+  # TickWindow's running OLS (same inputs as Signals.rolling_ols_beta/4)
+  # and lambda is its beta.
+  #
+  # Shares, not dollar notional: shares * trade price would put price
+  # moves into x, and those correlate with y. A window of identically
+  # sized prints would then fit a slope to the price path instead of
+  # returning :warming_up. To compare instruments in dollar terms,
+  # convert on the consumer side: per $1M notional = lambda * 1000 /
+  # price. At the same per-1,000-share lambda, a ~$90 XLE is ~7x more
+  # impact per dollar than a ~$650 SPY.
+  #
+  # Unit changed 2026-09-30. It was mid return per signed SHARE. Once
+  # trade sizes carried real share counts, that put lambda at ~1e-9 and
+  # the 8-decimal rounding turned most readings into exactly 0. **Values
+  # before and after the change are not comparable.** (Readings from
+  # before real sizes arrived were effectively per TRADE, since each
+  # trade counted as 1, and aren't comparable either.)
   #
   # Trade signing uses the same classifier logic as :signed_volume (see
   # params "classifier"), so the two kinds cannot disagree about which
@@ -707,7 +733,8 @@ defmodule TradingCore.Signal.Compute do
   # impact, and a slope fitted to it would be meaningless or explosive.
   #
   # A near-zero or NEGATIVE lambda is a real reading, not a fault.
-  # Measured on live SPY over 60s windows it sits around -4e-7: the mid
+  # Measured on live SPY over 60s windows (old per-share unit, one trade
+  # counted as one share) it sat around -4e-7: the mid
   # mean-reverts within the window and retail-size prints do not move the
   # most liquid ETF in the world, so the fitted slope is noise around
   # zero. Lambda is informative where impact actually exists — a thin
@@ -1194,6 +1221,12 @@ defmodule TradingCore.Signal.Compute do
     {Map.put(state, :value, value), warm(value)}
   end
 
+  # :kyle_lambda's volume unit: x is signed volume in thousands of shares.
+  # Per single share, real-size prints on SPY/QQQ/XLE put lambda at ~1e-9,
+  # which the default 8 decimal places round to 0. Per 1,000 shares it
+  # sits around 1e-6 to 1e-5.
+  @kyle_volume_unit Decimal.new(1_000)
+
   defp kyle_lambda_step(spec, state, quote_state, price, tick, now) do
     mid = mid_price(quote_state.bid, quote_state.ask)
     sign = trade_sign(classifier!(spec), price, quote_state, state)
@@ -1206,7 +1239,7 @@ defmodule TradingCore.Signal.Compute do
       {base, :warming_up}
     else
       size = trade_size(tick)
-      signed_volume = Decimal.mult(size, Decimal.new(sign))
+      signed_volume = size |> Decimal.mult(Decimal.new(sign)) |> Decimal.div(@kyle_volume_unit)
       mid_return = mid |> Decimal.sub(state.last_mid) |> Decimal.div(state.last_mid)
 
       opts = window_opts(spec)
