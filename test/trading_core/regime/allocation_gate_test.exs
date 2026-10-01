@@ -166,7 +166,9 @@ defmodule TradingCore.Regime.AllocationGateTest do
           max_positions: nil
         })
 
-      book = book(totals("10000", "999999", 50), totals("0", "0", 0))
+      # Bucket usage far above what the (unset) bucket caps would allow,
+      # but within the portfolio caps.
+      book = book(totals("900", "40000", 50), totals("900", "40000", 50))
 
       assert {:allow, _, %{headroom: %{bucket_risk: nil, bucket_positions: nil}}} =
                AllocationGate.decide(entry(), book, budget)
@@ -179,6 +181,110 @@ defmodule TradingCore.Regime.AllocationGateTest do
 
       assert {:resize, qty, :bucket_notional_cap, _} = AllocationGate.decide(opt, book, @budget)
       assert Decimal.equal?(qty, 2)
+    end
+  end
+
+  describe "decide/3 — bad input fails closed, never raises" do
+    test "zero or negative price/multiplier/lot rejects instead of disabling caps" do
+      for bad <- [
+            [price: d("0")],
+            [price: d("-5")],
+            [multiplier: d("0")],
+            [lot_size: d("0")],
+            [lot_size: d("-1")],
+            [qty: d("-1")],
+            [qty: Decimal.new("Infinity")],
+            [price: nil],
+            [qty: nil],
+            [price: Decimal.new("NaN")],
+            [size_multiplier: d("-0.5")]
+          ] do
+        assert {:reject, :invalid_input, %{final_qty: zero}} =
+                 AllocationGate.decide(entry(bad), @empty_book, @budget),
+               "expected :invalid_input for #{inspect(bad)}"
+
+        assert Decimal.equal?(zero, 0)
+      end
+    end
+
+    test "unparseable risk_per_unit is :missing_risk_input" do
+      for bad <- ["abc", "", Decimal.new("NaN"), d("-1")] do
+        assert {:reject, :missing_risk_input, _} =
+                 AllocationGate.decide(entry(risk_per_unit: bad), @empty_book, @budget)
+      end
+    end
+
+    test "a size_multiplier above 1 never upsizes" do
+      assert {:allow, qty, _} =
+               AllocationGate.decide(entry(size_multiplier: d("3")), @empty_book, @budget)
+
+      assert Decimal.equal?(qty, 10)
+    end
+
+    test "bad book values reject" do
+      for bad <- [
+            book(%{open_risk: nil, gross_notional: d("0"), count: 0}, totals("0", "0", 0)),
+            book(totals("-100", "0", 0), totals("0", "0", 0)),
+            book(%{open_risk: d("0"), gross_notional: d("0"), count: nil}, totals("0", "0", 0)),
+            book(totals("0", "0", 0), %{open_risk: "x", gross_notional: d("0"), count: 0}),
+            nil
+          ] do
+        assert {:reject, :invalid_input, _} = AllocationGate.decide(entry(), bad, @budget),
+               "expected :invalid_input for #{inspect(bad)}"
+      end
+    end
+
+    test "a book without :portfolio uses at least the bucket's usage" do
+      # Bucket risk $450 of a $500 cap leaves room for all 10 shares ($50),
+      # but with the portfolio cap lowered to $460 that same $450 must count
+      # against it too, leaving $10 = 2 shares.
+      budget = %{@budget | max_open_risk_pct: d("0.92")}
+      book = %{"tick" => totals("450", "0", 0)}
+
+      assert {:resize, qty, :portfolio_risk_cap, _} = AllocationGate.decide(entry(), book, budget)
+      assert Decimal.equal?(qty, 2)
+    end
+
+    test "bad budgets reject: float or misspelled bucket caps, negative pct, zero equity" do
+      tick = @budget.buckets["tick"]
+
+      for bad <- [
+            put_in(@budget, [:buckets, "tick"], %{tick | max_positions: 3.0}),
+            put_in(@budget, [:buckets, "tick"], Map.put(tick, :max_open_risk, d("1"))),
+            %{@budget | risk_per_trade_pct: d("-0.3")},
+            %{@budget | equity: d("0")},
+            %{@budget | max_open_risk_pct: nil},
+            Map.delete(@budget, :equity),
+            nil
+          ] do
+        assert {:reject, :invalid_input, _} = AllocationGate.decide(entry(), @empty_book, bad)
+      end
+
+      assert_raise ArgumentError, fn ->
+        AllocationGate.budget_dollars(%{@budget | equity: d("0")})
+      end
+    end
+
+    test "an integral Decimal max_positions (e.g. from an Ecto column) is accepted" do
+      budget = put_in(@budget, [:buckets, "tick", :max_positions], d("3"))
+
+      assert {:reject, :bucket_position_cap, _} =
+               AllocationGate.decide(
+                 entry(),
+                 book(totals("0", "0", 3), totals("0", "0", 3)),
+                 budget
+               )
+    end
+
+    test "an enormous headroom/unit ratio terminates" do
+      result =
+        AllocationGate.decide(
+          entry(qty: d("1E50"), price: d("3E-30"), risk_per_unit: d("3E-30")),
+          @empty_book,
+          %{@budget | buckets: %{"tick" => %{}}}
+        )
+
+      assert elem(result, 0) in [:allow, :resize, :reject]
     end
   end
 
@@ -206,7 +312,7 @@ defmodule TradingCore.Regime.AllocationGateTest do
           price <- cents(1, 20_000),
           multiplier <- member_of([1, 100]),
           rpu <- cents(1, 500),
-          size_mult <- cents(0, 100),
+          size_mult <- cents(0, 150),
           lot <- member_of([d("1"), d("10"), d("0.5")])
         ) do
       budget = %{
@@ -291,7 +397,11 @@ defmodule TradingCore.Regime.AllocationGateTest do
       lot = entry.lot_size
       risk = Decimal.mult(lot, entry.risk_per_unit)
       notional = lot |> Decimal.mult(entry.price) |> Decimal.mult(entry.multiplier)
-      sized_lots = entry.qty |> Decimal.mult(entry.size_multiplier) |> Decimal.div(lot)
+
+      sized_lots =
+        entry.qty
+        |> Decimal.mult(Decimal.min(entry.size_multiplier, 1))
+        |> Decimal.div(lot)
 
       one_lot_fits =
         Decimal.compare(sized_lots, 1) != :lt and
@@ -319,6 +429,115 @@ defmodule TradingCore.Regime.AllocationGateTest do
       large = final_qty(AllocationGate.decide(entry, book, bigger))
 
       assert Decimal.compare(large, small) != :lt
+    end
+  end
+
+  property "less book usage never yields a smaller qty" do
+    check all(
+            {entry, book, budget} <- scenario(),
+            pct <- integer(0..100),
+            max_runs: 500
+          ) do
+      shrink = fn d -> d |> Decimal.mult(pct) |> Decimal.div(100) |> Decimal.round(2, :floor) end
+
+      lighter =
+        Map.new(book, fn {k, t} ->
+          {k, %{t | open_risk: shrink.(t.open_risk), gross_notional: shrink.(t.gross_notional)}}
+        end)
+
+      heavy = final_qty(AllocationGate.decide(entry, book, budget))
+      light = final_qty(AllocationGate.decide(entry, lighter, budget))
+
+      assert Decimal.compare(light, heavy) != :lt
+    end
+  end
+
+  # Qty limit each cap implies, recomputed from the returned headroom.
+  defp cap_limits(entry, headroom) do
+    lot = entry.lot_size
+    notional_unit = Decimal.mult(entry.price, entry.multiplier)
+
+    fit = fn
+      nil, _unit ->
+        :infinity
+
+      h, unit ->
+        h
+        |> Decimal.div(unit)
+        |> Decimal.div(lot)
+        |> Decimal.round(0, :floor)
+        |> Decimal.mult(lot)
+    end
+
+    [
+      per_trade_risk_cap: fit.(headroom.per_trade_risk, entry.risk_per_unit),
+      bucket_position_cap:
+        if(headroom.bucket_positions == 0, do: Decimal.new(0), else: :infinity),
+      bucket_risk_cap: fit.(headroom.bucket_risk, entry.risk_per_unit),
+      bucket_notional_cap: fit.(headroom.bucket_notional, notional_unit),
+      portfolio_risk_cap: fit.(headroom.portfolio_risk, entry.risk_per_unit),
+      portfolio_notional_cap: fit.(headroom.portfolio_notional, notional_unit)
+    ]
+  end
+
+  defp below?(:infinity, _x), do: false
+  defp below?(limit, x), do: Decimal.compare(limit, x) == :lt
+
+  property "the reported reason is the first cap in order that binds" do
+    check all({entry, book, budget} <- scenario(), max_runs: 500) do
+      case AllocationGate.decide(entry, book, budget) do
+        {:resize, qty, reason, %{headroom: headroom}} ->
+          limits = cap_limits(entry, headroom)
+
+          {earlier, [{^reason, limit} | _]} =
+            Enum.split_while(limits, fn {r, _} -> r != reason end)
+
+          assert Decimal.equal?(limit, qty)
+
+          assert Enum.all?(earlier, fn {_, l} ->
+                   not below?(l, Decimal.add(qty, entry.lot_size))
+                 end)
+
+        {:reject, :below_one_lot, _} ->
+          :ok
+
+        {:reject, reason, %{headroom: headroom}} ->
+          limits = cap_limits(entry, headroom)
+
+          {earlier, [{^reason, limit} | _]} =
+            Enum.split_while(limits, fn {r, _} -> r != reason end)
+
+          assert below?(limit, entry.lot_size)
+          assert Enum.all?(earlier, fn {_, l} -> not below?(l, entry.lot_size) end)
+
+        {:allow, _, %{binding: nil}} ->
+          :ok
+      end
+    end
+  end
+
+  property "garbage input never raises" do
+    junk =
+      one_of([
+        constant(nil),
+        constant(""),
+        constant("abc"),
+        constant(-1),
+        constant(0),
+        float(),
+        constant(Decimal.new("NaN")),
+        constant(%{})
+      ])
+
+    check all(
+            {entry, book, budget} <- scenario(),
+            key <-
+              member_of([:qty, :price, :multiplier, :lot_size, :size_multiplier, :risk_per_unit]),
+            bad <- junk,
+            max_runs: 500
+          ) do
+      result = AllocationGate.decide(Map.put(entry, key, bad), book, budget)
+      assert elem(result, 0) in [:allow, :resize, :reject]
     end
   end
 end

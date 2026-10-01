@@ -88,6 +88,52 @@ defmodule TradingCore.Regime.ExposureTest do
     end
   end
 
+  describe "bad input never raises" do
+    test "unknown direction or beta is :flat / zero dollars" do
+      for {dir, beta} <- [{"buy", "1"}, {nil, "1"}, {"long", nil}, {"long", "abc"}] do
+        assert Exposure.sign(dir, beta) == :flat
+        assert Decimal.equal?(Exposure.beta_dollars(dir, beta, d("1000")), 0)
+      end
+
+      assert Exposure.sign("SHORT", "-3") == :long_market
+    end
+
+    test "risk_per_unit treats garbage as absent and rounds risk up" do
+      assert {:ok, _, :daily_vol} =
+               Exposure.risk_per_unit(%{
+                 stop_price: "abc",
+                 base_price: d("100"),
+                 daily_vol: d("0.01")
+               })
+
+      assert {:error, :missing_risk_input} =
+               Exposure.risk_per_unit(%{stop_price: d("95"), base_price: d("100"), multiplier: ""})
+
+      assert {:error, :missing_risk_input} =
+               Exposure.risk_per_unit(%{stop_price: Decimal.new("NaN"), base_price: d("100")})
+
+      assert {:error, :missing_risk_input} = Exposure.risk_per_unit(nil)
+
+      assert {:ok, r, :stop} =
+               Exposure.risk_per_unit(%{stop_price: d("100"), base_price: d("100.0000014")})
+
+      assert Decimal.equal?(r, d("0.000002"))
+    end
+
+    test "bucket_totals counts positions with unknown risk" do
+      totals =
+        Exposure.bucket_totals([
+          %{bucket: "a", open_risk: nil, notional: d("100"), beta_dollars: nil},
+          %{bucket: "a", open_risk: d("10"), notional: d("100"), beta_dollars: d("100")}
+        ])
+
+      assert totals["a"].missing_risk_count == 1
+      assert totals.portfolio.missing_risk_count == 1
+      assert Decimal.equal?(totals["a"].open_risk, 10)
+      assert Decimal.equal?(totals["a"].net_beta_dollars, 100)
+    end
+  end
+
   describe "bucket_totals/1" do
     test "empty book has a zero portfolio" do
       assert %{portfolio: %{count: 0} = p} = Exposure.bucket_totals([])

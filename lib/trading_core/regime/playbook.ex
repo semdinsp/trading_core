@@ -39,9 +39,18 @@ defmodule TradingCore.Regime.Playbook do
 
   A `nil` label, or one `TradingCore.Regime.parse_label/1` rejects (it
   returns a bare `:error`), resolves to `opts[:nil_regime]` and is reported
-  with rule id `:nil_regime`. This never raises. The caller decides what
-  counts as stale (e.g. a label from a previous session) and passes `nil`
-  in that case.
+  with rule id `:nil_regime`. The caller decides what counts as stale
+  (e.g. a label from a previous session) and passes `nil` in that case.
+
+  ## Never raises
+
+  `evaluate/4` and `grid/3` run on trading_live's entry path and never
+  raise. A rule that `validate_rule/1` would reject (bad action, a
+  multiplier outside `[0, 1]`, `enabled: nil`, …) is ignored, as is a
+  non-list `tags`. A fallback option that isn't `:block` or
+  `{:allow, m}` with `m` a Decimal, integer or decimal string in
+  `[0, 1]` is treated as `:block` — floats included, since multipliers
+  must never be converted from floats.
 
   ## Options
 
@@ -54,6 +63,7 @@ defmodule TradingCore.Regime.Playbook do
   """
 
   alias TradingCore.Regime
+  alias TradingCore.Regime.Decimals
 
   @type vol :: :calm | :normal | :stressed
   @type trend :: :up | :chop | :down
@@ -91,6 +101,8 @@ defmodule TradingCore.Regime.Playbook do
   """
   @spec evaluate([rule()], strategy_ctx(), String.t() | nil, keyword()) :: decision()
   def evaluate(rules, strategy_ctx, label, opts \\ []) do
+    rules = valid_rules(rules)
+
     case parse(label) do
       {:ok, cell} -> evaluate_cell(rules, strategy_ctx, cell, opts)
       :error -> fallback(Keyword.get(opts, :nil_regime, :block), :nil_regime)
@@ -103,6 +115,8 @@ defmodule TradingCore.Regime.Playbook do
   """
   @spec grid([rule()], strategy_ctx(), keyword()) :: %{{vol(), trend()} => decision()}
   def grid(rules, strategy_ctx, opts \\ []) do
+    rules = valid_rules(rules)
+
     for vol <- @vol_states, trend <- @trend_states, into: %{} do
       {{vol, trend}, evaluate_cell(rules, strategy_ctx, {vol, trend}, opts)}
     end
@@ -117,7 +131,7 @@ defmodule TradingCore.Regime.Playbook do
   converted. For a `:block` rule `size_multiplier` is ignored and
   normalized to `nil`.
   """
-  @spec validate_rule(map()) :: {:ok, rule()} | {:error, [atom()]}
+  @spec validate_rule(term()) :: {:ok, rule()} | {:error, [atom()]}
   def validate_rule(attrs) when is_map(attrs) do
     rule = %{
       id: Map.get(attrs, :id),
@@ -152,7 +166,20 @@ defmodule TradingCore.Regime.Playbook do
     end
   end
 
+  def validate_rule(_attrs), do: {:error, [:invalid_rule]}
+
   ## ---------------------------------------------------------------------
+
+  defp valid_rules(rules) when is_list(rules) do
+    Enum.flat_map(rules, fn rule ->
+      case validate_rule(rule) do
+        {:ok, rule} -> [rule]
+        {:error, _} -> []
+      end
+    end)
+  end
+
+  defp valid_rules(_rules), do: []
 
   defp parse(nil), do: :error
 
@@ -165,7 +192,7 @@ defmodule TradingCore.Regime.Playbook do
 
   defp evaluate_cell(rules, ctx, {vol, trend}, opts) do
     rules
-    |> Enum.filter(&(Map.get(&1, :enabled, true) and matches?(&1, ctx, vol, trend)))
+    |> Enum.filter(&(&1.enabled and matches?(&1, ctx, vol, trend)))
     |> Enum.sort(&ranks_before?/2)
     |> case do
       [] -> fallback(Keyword.get(opts, :default, {:allow, Decimal.new(1)}), :default)
@@ -174,11 +201,14 @@ defmodule TradingCore.Regime.Playbook do
     end
   end
 
-  defp fallback(:block, source), do: {:block, source}
-  defp fallback({:allow, %Decimal{} = m}, source), do: {:allow, m, source}
+  defp fallback({:allow, m}, source) do
+    case validate_multiplier(:allow, m) do
+      {m, []} -> {:allow, m, source}
+      _ -> {:block, source}
+    end
+  end
 
-  defp fallback({:allow, m}, source) when is_integer(m) or is_binary(m),
-    do: {:allow, Decimal.new(m), source}
+  defp fallback(_block_or_invalid, source), do: {:block, source}
 
   defp matches?(rule, ctx, vol, trend) do
     axis_matches?(rule.vol_state, vol) and axis_matches?(rule.trend_state, trend) and
@@ -190,15 +220,18 @@ defmodule TradingCore.Regime.Playbook do
   defp axis_matches?(_, _), do: false
 
   defp selector_matches?(:all, _ctx), do: true
+  defp selector_matches?(_, ctx) when not is_map(ctx), do: false
   defp selector_matches?({:strategy_id, id}, ctx), do: Map.get(ctx, :strategy_id) == id
-  defp selector_matches?({:tag, tag}, ctx), do: tag in Map.get(ctx, :tags, [])
+  defp selector_matches?({:tag, tag}, ctx), do: tag_in?(tag, Map.get(ctx, :tags))
   defp selector_matches?({:exposure, e}, ctx), do: Map.get(ctx, :exposure) == e
-  defp selector_matches?(_, _ctx), do: false
+
+  defp tag_in?(tag, tags) when is_list(tags), do: tag in tags
+  defp tag_in?(_tag, _tags), do: false
 
   # true when a should be chosen over b
   defp ranks_before?(a, b) do
-    ka = {selector_rank(a.selector), label_rank(a), Map.get(a, :priority, 0)}
-    kb = {selector_rank(b.selector), label_rank(b), Map.get(b, :priority, 0)}
+    ka = {selector_rank(a.selector), label_rank(a), a.priority}
+    kb = {selector_rank(b.selector), label_rank(b), b.priority}
 
     cond do
       ka > kb -> true
@@ -238,17 +271,5 @@ defmodule TradingCore.Regime.Playbook do
 
   defp validate_multiplier(_action, value), do: {value, []}
 
-  defp parse_multiplier(%Decimal{} = m),
-    do: if(Decimal.inf?(m) or Decimal.nan?(m), do: :error, else: {:ok, m})
-
-  defp parse_multiplier(m) when is_integer(m), do: {:ok, Decimal.new(m)}
-
-  defp parse_multiplier(m) when is_binary(m) do
-    case Decimal.parse(m) do
-      {d, ""} -> parse_multiplier(d)
-      _ -> :error
-    end
-  end
-
-  defp parse_multiplier(_), do: :error
+  defp parse_multiplier(m), do: Decimals.parse(m, floats: false)
 end

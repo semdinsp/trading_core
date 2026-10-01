@@ -120,6 +120,54 @@ defmodule TradingCore.Regime.PlaybookTest do
     end
   end
 
+  describe "evaluate/4 — malformed input never raises" do
+    test "malformed rules are ignored" do
+      bad = [
+        block("b1", enabled: nil),
+        block("b2", action: "block"),
+        rule("b3", size_multiplier: nil),
+        rule("b4", size_multiplier: Decimal.new(2)),
+        rule("b5", size_multiplier: 0.5),
+        :not_a_rule,
+        nil
+      ]
+
+      for rules <- [bad, Enum.reverse(bad)] do
+        assert {:allow, m, :default} = Playbook.evaluate(rules, @ctx, "calm|up")
+        assert Decimal.equal?(m, 1)
+      end
+
+      assert {:block, :default} = Playbook.evaluate(:nope, @ctx, "calm|up", default: :block)
+    end
+
+    test "nil or non-list tags never match a tag selector" do
+      rules = [block("t", selector: {:tag, "tick"})]
+
+      for ctx <- [%{@ctx | tags: nil}, Map.delete(@ctx, :tags), nil] do
+        assert {:allow, _, :default} = Playbook.evaluate(rules, ctx, "calm|up")
+      end
+    end
+
+    test "invalid fallback options fail closed to :block" do
+      for bad <- [
+            {:allow, 0.5},
+            :half,
+            {:allow, "x"},
+            {:allow, Decimal.new(5)},
+            {:allow, nil},
+            nil
+          ] do
+        assert {:block, :nil_regime} = Playbook.evaluate([], @ctx, nil, nil_regime: bad)
+        assert {:block, :default} = Playbook.evaluate([], @ctx, "calm|up", default: bad)
+      end
+
+      assert {:allow, m, :nil_regime} =
+               Playbook.evaluate([], @ctx, nil, nil_regime: {:allow, "0.5"})
+
+      assert Decimal.equal?(m, @half)
+    end
+  end
+
   describe "grid/3" do
     test "returns all nine cells" do
       rules = [block("a", vol_state: :stressed)]
