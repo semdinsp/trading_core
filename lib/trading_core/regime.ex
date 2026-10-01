@@ -6,13 +6,19 @@ defmodule TradingCore.Regime do
   math a caller (`trading_signal`) needs to compute those states from its
   own persisted session history.
 
-  This is **analysis infrastructure, not a tradeable signal**: unlike
-  every kind in `TradingCore.Signal.Spec`/`TradingCore.Signal.Compute`,
-  nothing here is wired into that DAG, and it is not meant to be — a
-  strategy conditioning its entry rules on a bucket that currently holds
-  three observations is exactly the premature-promotion failure this
-  module is scoped to avoid. Promote to a `Spec` kind only once there are
-  ~20 sessions of history per bucket to make that meaningful.
+  The label is **used for entry gating** through
+  `TradingCore.Regime.Playbook`, which maps a `"vol|trend"` label to
+  allow/block and a size multiplier per strategy, ahead of the budget
+  check in `TradingCore.Regime.AllocationGate`. Those rules are
+  operator-written and coarse (nine cells), not fitted per bucket.
+
+  It is still **not a signal kind**: unlike every kind in
+  `TradingCore.Signal.Spec`/`TradingCore.Signal.Compute`, nothing here is
+  wired into that DAG — a strategy conditioning its own entry rules on a
+  bucket that currently holds three observations is exactly the
+  premature-promotion failure this module is scoped to avoid. Promote to
+  a `Spec` kind only once there are ~20 sessions of history per bucket to
+  make that meaningful.
 
   Same `TradingCore.Signals`-style constraints as the rest of this
   library: no `Repo`, no `GenServer`, no `DateTime.utc_now/0`, no feed of
