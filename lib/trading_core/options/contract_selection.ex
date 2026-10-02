@@ -72,6 +72,16 @@ defmodule TradingCore.Options.ContractSelection do
   a $10 grid while SMH at the same price trades $5 is why $200+ guesses
   10, not 5. With no spot, the guess is the old flat `1.0`.
 
+  Where the guess can still miss:
+
+    * Under $25, `1.0` covers $0.50 and $1 grids but not a $2.50 one
+      (17.5, 20, 22.5): a rounded 21 misses, though its neighbour 20 hits;
+      a rounded 23 misses along with both neighbours.
+    * Some very high-priced names list only every $25 or $50. A `10.0`
+      guess lands on those only when it happens to be a multiple.
+
+  Measure the symbol and add it to the table in either case.
+
   ## Expiry
 
   `"dte_target"` picks the nearest **third Friday** (the standard
