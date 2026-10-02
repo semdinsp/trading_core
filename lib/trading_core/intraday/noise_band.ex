@@ -48,31 +48,22 @@ defmodule TradingCore.Intraday.NoiseBand do
   @precision 8
   @default_lookback 14
 
-  @doc "The noise-band width for `minute` on `today`. See the moduledoc."
+  @doc """
+  The noise-band width for `minute` on `today`. See the moduledoc.
+
+  Raises `ArgumentError` if `opts[:lookback]` is not a positive integer;
+  that's a configuration mistake, not missing history.
+  """
   @spec width(Enumerable.t(), Date.t(), non_neg_integer(), keyword()) ::
           {:ok, Decimal.t()} | {:error, :insufficient_history}
   def width(history_bars, %Date{} = today, minute, opts \\ [])
       when is_integer(minute) and minute >= 0 do
-    lookback = Keyword.get(opts, :lookback, @default_lookback)
+    case Keyword.get(opts, :lookback, @default_lookback) do
+      lookback when is_integer(lookback) and lookback > 0 ->
+        mean_move(history_bars, today, minute, lookback)
 
-    moves =
-      history_bars
-      |> Enum.group_by(&bar_date/1)
-      |> Enum.filter(fn {date, _bars} -> date != :error and Date.compare(date, today) == :lt end)
-      |> Enum.sort_by(fn {date, _bars} -> date end, {:desc, Date})
-      |> Stream.flat_map(fn {date, bars} -> List.wrap(move_at(bars, date, minute)) end)
-      |> Enum.take(lookback)
-
-    if is_integer(lookback) and lookback > 0 and length(moves) == lookback do
-      mean =
-        moves
-        |> Enum.reduce(Decimal.new(0), &Decimal.add/2)
-        |> Decimal.div(lookback)
-        |> Decimal.round(@precision)
-
-      {:ok, mean}
-    else
-      {:error, :insufficient_history}
+      other ->
+        raise ArgumentError, "lookback must be a positive integer, got: #{inspect(other)}"
     end
   end
 
@@ -117,6 +108,28 @@ defmodule TradingCore.Intraday.NoiseBand do
   defdelegate minute_of_day(at, session_date), to: RegularSession
 
   ## ---------------------------------------------------------------------
+
+  defp mean_move(history_bars, today, minute, lookback) do
+    moves =
+      history_bars
+      |> Enum.group_by(&bar_date/1)
+      |> Enum.filter(fn {date, _bars} -> date != :error and Date.compare(date, today) == :lt end)
+      |> Enum.sort_by(fn {date, _bars} -> date end, {:desc, Date})
+      |> Stream.flat_map(fn {date, bars} -> List.wrap(move_at(bars, date, minute)) end)
+      |> Enum.take(lookback)
+
+    if length(moves) == lookback do
+      mean =
+        moves
+        |> Enum.reduce(Decimal.new(0), &Decimal.add/2)
+        |> Decimal.div(lookback)
+        |> Decimal.round(@precision)
+
+      {:ok, mean}
+    else
+      {:error, :insufficient_history}
+    end
+  end
 
   defp bar_date(bar) do
     case RegularSession.local_date(bar) do

@@ -122,6 +122,16 @@ defmodule TradingCore.Intraday.NoiseBandTest do
       assert NoiseBand.width(bars, @today, 5, lookback: 2) == {:error, :insufficient_history}
     end
 
+    test "a lookback that isn't a positive integer raises" do
+      bars = session(~D[2026-09-30], d("101"))
+
+      for bad <- [0, -1, "14", 1.5, nil] do
+        assert_raise ArgumentError, ~r/lookback must be a positive integer/, fn ->
+          NoiseBand.width(bars, @today, 5, lookback: bad)
+        end
+      end
+    end
+
     test "width is rounded to 8 places" do
       bars =
         session(~D[2026-09-30], d("101")) ++
