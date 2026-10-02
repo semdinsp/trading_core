@@ -140,6 +140,14 @@ defmodule TradingCore.MarketContext do
   def keys, do: @keys
 
   @doc """
+  The trading_signal slugs `build/3` reads from `signal_values`, in a
+  stable order: what an app must subscribe to so its stamps can be
+  complete. Use this rather than copying the list.
+  """
+  @spec signal_slugs() :: [String.t()]
+  def signal_slugs, do: Enum.map(@signals, &elem(&1, 1))
+
+  @doc """
   Builds the stamp at `now` from trading_signal's regime payload (`nil`
   for none; atom or string keys) and its latest signal values
   (`%{slug => {value, received_at}}`). See the moduledoc for keys,
