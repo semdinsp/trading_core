@@ -98,4 +98,65 @@ defmodule TradingCore.Options.GammaExposureTest do
     assert GEX.net(@chain, 100, multiplier: 0) == {:error, :invalid_multiplier}
     assert GEX.net(@chain, 100, multiplier: "x") == {:error, :invalid_multiplier}
   end
+
+  describe "expiring_after:" do
+    # Session date 2026-10-02, spot 100: gamma × OI × 10_000 per contract.
+    #   call  0DTE   10-02  0.05 × 1000 = +500_000  (excluded)
+    #   put   expired 10-01 0.01 × 1000 = -100_000  (excluded)
+    #   call  next   10-05  0.02 ×  500 = +100_000
+    #   put   later  10-16  0.04 × 2000 = -800_000
+    #   call  no :expiry    0.01 ×  100 =  +10_000  (excluded under the option)
+    @session ~D[2026-10-02]
+
+    defp mixed_chain do
+      [
+        %{right: :call, gamma: d("0.05"), open_interest: 1000, expiry: ~D[2026-10-02]},
+        %{right: :put, gamma: d("0.01"), open_interest: 1000, expiry: ~D[2026-10-01]},
+        %{right: :call, gamma: d("0.02"), open_interest: 500, expiry: ~D[2026-10-05]},
+        %{right: :put, gamma: d("0.04"), open_interest: 2000, expiry: ~D[2026-10-16]},
+        %{right: :call, gamma: d("0.01"), open_interest: 100}
+      ]
+    end
+
+    test "omitted: every expiry counts, as before" do
+      assert {:ok, result} = GEX.net(mixed_chain(), 100)
+
+      assert_dollars(result.calls, 610_000)
+      assert_dollars(result.puts, -900_000)
+      assert_dollars(result.net, -290_000)
+      assert result.contracts_used == 5
+    end
+
+    test "excludes same-day and expired contracts, and ones without :expiry" do
+      assert {:ok, result} = GEX.net(mixed_chain(), 100, expiring_after: @session)
+
+      assert_dollars(result.calls, 100_000)
+      assert_dollars(result.puts, -800_000)
+      assert_dollars(result.net, -700_000)
+      assert result.contracts_used == 2
+    end
+
+    test "the boundary is strict: expiring on the date is excluded, the day after included" do
+      chain = [%{right: :call, gamma: 1, open_interest: 1, expiry: ~D[2026-10-03]}]
+
+      assert {:ok, %{contracts_used: 1}} = GEX.net(chain, 100, expiring_after: @session)
+
+      assert {:ok, %{contracts_used: 0}} =
+               GEX.net(chain, 100, expiring_after: ~D[2026-10-03])
+    end
+
+    test "a non-Date :expiry is skipped under the option" do
+      chain = [%{right: :call, gamma: 1, open_interest: 1, expiry: "2026-10-16"}]
+
+      assert {:ok, %{contracts_used: 0}} = GEX.net(chain, 100, expiring_after: @session)
+      assert {:ok, %{contracts_used: 1}} = GEX.net(chain, 100)
+    end
+
+    test "an option value that isn't a Date is an error" do
+      for bad <- ["2026-10-02", ~U[2026-10-02 15:30:00Z], 20_261_002] do
+        assert GEX.net(mixed_chain(), 100, expiring_after: bad) ==
+                 {:error, :invalid_expiring_after}
+      end
+    end
+  end
 end
