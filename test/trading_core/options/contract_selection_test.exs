@@ -100,13 +100,37 @@ defmodule TradingCore.Options.ContractSelectionTest do
     end
   end
 
-  describe "strike_increment/1" do
-    test "SPY and QQQ on $5, XLF on $1, XLK and unknowns on the $1 default" do
-      assert CS.strike_increment("SPY") == 5.0
-      assert CS.strike_increment("QQQ") == 5.0
-      assert CS.strike_increment("XLF") == 1.0
-      assert CS.strike_increment("XLK") == 1.0
+  describe "strike_increment/2" do
+    test "measured symbols use their table entry, whatever the spot" do
+      for {symbol, increment} <- [
+            {"SPY", 5.0},
+            {"QQQ", 5.0},
+            {"XLF", 1.0},
+            {"NVDA", 5.0},
+            {"TSLA", 5.0},
+            {"SMH", 5.0},
+            {"SOXL", 5.0},
+            {"AMD", 10.0},
+            {"MU", 10.0}
+          ] do
+        assert CS.strike_increment(symbol) == increment
+        assert CS.strike_increment(symbol, 3.0) == increment
+        assert CS.strike_increment(symbol, 5_000.0) == increment
+      end
+    end
+
+    test "unmeasured symbols guess from spot, coarsest plausible grid" do
+      assert CS.strike_increment("ZZZZ", 24.99) == 1.0
+      assert CS.strike_increment("ZZZZ", 25) == 5.0
+      assert CS.strike_increment("ZZZZ", 199.99) == 5.0
+      assert CS.strike_increment("ZZZZ", 200) == 10.0
+      assert CS.strike_increment("ZZZZ", 1_500.0) == 10.0
+      assert CS.strike_increment("XLK", 275.0) == 10.0
+    end
+
+    test "with no spot an unmeasured symbol falls back to $1" do
       assert CS.strike_increment("ZZZZ") == 1.0
+      assert CS.strike_increment("ZZZZ", nil) == 1.0
     end
   end
 
@@ -157,6 +181,31 @@ defmodule TradingCore.Options.ContractSelectionTest do
                {@feb, 54.0},
                {@feb, 52.0}
              ]
+    end
+
+    # Spots from IBKR on 2026-10-02; the first candidate must be a strike
+    # on the measured Nov-2026 grid, and so must its neighbours.
+    for {symbol, spot, first, up, down} <- [
+          {"NVDA", 231.4, 230.0, 235.0, 225.0},
+          {"TSLA", 355.0, 355.0, 360.0, 350.0},
+          {"SMH", 618.0, 620.0, 625.0, 615.0},
+          {"SOXL", 154.0, 155.0, 160.0, 150.0},
+          {"AMD", 618.0, 620.0, 630.0, 610.0},
+          {"MU", 1088.0, 1090.0, 1100.0, 1080.0}
+        ] do
+      @symbol symbol
+      @spot spot
+      @expected [first, first, first, up, down]
+      test "#{symbol} at #{spot} probes on-grid strikes" do
+        assert {:ok, contracts} = CS.candidates(@symbol, atm(), @spot, @today)
+        assert Enum.map(contracts, & &1.strike) == @expected
+      end
+    end
+
+    test "an unmeasured symbol rounds to its price-based grid" do
+      assert [{@feb, 240.0} | _] = pairs(CS.candidates("ZZZZ", atm(), 236.0, @today))
+      assert [{@feb, 85.0} | _] = pairs(CS.candidates("ZZZZ", atm(), 83.0, @today))
+      assert [{@feb, 12.0} | _] = pairs(CS.candidates("ZZZZ", atm(), 12.3, @today))
     end
 
     test "strikes at or below zero are never probed" do

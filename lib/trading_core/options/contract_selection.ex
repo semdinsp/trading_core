@@ -39,11 +39,48 @@ defmodule TradingCore.Options.ContractSelection do
       XLF   53C ok,  53.5C not found,  54C ok      -> 1.0
       XLK  275C ok, 276C/277.5C/280C not found     -> UNRESOLVED
 
-  XLK is deliberately left out: no single increment fits, so it takes the
-  $1 default and will most likely fail with `:no_listed_contract` until
-  measured properly. No contract beats a wrong one. $1 is the default
-  because it's the densest common grid, so an unknown symbol misses
-  rather than skipping past a strike that exists.
+  and on 2026-10-02 from the ATM strikes of the Nov-20-2026 monthly
+  chains (spot in brackets):
+
+      NVDA  ($231)    -> 5.0
+      TSLA  ($355)    -> 5.0
+      SMH   ($618)    -> 5.0
+      SOXL  ($154)    -> 5.0
+      AMD   ($618)    -> 10.0
+      MU    ($1,088)  -> 10.0
+
+  These are **price-dependent**: an exchange widens a strike grid as the
+  underlying's price rises, so a measured increment can go stale after a
+  large move. Re-measure when a listed symbol starts failing with
+  `:no_listed_contract`.
+
+  XLK is deliberately left out: no single increment fits, so it falls to
+  the price-based guess below and will most likely fail with
+  `:no_listed_contract` until measured properly. No contract beats a
+  wrong one.
+
+  ## Unmeasured symbols: a price-based guess
+
+  A symbol not in the table gets an increment from its spot
+  (`strike_increment/2`): under $25 → 1.0, $25 up to $200 → 5.0, $200 and
+  up → 10.0. Each guess is deliberately the *coarsest* grid plausible at
+  that price, because a strike on a coarse grid is still listed on any
+  finer grid it is a multiple of (230 exists on a $5 grid and a $10 one),
+  while rounding to a grid finer than the real one lands on unlisted
+  strikes (231 on a $5 grid). The cost is ATM precision: the chosen
+  strike can sit up to half an increment from spot. AMD at $618 trading
+  a $10 grid while SMH at the same price trades $5 is why $200+ guesses
+  10, not 5. With no spot, the guess is the old flat `1.0`.
+
+  Where the guess can still miss:
+
+    * Under $25, `1.0` covers $0.50 and $1 grids but not a $2.50 one
+      (17.5, 20, 22.5): a rounded 21 misses, though its neighbour 20 hits;
+      a rounded 23 misses along with both neighbours.
+    * Some very high-priced names list only every $25 or $50. A `10.0`
+      guess lands on those only when it happens to be a multiple.
+
+  Measure the symbol and add it to the table in either case.
 
   ## Expiry
 
@@ -84,9 +121,26 @@ defmodule TradingCore.Options.ContractSelection do
   @type contract :: %{expiry: String.t(), strike: float(), right: String.t()}
 
   # Strike grid per underlying; see the moduledoc for how each was
-  # measured and why XLK is absent.
-  @strike_increments %{"SPY" => 5.0, "QQQ" => 5.0, "XLF" => 1.0}
+  # measured and why XLK is absent. The NVDA..MU entries were measured from
+  # the Nov-2026 monthly chains on 2026-10-02 and are price-dependent: the
+  # exchange grid widens as the price rises.
+  @strike_increments %{
+    "SPY" => 5.0,
+    "QQQ" => 5.0,
+    "XLF" => 1.0,
+    "NVDA" => 5.0,
+    "TSLA" => 5.0,
+    "SMH" => 5.0,
+    "SOXL" => 5.0,
+    "AMD" => 10.0,
+    "MU" => 10.0
+  }
   @default_increment 1.0
+
+  # {upper spot bound (exclusive), increment} for symbols not in the
+  # table; see "Unmeasured symbols" in the moduledoc.
+  @price_tiers [{25, 1.0}, {200, 5.0}]
+  @top_tier_increment 10.0
 
   @default_dte_target 45
 
@@ -95,7 +149,7 @@ defmodule TradingCore.Options.ContractSelection do
   underlying's `spot` and the caller's ET trading date `today`.
 
   For `"atm_offset"`, the target is `spot + strike_offset`, rounded to
-  `strike_increment(symbol)`. The rounded strike comes first on each
+  `strike_increment(symbol, spot)`. The rounded strike comes first on each
   expiry candidate in order, then one grid step above and below on the
   FIRST expiry only. The order matters because every miss costs 10s. On
   a $5 grid the rounded strike is essentially always listed, so a miss
@@ -115,7 +169,7 @@ defmodule TradingCore.Options.ContractSelection do
          {:ok, offset} <- fetch_offset(config),
          {:ok, expiries} <- expiry_candidates(config, today),
          :ok <- check_spot(spot) do
-      increment = strike_increment(symbol)
+      increment = strike_increment(symbol, spot)
       rounded = round_to_grid(spot + offset, increment)
       [first | _] = expiries
 
@@ -215,11 +269,26 @@ defmodule TradingCore.Options.ContractSelection do
   end
 
   @doc """
-  The strike grid for `symbol`: `5.0` for SPY and QQQ, `1.0` for XLF,
-  and `#{@default_increment}` for anything else. See the moduledoc.
+  The strike grid for `symbol`: the measured increment when the symbol is
+  in the table, otherwise a guess from `spot` (under $25 → 1.0, under
+  $200 → 5.0, else 10.0), or `#{@default_increment}` when `spot` is `nil`.
+  See the moduledoc for the table and why the guess errs coarse.
   """
-  @spec strike_increment(String.t()) :: float()
-  def strike_increment(symbol), do: Map.get(@strike_increments, symbol, @default_increment)
+  @spec strike_increment(String.t(), number() | nil) :: float()
+  def strike_increment(symbol, spot \\ nil) do
+    case Map.fetch(@strike_increments, symbol) do
+      {:ok, increment} -> increment
+      :error -> price_increment(spot)
+    end
+  end
+
+  defp price_increment(spot) when is_number(spot) do
+    Enum.find_value(@price_tiers, @top_tier_increment, fn {below, increment} ->
+      if spot < below, do: increment
+    end)
+  end
+
+  defp price_increment(_spot), do: @default_increment
 
   defp third_friday?(date), do: Date.day_of_week(date) == 5 and date.day in 15..21
 
