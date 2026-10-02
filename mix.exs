@@ -7,7 +7,9 @@ defmodule TradingCore.MixProject do
       version: "0.2.0",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      # Shared fixtures that test files Code.require_file/2 themselves.
+      test_ignore_filters: [&String.starts_with?(&1, "test/support/")]
     ]
   end
 
