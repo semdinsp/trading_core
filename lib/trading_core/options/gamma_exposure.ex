@@ -42,10 +42,15 @@ defmodule TradingCore.Options.GammaExposure do
   ## Options
 
   - `:multiplier` — contract multiplier, default `100`; must be positive.
+  - `:expiring_after` — a `Date`. Only contracts whose `:expiry` (a
+    `Date`, as `TradingCore.Options.Occ.parse/1` returns) is **strictly
+    after** it count. Pass the session date (US/Eastern) to get "ex-0DTE"
+    exposure: same-day and already-expired contracts drop out. Under
+    this option a contract with no `:expiry`, or one that isn't a `Date`,
+    is skipped and not counted, since it can't be shown to qualify.
+    Omitted, every expiry counts.
 
-  Contracts may carry extra keys (e.g. `:expiry`), so a filter such as
-  "0DTE only" can be added later as another option without changing the
-  contract shape.
+  Contracts may carry other keys too; they are ignored.
   """
 
   alias TradingCore.Regime.Decimals
@@ -71,25 +76,30 @@ defmodule TradingCore.Options.GammaExposure do
   Net gamma exposure of `contracts` at `spot`. See the moduledoc.
 
   `{:error, :invalid_spot}` unless `spot` is a positive number;
-  `{:error, :invalid_multiplier}` unless `opts[:multiplier]` is. Never
-  raises on malformed contracts; they are skipped.
+  `{:error, :invalid_multiplier}` unless `opts[:multiplier]` is;
+  `{:error, :invalid_expiring_after}` when `opts[:expiring_after]` is
+  given but isn't a `Date`. Never raises on malformed contracts; they
+  are skipped.
   """
   @spec net(Enumerable.t(), number() | Decimal.t() | String.t(), keyword()) ::
-          {:ok, result()} | {:error, :invalid_spot | :invalid_multiplier}
+          {:ok, result()}
+          | {:error, :invalid_spot | :invalid_multiplier | :invalid_expiring_after}
   def net(contracts, spot, opts \\ []) do
     with {:spot, {:ok, spot}} <- {:spot, Decimals.parse(spot, :pos, [])},
          {:multiplier, {:ok, multiplier}} <-
            {:multiplier,
-            Decimals.parse(Keyword.get(opts, :multiplier, @default_multiplier), :pos, [])} do
+            Decimals.parse(Keyword.get(opts, :multiplier, @default_multiplier), :pos, [])},
+         {:expiry, {:ok, included?}} <-
+           {:expiry, expiry_filter(Keyword.get(opts, :expiring_after))} do
       scale = spot |> Decimal.mult(spot) |> Decimal.mult(@one_percent) |> Decimal.mult(multiplier)
 
       {calls, puts, used} =
         Enum.reduce(contracts, {Decimal.new(0), Decimal.new(0), 0}, fn contract,
                                                                        {calls, puts, used} ->
-          case contribution(contract, scale) do
+          case included?.(contract) && contribution(contract, scale) do
             {:call, gex} -> {Decimal.add(calls, gex), puts, used + 1}
             {:put, gex} -> {calls, Decimal.sub(puts, gex), used + 1}
-            :skip -> {calls, puts, used}
+            skip when skip in [:skip, false] -> {calls, puts, used}
           end
         end)
 
@@ -103,8 +113,21 @@ defmodule TradingCore.Options.GammaExposure do
     else
       {:spot, :error} -> {:error, :invalid_spot}
       {:multiplier, :error} -> {:error, :invalid_multiplier}
+      {:expiry, :error} -> {:error, :invalid_expiring_after}
     end
   end
+
+  defp expiry_filter(nil), do: {:ok, fn _contract -> true end}
+
+  defp expiry_filter(%Date{} = after_date) do
+    {:ok,
+     fn
+       %{expiry: %Date{} = expiry} -> Date.compare(expiry, after_date) == :gt
+       _contract -> false
+     end}
+  end
+
+  defp expiry_filter(_invalid), do: :error
 
   # Unsigned dollar gamma for one usable contract, tagged by side.
   defp contribution(%{right: right} = contract, scale) when right in [:call, :put] do
