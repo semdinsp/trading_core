@@ -111,7 +111,10 @@ defmodule TradingCore.Options.ContractSelectionTest do
             {"SMH", 5.0},
             {"SOXL", 5.0},
             {"AMD", 10.0},
-            {"MU", 10.0}
+            {"MU", 10.0},
+            {"TLT", 1.0},
+            {"XLE", 1.0},
+            {"RSP", 1.0}
           ] do
         assert CS.strike_increment(symbol) == increment
         assert CS.strike_increment(symbol, 3.0) == increment
@@ -183,7 +186,8 @@ defmodule TradingCore.Options.ContractSelectionTest do
              ]
     end
 
-    # Spots from IBKR on 2026-10-02; the first candidate must be a strike
+    # Spots from IBKR on 2026-10-02 (TLT/XLE/RSP: trading_options_sim, 10-01;
+    # RSP 210.5 rounds half away from zero to 211). The first candidate must be a strike
     # on the measured Nov-2026 grid, and so must its neighbours.
     for {symbol, spot, first, up, down} <- [
           {"NVDA", 231.4, 230.0, 235.0, 225.0},
@@ -191,7 +195,10 @@ defmodule TradingCore.Options.ContractSelectionTest do
           {"SMH", 618.0, 620.0, 625.0, 615.0},
           {"SOXL", 154.0, 155.0, 160.0, 150.0},
           {"AMD", 618.0, 620.0, 630.0, 610.0},
-          {"MU", 1088.0, 1090.0, 1100.0, 1080.0}
+          {"MU", 1088.0, 1090.0, 1100.0, 1080.0},
+          {"TLT", 78.3, 78.0, 79.0, 77.0},
+          {"XLE", 62.4, 62.0, 63.0, 61.0},
+          {"RSP", 210.5, 211.0, 212.0, 210.0}
         ] do
       @symbol symbol
       @spot spot

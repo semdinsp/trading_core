@@ -49,6 +49,15 @@ defmodule TradingCore.Options.ContractSelection do
       AMD   ($618)    -> 10.0
       MU    ($1,088)  -> 10.0
 
+  and from contracts trading_options_sim resolved and traded live on
+  2026-09-30 and 2026-10-01 on the Nov-20-2026 monthly ($1 strikes, so
+  these must not take the price-based guess below, which would move
+  running ATM experiments up to half a $5/$10 grid off the money):
+
+      TLT   ($78)     78C ok                       -> 1.0
+      XLE   ($62)     62C ok                       -> 1.0
+      RSP   ($210)   210C ok                       -> 1.0
+
   These are **price-dependent**: an exchange widens a strike grid as the
   underlying's price rises, so a measured increment can go stale after a
   large move. Re-measure when a listed symbol starts failing with
@@ -133,7 +142,11 @@ defmodule TradingCore.Options.ContractSelection do
     "SMH" => 5.0,
     "SOXL" => 5.0,
     "AMD" => 10.0,
-    "MU" => 10.0
+    "MU" => 10.0,
+    # Resolved and traded live by trading_options_sim on 2026-09-30/10-01.
+    "TLT" => 1.0,
+    "XLE" => 1.0,
+    "RSP" => 1.0
   }
   @default_increment 1.0
 
