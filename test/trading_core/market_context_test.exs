@@ -47,6 +47,19 @@ defmodule TradingCore.MarketContextTest do
     assert stamp == %{"market_context_version" => 1, "captured_at" => "2026-10-02T16:00:00Z"}
   end
 
+  test "signal_slugs/0 is exactly the slugs build/3 reads" do
+    slugs = MarketContext.signal_slugs()
+    assert length(slugs) == 22 and length(Enum.uniq(slugs)) == 22
+
+    # Every listed slug produces a key; an unlisted one produces nothing.
+    values = Map.new(slugs, &{&1, {1, @noon}})
+    stamp = MarketContext.build(nil, values, @noon)
+    assert map_size(stamp["as_of"]) == 22
+
+    assert MarketContext.build(nil, %{"not_a_listed_slug" => {1, @noon}}, @noon)
+           |> Map.has_key?("as_of") == false
+  end
+
   test "every key build/3 writes is listed in keys/0" do
     stamp = MarketContext.build(payload(), signals(), @noon)
     assert Map.keys(stamp) -- MarketContext.keys() == []
