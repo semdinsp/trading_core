@@ -646,9 +646,23 @@ defmodule TradingCore.Backtest do
   end
 
   defp compute_global_one(name, spec, specs, bars_by_symbol, literal_series, acc) do
-    parent_series = resolve_input_series(spec, specs, bars_by_symbol, literal_series, acc)
+    parent_series =
+      spec
+      |> resolve_input_series(specs, bars_by_symbol, literal_series, acc)
+      |> without_nil_inputs()
+
     replay_wrapping_signal(name, spec, parent_series)
   end
+
+  # A nil entry in an input series (a literal_series gap, a bar without
+  # :vwap) is "no value", not a number: strip it before replay, the same
+  # way the per-symbol path skips a nil input. Two-input kinds still see
+  # nil on one side before that side's first value (merge_series/2) and
+  # handle it themselves.
+  defp without_nil_inputs({series_a, series_b}),
+    do: {drop_nil_values(series_a), drop_nil_values(series_b)}
+
+  defp without_nil_inputs(series), do: drop_nil_values(series)
 
   # For a wrapping global spec, gathers the {ts, value} series (or pair of
   # series, for value/reference or direction/gate kinds) it needs — either
@@ -770,7 +784,7 @@ defmodule TradingCore.Backtest do
     value_series
     |> merge_series(reference_series)
     |> Enum.map(fn {ts, value, reference} ->
-      {ts, Signals.percent_deviation(value, reference)}
+      {ts, both_present(value, reference, &Signals.percent_deviation/2)}
     end)
     |> drop_nil_values()
   end
@@ -780,7 +794,9 @@ defmodule TradingCore.Backtest do
 
     value_series
     |> merge_series(reference_series)
-    |> Enum.map(fn {ts, value, reference} -> {ts, Signals.ratio(value, reference, opts)} end)
+    |> Enum.map(fn {ts, value, reference} ->
+      {ts, both_present(value, reference, &Signals.ratio(&1, &2, opts))}
+    end)
     |> drop_nil_values()
   end
 
@@ -794,12 +810,15 @@ defmodule TradingCore.Backtest do
     {series, _final_state} =
       value_series
       |> merge_series(reference_series)
-      |> Enum.map_reduce({[], TradingCore.WelfordAcc.new()}, fn {ts, value, reference},
-                                                                {history, welford} ->
-        {new_history, new_welford, result} =
-          Signals.spread_zscore(history, welford, value, reference, ts, opts)
+      |> Enum.map_reduce({[], TradingCore.WelfordAcc.new()}, fn
+        {ts, value, reference}, state when is_nil(value) or is_nil(reference) ->
+          {{ts, nil}, state}
 
-        {{ts, result}, {new_history, new_welford}}
+        {ts, value, reference}, {history, welford} ->
+          {new_history, new_welford, result} =
+            Signals.spread_zscore(history, welford, value, reference, ts, opts)
+
+          {{ts, result}, {new_history, new_welford}}
       end)
 
     drop_nil_values(series)
@@ -812,7 +831,7 @@ defmodule TradingCore.Backtest do
     direction_series
     |> merge_series(gate_series)
     |> Enum.map(fn {ts, direction, gate} ->
-      {ts, Signals.regime(direction, gate, tick_deadband, vix_gate_zscore)}
+      {ts, both_present(direction, gate, &Signals.regime(&1, &2, tick_deadband, vix_gate_zscore))}
     end)
   end
 
@@ -840,6 +859,11 @@ defmodule TradingCore.Backtest do
   end
 
   defp drop_nil_values(series), do: Enum.reject(series, fn {_ts, value} -> is_nil(value) end)
+
+  # A two-input signal has no value until both inputs do (one series can
+  # start later than the other).
+  defp both_present(a, b, _fun) when is_nil(a) or is_nil(b), do: nil
+  defp both_present(a, b, fun), do: fun.(a, b)
 
   ## -----------------------------------------------------------------------
   ## Per-symbol walk
