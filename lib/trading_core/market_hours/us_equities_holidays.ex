@@ -14,6 +14,14 @@ defmodule TradingCore.MarketHours.UsEquitiesHolidays do
 
   Does not include early-close (half) days — this only answers "is the
   market fully closed," not "is it closing early."
+
+  Starts at 2023: `holiday?/1` answers `false` for any earlier date, so a
+  backtest further back than that would treat its holidays as trading
+  days. Add the earlier years first if one is needed.
+
+  Also lists **unscheduled** full closures the exchanges announced at
+  short notice (e.g. a national day of mourning), since a backtest or a
+  data fetch over that date must treat it as a non-trading day too.
   """
 
   # New Year's Day, MLK Day, Presidents Day, Good Friday, Memorial Day,
@@ -27,8 +35,36 @@ defmodule TradingCore.MarketHours.UsEquitiesHolidays do
   # Memorial, Labor, Thanksgiving) are already always weekdays by
   # definition and never need this shift.
   @holidays MapSet.new([
+              # 2023 and 2024 checked against NYSE Group's "2022, 2023 and
+              # 2024 Holiday and Early Closings Calendar" release
+              # (2021-12-27), 2026-10-04.
+              # 2023 — New Year's Day (Sunday) observed Monday Jan 2.
+              ~D[2023-01-02],
+              ~D[2023-01-16],
+              ~D[2023-02-20],
+              ~D[2023-04-07],
+              ~D[2023-05-29],
+              ~D[2023-06-19],
+              ~D[2023-07-04],
+              ~D[2023-09-04],
+              ~D[2023-11-23],
+              ~D[2023-12-25],
+              # 2024
+              ~D[2024-01-01],
+              ~D[2024-01-15],
+              ~D[2024-02-19],
+              ~D[2024-03-29],
+              ~D[2024-05-27],
+              ~D[2024-06-19],
+              ~D[2024-07-04],
+              ~D[2024-09-02],
+              ~D[2024-11-28],
+              ~D[2024-12-25],
               # 2025
               ~D[2025-01-01],
+              # Unscheduled: national day of mourning for President
+              # Carter (NYSE announcement, 2024-12-30).
+              ~D[2025-01-09],
               ~D[2025-01-20],
               ~D[2025-02-17],
               ~D[2025-04-18],

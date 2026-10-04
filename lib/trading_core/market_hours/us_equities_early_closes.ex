@@ -19,6 +19,14 @@ defmodule TradingCore.MarketHours.UsEquitiesEarlyCloses do
   @timezone "America/New_York"
 
   @early_closes %{
+    # 2023–2024 checked against NYSE Group's 2022–2024 calendar release
+    # (2021-12-27), 2026-10-04. 2023 has no Christmas Eve early close
+    # (December 24 was a Sunday).
+    ~D[2023-07-03] => ~T[13:00:00],
+    ~D[2023-11-24] => ~T[13:00:00],
+    ~D[2024-07-03] => ~T[13:00:00],
+    ~D[2024-11-29] => ~T[13:00:00],
+    ~D[2024-12-24] => ~T[13:00:00],
     # 2025 — day before Independence Day, day after Thanksgiving,
     # Christmas Eve.
     ~D[2025-07-03] => ~T[13:00:00],
