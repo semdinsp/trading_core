@@ -859,10 +859,10 @@ defmodule TradingCore.BacktestTest do
     test "estimate_daily_vol/3 matches a hand-computed stdev of daily returns" do
       # Returns: (102-100)/100=0.02, (99-102)/102≈-0.029412, (105-99)/99≈0.060606
       bars = [
-        bar(0, 100, 101, 99, 100),
-        bar(1, 101, 103, 100, 102),
-        bar(2, 100, 101, 97, 99),
-        bar(3, 103, 106, 98, 105)
+        daily(0, 100, 101, 99, 100),
+        daily(1, 101, 103, 100, 102),
+        daily(2, 100, 101, 97, 99),
+        daily(3, 103, 106, 98, 105)
       ]
 
       assert {:ok, daily_vol} = Backtest.estimate_daily_vol(bars, 3, 20)
@@ -908,13 +908,13 @@ defmodule TradingCore.BacktestTest do
       signal_specs = %{"close_price" => %{kind: :price}}
 
       bars = [
-        bar(0, 98, 99, 97, 98),
-        bar(1, 99, 100, 98, 99),
-        bar(2, 99, 101, 98, 101),
+        daily(0, 98, 99, 97, 98),
+        daily(1, 99, 100, 98, 99),
+        daily(2, 99, 101, 98, 101),
         # entry fires here (close 105 > 100), fills at bar 4's open
-        bar(3, 101, 106, 100, 105),
-        bar(4, 106, 108, 105, 106),
-        bar(5, 106, 107, 105, 106)
+        daily(3, 101, 106, 100, 105),
+        daily(4, 106, 108, 105, 106),
+        daily(5, 106, 107, 105, 106)
       ]
 
       bars_by_symbol = %{"AAPL" => bars}
