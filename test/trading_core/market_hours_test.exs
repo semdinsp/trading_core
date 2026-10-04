@@ -386,6 +386,56 @@ defmodule TradingCore.MarketHoursTest do
       refute MarketHours.holiday?("US_EQUITIES", ~D[2027-12-31])
     end
 
+    test "2023 and 2024 match NYSE's published closures" do
+      closures = fn year ->
+        Date.range(Date.new!(year, 1, 1), Date.new!(year, 12, 31))
+        |> Enum.filter(&MarketHours.holiday?("US_EQUITIES", &1))
+      end
+
+      assert closures.(2023) == [
+               ~D[2023-01-02],
+               ~D[2023-01-16],
+               ~D[2023-02-20],
+               ~D[2023-04-07],
+               ~D[2023-05-29],
+               ~D[2023-06-19],
+               ~D[2023-07-04],
+               ~D[2023-09-04],
+               ~D[2023-11-23],
+               ~D[2023-12-25]
+             ]
+
+      assert closures.(2024) == [
+               ~D[2024-01-01],
+               ~D[2024-01-15],
+               ~D[2024-02-19],
+               ~D[2024-03-29],
+               ~D[2024-05-27],
+               ~D[2024-06-19],
+               ~D[2024-07-04],
+               ~D[2024-09-02],
+               ~D[2024-11-28],
+               ~D[2024-12-25]
+             ]
+    end
+
+    test "the unscheduled 2025-01-09 closure (President Carter) is listed" do
+      assert MarketHours.holiday?("US_EQUITIES", ~D[2025-01-09])
+      refute MarketHours.holiday?("US_EQUITIES", ~D[2025-01-08])
+      refute MarketHours.holiday?("US_EQUITIES", ~D[2025-01-10])
+    end
+
+    test "2023 and 2024 early closes" do
+      early = fn date -> MarketHours.early_close("US_EQUITIES", date) end
+
+      for date <- [~D[2023-07-03], ~D[2023-11-24], ~D[2024-07-03], ~D[2024-11-29], ~D[2024-12-24]] do
+        assert early.(date) == {~T[13:00:00], "America/New_York"}, "#{date}"
+      end
+
+      # December 24, 2023 was a Sunday: no Christmas Eve early close.
+      assert early.(~D[2023-12-22]) == nil
+    end
+
     # A deliberate tripwire: this goes red about 400 days before the
     # calendar runs out, so it is extended before option expiries (up to
     # ~120 DTE, via ContractSelection.monthly_expiry/1) or session checks
