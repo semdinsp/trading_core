@@ -143,6 +143,17 @@ defmodule TradingCore.BacktestFlattenTest do
       assert run.exit_reason == "eod_flatten"
     end
 
+    test "data ending on the session's last minute bar flattens; ending mid-session is end_of_data" do
+      at_close = [flatten_at: ~T[16:00:00], signal_specs: @specs]
+
+      assert {:ok, [run]} = run(minutes(@thu, ~T[15:40:00], ~T[15:59:00], 101), at_close)
+      assert run.exit_reason == "eod_flatten"
+      assert run.exit_at == et(@thu, ~T[15:59:00])
+
+      assert {:ok, [run]} = run(minutes(@thu, ~T[11:40:00], ~T[12:00:00], 101), at_close)
+      assert run.exit_reason == "end_of_data"
+    end
+
     test "an intrabar stop on the flatten bar wins over the flatten" do
       strategy =
         put_in(@strategy, ["params", "risk_controls"], %{
