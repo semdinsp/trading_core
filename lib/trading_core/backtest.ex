@@ -57,6 +57,17 @@ defmodule TradingCore.Backtest do
       `20`); intraday bars are collapsed to one close per trading day
       first (see `estimate_daily_vol/3`). Ignored entirely if
       `position_sizing["method"] != "volatility_target"`.
+    - `:sizing_vol` — the `daily_vol` estimator for `"volatility_target"`
+      sizing: `:stdev` (default; standard deviation of the last
+      `:volatility_window` daily close-to-close returns) or `:ewma`,
+      trading_hub's estimator that live sizing uses
+      (`trailing_ewma_vol_sync/4` via trading_system's `DailyVolCache`,
+      reproduced by `TradingCore.Volatility.ewma_daily_vol/2`): RiskMetrics
+      EWMA of `|ln|` daily returns over `:sizing_vol_lookback_days`
+      calendar days (default `14`) with decay `:sizing_vol_lambda`
+      (default `0.94`). Both use the same one-close-per-ET-trading-day
+      series, with today's close so far at the signal bar. Any other
+      value is `{:error, :invalid_sizing_vol}`.
     - `:target_dollar_volatility` — required only when
       `position_sizing["method"] == "volatility_target"`, same meaning as
       `TradingCore.PositionSizing.calculate_qty/2`'s context key.
@@ -119,7 +130,10 @@ defmodule TradingCore.Backtest do
   - **Safety net.** A position still open on the last bar of a session
     (a data gap skipped the cutoff bar), or on a bar outside any
     session, is flattened at that bar's close the same way, so nothing is
-    held overnight. A run's very last bar is still `"end_of_data"`.
+    held overnight. When the data itself ends, its last bar flattens only
+    if that bar's minute reaches the cutoff (the data ends on the
+    session's final minute bar); data that stops mid-session still closes
+    as `"end_of_data"`.
   - **No entries in the window.** An entry fills at the next bar's open,
     so a signal is acted on only when both its bar and the fill bar are
     in the same session, at or after the 09:30 open and before the
@@ -147,9 +161,16 @@ defmodule TradingCore.Backtest do
           "stopped_out" | "target_hit" | "rule_exit" | "end_of_data" | "eod_flatten",
         stop_method: "percent_of_entry" | "volatility_multiple",
         stop_daily_vol: Decimal.t() | nil,
+        entry_stop_loss_price: Decimal.t() | nil,
+        entry_take_profit_price: Decimal.t() | nil,
         qty: Decimal.t(),
         pnl: Decimal.t()
       }
+
+  `entry_stop_loss_price`/`entry_take_profit_price` are the levels as set
+  when the run opened (after `:round_numbers`), before any
+  `exit_strategy` ratchet or trail moved the stop or cleared the target,
+  so a caller can compute risk at entry (R) from them.
 
   `pnl = (exit_price - entry_price) * qty` for `"long"`, inverted for
   `"short"` — same sign convention `TradingSystem.Trading.Workers.CloseRunWorker`'s
@@ -465,11 +486,17 @@ defmodule TradingCore.Backtest do
           exit_reason: String.t(),
           stop_method: String.t(),
           stop_daily_vol: Decimal.t() | nil,
+          entry_stop_loss_price: Decimal.t() | nil,
+          entry_take_profit_price: Decimal.t() | nil,
           qty: Decimal.t(),
           pnl: Decimal.t()
         }
 
   @default_volatility_window 20
+  # trading_hub's trailing_ewma_vol_sync/4 defaults, which live
+  # volatility_target sizing uses via trading_system's DailyVolCache.
+  @hub_vol_lookback_days 14
+  @hub_vol_lambda 0.94
   @eastern "America/New_York"
   @regular_close ~T[16:00:00]
 
@@ -478,7 +505,8 @@ defmodule TradingCore.Backtest do
   shape. Returns `{:ok, [run_result()]}` on success, or
   `{:error, reason}` if `opts[:signal_specs]` is missing/malformed for a
   signal the rules actually reference, `{:error, :invalid_flatten_at}`
-  if `opts[:flatten_at]` is neither `nil` nor a `Time`, or a required
+  if `opts[:flatten_at]` is neither `nil` nor a `Time`,
+  `{:error, :invalid_sizing_vol}` for an unknown `opts[:sizing_vol]`, or a required
   `position_sizing` context value is missing for every symbol (nothing
   to backtest).
   """
@@ -497,7 +525,8 @@ defmodule TradingCore.Backtest do
       |> Enum.reject(&run_local?/1)
 
     with :ok <- validate_specs(needed_names, signal_specs),
-         :ok <- validate_flatten_at(Keyword.get(opts, :flatten_at)) do
+         :ok <- validate_flatten_at(Keyword.get(opts, :flatten_at)),
+         :ok <- validate_sizing_vol(Keyword.get(opts, :sizing_vol, :stdev)) do
       global_series = compute_global_series(signal_specs, bars_by_symbol, literal_series)
 
       runs =
@@ -513,6 +542,9 @@ defmodule TradingCore.Backtest do
   defp validate_flatten_at(nil), do: :ok
   defp validate_flatten_at(%Time{}), do: :ok
   defp validate_flatten_at(_other), do: {:error, :invalid_flatten_at}
+
+  defp validate_sizing_vol(mode) when mode in [:stdev, :ewma], do: :ok
+  defp validate_sizing_vol(_other), do: {:error, :invalid_sizing_vol}
 
   defp run_local?("run_" <> _), do: true
   defp run_local?(_), do: false
@@ -787,7 +819,7 @@ defmodule TradingCore.Backtest do
   # Merges two chronological {ts, value} series into a single {ts, a, b}
   # series, sampling each side last-observation-carried-forward at every
   # timestamp present in either series — the same LOCF discipline
-  # sample_at/2 uses for looking up a :global series against a symbol's
+  # advance_cursors/2 uses for looking up a :global series against a symbol's
   # own bar timeline, applied here so a wrapping :global signal (e.g.
   # regime, built from two other :global series that may not share a
   # timestamp cadence) sees a coherent pair at every point.
@@ -797,7 +829,14 @@ defmodule TradingCore.Backtest do
       |> Enum.uniq()
       |> Enum.sort({:asc, DateTime})
 
-    Enum.map(all_ts, fn ts -> {ts, sample_at(series_a, ts), sample_at(series_b, ts)} end)
+    {merged, _cursors} =
+      Enum.map_reduce(all_ts, {series_a, nil, series_b, nil}, fn ts, {rest_a, a, rest_b, b} ->
+        {rest_a, a} = advance(rest_a, a, ts)
+        {rest_b, b} = advance(rest_b, b, ts)
+        {{ts, a, b}, {rest_a, a, rest_b, b}}
+      end)
+
+    merged
   end
 
   defp drop_nil_values(series), do: Enum.reject(series, fn {_ts, value} -> is_nil(value) end)
@@ -841,13 +880,19 @@ defmodule TradingCore.Backtest do
       signal_state: initial_signal_state,
       position: nil,
       runs: [],
-      sessions: %{}
+      sessions: %{},
+      # name => {series entries not yet reached, latest value reached}
+      global_cursors: Map.new(global_series, fn {name, series} -> {name, {series, nil}} end)
     }
 
     final =
       Enum.reduce(indexed_pairs, acc, fn {{bar, next_bar}, index}, acc ->
+        {global_values, global_cursors} = advance_cursors(acc.global_cursors, bar.ts)
+
         {snapshot, new_signal_state} =
-          build_snapshot(bar, symbol_names, signal_specs, acc.signal_state, global_series)
+          build_snapshot(bar, symbol_names, signal_specs, acc.signal_state, global_values)
+
+        acc = %{acc | global_cursors: global_cursors}
 
         {session, next_session, sessions} =
           bar_sessions(bar, next_bar, flatten_at, acc.sessions)
@@ -957,13 +1002,16 @@ defmodule TradingCore.Backtest do
 
   # Flatten on this bar when it is at/after the session's cutoff, outside
   # any session, or the last bar of its session (a data gap must not let a
-  # position ride overnight). The run's final bar is left to end_of_data.
+  # position ride overnight). When the data ends, the final bar flattens
+  # only if its minute reaches the cutoff (data ending on the session's
+  # last minute bar); data that stops mid-session stays end_of_data.
   defp flatten_now?(_bar, _next_bar, nil, _next_session), do: false
 
   defp flatten_now?(bar, next_bar, session, next_session) do
     session.cutoff == nil or DateTime.compare(bar.ts, session.cutoff) != :lt or
       DateTime.compare(bar.ts, session.open) == :lt or
-      (next_bar != nil and next_session.date != session.date)
+      (next_bar != nil and next_session.date != session.date) or
+      (next_bar == nil and DateTime.diff(session.cutoff, bar.ts) <= 60)
   end
 
   defp fresh_state(%{kind: :self_zscore}), do: {[], TradingCore.WelfordAcc.new()}
@@ -1023,16 +1071,13 @@ defmodule TradingCore.Backtest do
   ## Snapshot construction (per bar)
   ## -----------------------------------------------------------------------
 
-  defp build_snapshot(bar, symbol_names, signal_specs, signal_state, global_series) do
+  defp build_snapshot(bar, symbol_names, signal_specs, signal_state, global_values) do
     {values, new_state} =
       Enum.reduce(symbol_names, {%{}, signal_state}, fn name, {values, state} ->
         spec = Map.fetch!(signal_specs, name)
         {value, new_state_for_name} = compute_symbol_signal(name, spec, bar, values, state)
         {Map.put(values, name, value), Map.put(state, name, new_state_for_name)}
       end)
-
-    global_values =
-      Map.new(global_series, fn {name, series} -> {name, sample_at(series, bar.ts)} end)
 
     snapshot =
       values
@@ -1043,17 +1088,24 @@ defmodule TradingCore.Backtest do
     {snapshot, new_state}
   end
 
-  # Last-observation-carried-forward lookup: the most recent entry in
-  # `series` at or before `ts`, or nil if the series hasn't started yet.
-  defp sample_at(series, ts) do
-    series
-    |> Enum.take_while(fn {entry_ts, _value} -> DateTime.compare(entry_ts, ts) != :gt end)
-    |> List.last()
-    |> case do
-      nil -> nil
-      {_ts, value} -> value
-    end
+  # Each global series is sampled as of each bar: the value of its latest
+  # entry at or before `ts` (nil before its first entry). Bars and series
+  # are both chronological, so a cursor that only moves forward gives the
+  # same answer as searching from the start, in linear time overall.
+  defp advance_cursors(cursors, ts) do
+    Enum.reduce(cursors, {%{}, cursors}, fn {name, {rest, current}}, {values, cursors} ->
+      {rest, current} = advance(rest, current, ts)
+      {Map.put(values, name, current), Map.put(cursors, name, {rest, current})}
+    end)
   end
+
+  defp advance([{entry_ts, value} | rest] = series, current, ts) do
+    if DateTime.compare(entry_ts, ts) != :gt,
+      do: advance(rest, value, ts),
+      else: {series, current}
+  end
+
+  defp advance([], current, _ts), do: {[], current}
 
   defp compute_symbol_signal(name, %{kind: :price}, bar, _values, state) do
     {bar.close, Map.fetch!(state, name)}
@@ -1271,6 +1323,10 @@ defmodule TradingCore.Backtest do
             direction: direction,
             stop_loss_price: stop_loss_price,
             take_profit_price: take_profit_price,
+            # As set at entry; the ratchet later moves stop_loss_price and
+            # may clear take_profit_price.
+            entry_stop_loss_price: stop_loss_price,
+            entry_take_profit_price: take_profit_price,
             stop_method: levels.method,
             stop_daily_vol: levels.daily_vol,
             qty: qty,
@@ -1347,7 +1403,16 @@ defmodule TradingCore.Backtest do
 
     day_index = Keyword.get_lazy(opts, :__day_index__, fn -> day_index(bars) end)
 
-    case daily_vol_at(day_index, index, window) do
+    estimate =
+      case Keyword.get(opts, :sizing_vol, :stdev) do
+        :ewma ->
+          ewma_daily_vol_at(day_index, index, opts)
+
+        :stdev ->
+          daily_vol_at(day_index, index, window)
+      end
+
+    case estimate do
       {:ok, daily_vol} ->
         %{
           daily_vol: daily_vol,
@@ -1451,19 +1516,8 @@ defmodule TradingCore.Backtest do
   defp daily_vol_at(%{rows: rows}, index, _window) when index >= tuple_size(rows),
     do: :insufficient_data
 
-  defp daily_vol_at(%{rows: rows, last_by_date: last_by_date, dates: dates}, index, window) do
-    {today, _regular?, _close} = elem(rows, index)
-
-    prior_closes =
-      dates
-      |> Enum.take_while(&(Date.compare(&1, today) == :lt))
-      |> Enum.take(-(window - 1))
-      |> Enum.map(fn date ->
-        {last_regular, last} = Map.fetch!(last_by_date, date)
-        rows |> elem(last_regular || last) |> elem(2)
-      end)
-
-    trailing = prior_closes ++ [today_close(rows, index, today)]
+  defp daily_vol_at(day_index, index, window) do
+    trailing = day_index |> daily_closes_at(index, window) |> Enum.map(&elem(&1, 1))
 
     if length(trailing) < 2 do
       :insufficient_data
@@ -1476,6 +1530,42 @@ defmodule TradingCore.Backtest do
       {:ok, stdev(returns)}
     end
   end
+
+  # The last `count` daily closes as of the bar at `index`, oldest first,
+  # as {date, close}: prior days' closes, then today's close so far.
+  defp daily_closes_at(%{rows: rows, last_by_date: last_by_date, dates: dates}, index, count) do
+    {today, _regular?, _close} = elem(rows, index)
+
+    prior =
+      dates
+      |> Enum.take_while(&(Date.compare(&1, today) == :lt))
+      |> Enum.take(-(count - 1))
+      |> Enum.map(fn date ->
+        {last_regular, last} = Map.fetch!(last_by_date, date)
+        {date, rows |> elem(last_regular || last) |> elem(2)}
+      end)
+
+    prior ++ [{today, today_close(rows, index, today)}]
+  end
+
+  # The hub's estimator (TradingCore.Volatility.ewma_daily_vol/2, which
+  # matches trailing_ewma_vol_sync/4) over the same daily closes. Its
+  # window is calendar days, so `lookback_days + 1` closes always cover it.
+  defp ewma_daily_vol_at(%{rows: rows} = day_index, index, opts) when index < tuple_size(rows) do
+    lookback_days = Keyword.get(opts, :sizing_vol_lookback_days, @hub_vol_lookback_days)
+    {today, _regular?, _close} = elem(rows, index)
+
+    day_index
+    |> daily_closes_at(index, lookback_days + 1)
+    |> Enum.map(fn {date, close} -> %{ts: date, close: close} end)
+    |> Volatility.ewma_daily_vol(
+      as_of: today,
+      lookback_days: lookback_days,
+      lambda: Keyword.get(opts, :sizing_vol_lambda, @hub_vol_lambda)
+    )
+  end
+
+  defp ewma_daily_vol_at(_day_index, _index, _opts), do: :insufficient_data
 
   # Today's close so far: the latest regular-session bar at or before
   # `index` on `today`, else the bar at `index` itself.
@@ -1688,6 +1778,8 @@ defmodule TradingCore.Backtest do
       exit_reason: exit_reason,
       stop_method: Map.get(position, :stop_method),
       stop_daily_vol: Map.get(position, :stop_daily_vol),
+      entry_stop_loss_price: Map.get(position, :entry_stop_loss_price),
+      entry_take_profit_price: Map.get(position, :entry_take_profit_price),
       qty: position.qty,
       pnl: pnl
     }
