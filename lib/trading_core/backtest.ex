@@ -52,15 +52,21 @@ defmodule TradingCore.Backtest do
     - `:literal_series` — `%{"signal_name" => [{DateTime.t(), Decimal.t()}, ...]}`,
       chronological, for a `:series`-kind signal spec (e.g. VIX) not
       derivable from `bars_by_symbol` itself. Optional; defaults to `%{}`.
-    - `:volatility_window` — trailing-bar window used to estimate
-      `daily_vol` for `"volatility_target"` sizing (default `20`). Ignored
-      entirely if `position_sizing["method"] != "volatility_target"`.
+    - `:volatility_window` — number of trailing **daily** closes used to
+      estimate `daily_vol` for `"volatility_target"` sizing (default
+      `20`); intraday bars are collapsed to one close per trading day
+      first (see `estimate_daily_vol/3`). Ignored entirely if
+      `position_sizing["method"] != "volatility_target"`.
     - `:target_dollar_volatility` — required only when
       `position_sizing["method"] == "volatility_target"`, same meaning as
       `TradingCore.PositionSizing.calculate_qty/2`'s context key.
     - `:intrabar` — `true` to also check stop-loss/take-profit against
       each bar's `high`/`low`, not just its `close` (default `false`). See
       "Exits" below.
+    - `:flatten_at` — a `Time` in US/Eastern, e.g. `~T[15:55:00]`, for
+      **intraday** bars: no position is held past it. Off (`nil`) by
+      default, which leaves results exactly as without it. See
+      "End-of-session flatten" below.
     - `:stop_vol_lookback_days` / `:stop_vol_lambda` — the EWMA window
       (calendar days, default `14`) and decay (default `0.94`) for a
       `"volatility_multiple"` risk_controls method. The defaults match the
@@ -98,6 +104,36 @@ defmodule TradingCore.Backtest do
   checks and the custom exit rule still run afterwards for a bar with no
   intrabar hit.
 
+  ## End-of-session flatten
+
+  With `flatten_at: ~T[15:55:00]`, every bar's time is read in
+  America/New_York (so DST is handled) against the US-equities regular
+  session from `TradingCore.MarketHours`:
+
+  - **Flatten.** An open position is closed at the close of the first bar
+    at or after the cutoff, with `exit_reason: "eod_flatten"`. An
+    `intrabar: true` stop or target hit on that same bar still wins,
+    since it happened before the close. The cutoff keeps the same
+    distance before an early close, so 15:55 becomes 12:55 on a 13:00
+    half day; a `Time` at or after 16:00 means the close itself.
+  - **Safety net.** A position still open on the last bar of a session
+    (a data gap skipped the cutoff bar), or on a bar outside any
+    session, is flattened at that bar's close the same way, so nothing is
+    held overnight. A run's very last bar is still `"end_of_data"`.
+  - **No entries in the window.** An entry fills at the next bar's open,
+    so a signal is acted on only when both its bar and the fill bar are
+    in the same session, at or after the 09:30 open and before the
+    cutoff. Signals in the flatten window, after hours, pre-market or
+    across a session boundary are ignored until the next session opens.
+
+  It is meant for intraday bars. Daily bars have timestamps outside the
+  session, so with `:flatten_at` set they would never enter.
+
+  Live trading_system closes a version with no `close_after_hours` or
+  `time_box_exit_et` when the session actually closes (its 5-minute
+  `market_close` sweep), so `~T[15:55:00]` is a slightly earlier,
+  deliberate choice rather than an exact copy of live.
+
   Returns `{:ok, [run]}` where each `run` is a plain map:
 
       %{
@@ -107,7 +143,8 @@ defmodule TradingCore.Backtest do
         entry_price: Decimal.t(),
         exit_at: DateTime.t(),
         exit_price: Decimal.t(),
-        exit_reason: "stopped_out" | "target_hit" | "rule_exit" | "end_of_data",
+        exit_reason:
+          "stopped_out" | "target_hit" | "rule_exit" | "end_of_data" | "eod_flatten",
         stop_method: "percent_of_entry" | "volatility_multiple",
         stop_daily_vol: Decimal.t() | nil,
         qty: Decimal.t(),
@@ -376,8 +413,8 @@ defmodule TradingCore.Backtest do
     fetched.** Live sizing calls an RPC for the pool's actual daily
     volatility; a backtest has no such RPC. `estimate_daily_vol/2` (below)
     computes a simple realized-volatility estimate — stdev of trailing
-    daily close-to-close returns over `opts[:volatility_window]` bars
-    (default 20) — as a stand-in `daily_vol` input to
+    daily close-to-close returns over `opts[:volatility_window]` daily
+    closes (default 20) — as a stand-in `daily_vol` input to
     `TradingCore.PositionSizing.calculate_qty/2`. This is a real
     approximation, not an equivalent: the live RPC may use a different
     window length, a different estimator (e.g. EWMA, Parkinson/high-low
@@ -396,6 +433,8 @@ defmodule TradingCore.Backtest do
     discipline closely enough to be a reasonable default, though this
     module doesn't enforce anything about *other* symbols or versions.
   """
+
+  alias TradingCore.Intraday.RegularSession
 
   alias TradingCore.{
     ExitStrategy,
@@ -431,13 +470,17 @@ defmodule TradingCore.Backtest do
         }
 
   @default_volatility_window 20
+  @eastern "America/New_York"
+  @regular_close ~T[16:00:00]
 
   @doc """
   Runs a full backtest. See moduledoc for `strategy`/`bars_by_symbol`/`opts`
   shape. Returns `{:ok, [run_result()]}` on success, or
   `{:error, reason}` if `opts[:signal_specs]` is missing/malformed for a
-  signal the rules actually reference, or a required `position_sizing`
-  context value is missing for every symbol (nothing to backtest).
+  signal the rules actually reference, `{:error, :invalid_flatten_at}`
+  if `opts[:flatten_at]` is neither `nil` nor a `Time`, or a required
+  `position_sizing` context value is missing for every symbol (nothing
+  to backtest).
   """
   @spec run(map(), %{String.t() => [bar()]}, keyword()) ::
           {:ok, [run_result()]} | {:error, term()}
@@ -453,7 +496,8 @@ defmodule TradingCore.Backtest do
       |> Enum.uniq()
       |> Enum.reject(&run_local?/1)
 
-    with :ok <- validate_specs(needed_names, signal_specs) do
+    with :ok <- validate_specs(needed_names, signal_specs),
+         :ok <- validate_flatten_at(Keyword.get(opts, :flatten_at)) do
       global_series = compute_global_series(signal_specs, bars_by_symbol, literal_series)
 
       runs =
@@ -465,6 +509,10 @@ defmodule TradingCore.Backtest do
       {:ok, runs}
     end
   end
+
+  defp validate_flatten_at(nil), do: :ok
+  defp validate_flatten_at(%Time{}), do: :ok
+  defp validate_flatten_at(_other), do: {:error, :invalid_flatten_at}
 
   defp run_local?("run_" <> _), do: true
   defp run_local?(_), do: false
@@ -777,39 +825,55 @@ defmodule TradingCore.Backtest do
     initial_signal_state =
       Map.new(symbol_names, fn name -> {name, fresh_state(Map.fetch!(signal_specs, name))} end)
 
-    indexed_bars = Enum.with_index(bars)
+    # Pair each bar with its successor up front: Enum.at/2 inside the
+    # loop made the walk quadratic, which minute bars can't afford.
+    indexed_pairs = bars |> Enum.zip(Enum.drop(bars, 1) ++ [nil]) |> Enum.with_index()
+    flatten_at = Keyword.get(opts, :flatten_at)
+    intrabar? = Keyword.get(opts, :intrabar, false)
+
+    # Built once per symbol; only volatility_target sizing reads it.
+    opts =
+      if match?(%{"method" => "volatility_target"}, position_sizing_config),
+        do: Keyword.put(opts, :__day_index__, day_index(bars)),
+        else: opts
 
     acc = %{
       signal_state: initial_signal_state,
       position: nil,
-      runs: []
+      runs: [],
+      sessions: %{}
     }
 
     final =
-      Enum.reduce(indexed_bars, acc, fn {bar, index}, acc ->
+      Enum.reduce(indexed_pairs, acc, fn {{bar, next_bar}, index}, acc ->
         {snapshot, new_signal_state} =
           build_snapshot(bar, symbol_names, signal_specs, acc.signal_state, global_series)
 
-        next_bar = Enum.at(bars, index + 1)
+        {session, next_session, sessions} =
+          bar_sessions(bar, next_bar, flatten_at, acc.sessions)
 
-        acc = %{acc | signal_state: new_signal_state}
+        acc = %{acc | signal_state: new_signal_state, sessions: sessions}
 
         case acc.position do
           nil ->
-            maybe_enter(
-              acc,
-              symbol,
-              bar,
-              next_bar,
-              snapshot,
-              entry_rule,
-              direction,
-              risk_controls_config,
-              position_sizing_config,
-              bars,
-              index,
-              opts
-            )
+            if entry_allowed?(bar, next_bar, session, next_session) do
+              maybe_enter(
+                acc,
+                symbol,
+                bar,
+                next_bar,
+                snapshot,
+                entry_rule,
+                direction,
+                risk_controls_config,
+                position_sizing_config,
+                bars,
+                index,
+                opts
+              )
+            else
+              acc
+            end
 
           position ->
             maybe_exit(
@@ -822,7 +886,8 @@ defmodule TradingCore.Backtest do
               exit_rule,
               exit_strategy_config,
               direction,
-              Keyword.get(opts, :intrabar, false)
+              intrabar?,
+              flatten_now?(bar, next_bar, session, next_session)
             )
         end
       end)
@@ -830,6 +895,75 @@ defmodule TradingCore.Backtest do
     runs = force_close_open_position(final, symbol, List.last(bars))
 
     Enum.reverse(runs)
+  end
+
+  ## -----------------------------------------------------------------------
+  ## End-of-session flatten (opts[:flatten_at])
+  ## -----------------------------------------------------------------------
+
+  # Without :flatten_at nothing is session-aware: every bar may enter and
+  # nothing is flattened, exactly as before the option existed.
+  defp bar_sessions(_bar, _next_bar, nil, sessions), do: {nil, nil, sessions}
+
+  defp bar_sessions(bar, next_bar, flatten_at, sessions) do
+    {session, sessions} = session_for(bar, flatten_at, sessions)
+    {next_session, sessions} = session_for(next_bar, flatten_at, sessions)
+    {session, next_session, sessions}
+  end
+
+  defp session_for(nil, _flatten_at, sessions), do: {nil, sessions}
+
+  # Session facts for the US/Eastern date a bar falls on, cached per date.
+  # `cutoff` is flatten_at on that date, kept the same distance before an
+  # early close (15:55 -> 12:55 on a 13:00 half day). A date with no
+  # session (weekend, holiday) has `open`/`cutoff` nil.
+  defp session_for(%{ts: ts}, flatten_at, sessions) do
+    date = ts |> DateTime.shift_zone!(@eastern) |> DateTime.to_date()
+
+    case Map.fetch(sessions, date) do
+      {:ok, session} ->
+        {session, sessions}
+
+      :error ->
+        session =
+          case RegularSession.bounds(date) do
+            {:ok, open, close} ->
+              before_close = max(Time.diff(@regular_close, flatten_at), 0)
+              %{date: date, open: open, cutoff: DateTime.add(close, -before_close, :second)}
+
+            :error ->
+              %{date: date, open: nil, cutoff: nil}
+          end
+
+        {session, Map.put(sessions, date, session)}
+    end
+  end
+
+  # An entry fills at next_bar's open, so it is allowed only when both the
+  # signal bar and the fill bar are inside the same session, at or after
+  # its open and before its cutoff: nothing fills into the flatten window,
+  # overnight, or pre-market.
+  defp entry_allowed?(_bar, _next_bar, nil, _next_session), do: true
+  defp entry_allowed?(_bar, nil, _session, _next_session), do: true
+
+  defp entry_allowed?(bar, next_bar, session, next_session) do
+    session.open != nil and next_session.date == session.date and
+      in_window?(bar.ts, session) and in_window?(next_bar.ts, session)
+  end
+
+  defp in_window?(ts, %{open: open, cutoff: cutoff}) do
+    DateTime.compare(ts, open) != :lt and DateTime.compare(ts, cutoff) == :lt
+  end
+
+  # Flatten on this bar when it is at/after the session's cutoff, outside
+  # any session, or the last bar of its session (a data gap must not let a
+  # position ride overnight). The run's final bar is left to end_of_data.
+  defp flatten_now?(_bar, _next_bar, nil, _next_session), do: false
+
+  defp flatten_now?(bar, next_bar, session, next_session) do
+    session.cutoff == nil or DateTime.compare(bar.ts, session.cutoff) != :lt or
+      DateTime.compare(bar.ts, session.open) == :lt or
+      (next_bar != nil and next_session.date != session.date)
   end
 
   defp fresh_state(%{kind: :self_zscore}), do: {[], TradingCore.WelfordAcc.new()}
@@ -1211,7 +1345,9 @@ defmodule TradingCore.Backtest do
     window = Keyword.get(opts, :volatility_window, @default_volatility_window)
     target_dollar_volatility = Keyword.fetch!(opts, :target_dollar_volatility)
 
-    case estimate_daily_vol(bars, index, window) do
+    day_index = Keyword.get_lazy(opts, :__day_index__, fn -> day_index(bars) end)
+
+    case daily_vol_at(day_index, index, window) do
       {:ok, daily_vol} ->
         %{
           daily_vol: daily_vol,
@@ -1234,15 +1370,27 @@ defmodule TradingCore.Backtest do
 
   @doc """
   Estimates a `daily_vol` figure (fractional stdev of close-to-close
-  returns, e.g. `0.02` for 2%) from the `window` bars trailing `bars`'
-  entry at `index` (inclusive of the entry bar itself) — the backtest
-  stand-in for the live `daily_vol` RPC `"volatility_target"` sizing needs
-  (see `TradingCore.PositionSizing.calculate_qty/2`). Returns
-  `{:ok, daily_vol}`, or `:insufficient_data` when fewer than 2 trailing
-  bars (hence fewer than 1 return) are available yet — same "not enough
-  history" gap a freshly-started live volatility service would also have,
-  just resolved differently (a backtest can't fall back to "wait for more
-  ticks," it just can't size this particular entry).
+  **daily** returns, e.g. `0.02` for 2%) as of the bar at `index`, from
+  the last `window` daily closes up to and including that bar — the
+  backtest stand-in for the live `daily_vol` RPC `"volatility_target"`
+  sizing needs (see `TradingCore.PositionSizing.calculate_qty/2`).
+
+  Bars are first collapsed to **one close per US/Eastern trading day**:
+  the close of that day's last regular-session bar (09:30 ET to the
+  close), so pre- and post-market bars never stand in for the close, or
+  the day's last bar when it has no regular-session bar at all (daily
+  bars, whose timestamps sit outside the session). The bar at `index`
+  supplies the current day's close so far. For daily bars this is the
+  same as using the trailing `window` bars directly; for intraday bars
+  it is what makes the figure a *daily* volatility. (Before 2026-10-03
+  intraday bars were used one-per-"day", so minute bars produced roughly
+  a 20-minute volatility and sized positions about √390 ≈ 20× too large.)
+
+  Returns `{:ok, daily_vol}`, or `:insufficient_data` when fewer than 2
+  daily closes (hence fewer than 1 return) are available yet — same "not
+  enough history" gap a freshly-started live volatility service would
+  also have, just resolved differently (a backtest can't fall back to
+  "wait for more ticks," it just can't size this particular entry).
 
   This is a simple realized-volatility estimate, not a reconstruction of
   whatever `trading_hub`'s own volatility RPC actually computes — see this
@@ -1253,8 +1401,69 @@ defmodule TradingCore.Backtest do
   @spec estimate_daily_vol([bar()], non_neg_integer(), pos_integer()) ::
           {:ok, Decimal.t()} | :insufficient_data
   def estimate_daily_vol(bars, index, window) do
-    start_index = max(0, index - window + 1)
-    trailing = bars |> Enum.slice(start_index..index) |> Enum.map(& &1.close)
+    bars |> Enum.take(index + 1) |> day_index() |> daily_vol_at(index, window)
+  end
+
+  # Per-bar facts for daily-close lookups, built in one pass: each bar's
+  # US/Eastern date, whether it is inside that date's regular session,
+  # its close, and every date's ordered index of bars.
+  defp day_index(bars) do
+    {rows, _cache} =
+      Enum.map_reduce(bars, %{}, fn bar, cache ->
+        date = bar.ts |> DateTime.shift_zone!(@eastern) |> DateTime.to_date()
+
+        {bounds, cache} =
+          case Map.fetch(cache, date) do
+            {:ok, bounds} -> {bounds, cache}
+            :error -> RegularSession.bounds(date) |> then(&{&1, Map.put(cache, date, &1)})
+          end
+
+        regular? =
+          match?({:ok, _, _}, bounds) and
+            DateTime.compare(bar.ts, elem(bounds, 1)) != :lt and
+            DateTime.compare(bar.ts, elem(bounds, 2)) == :lt
+
+        {{date, regular?, bar.close}, cache}
+      end)
+
+    rows = List.to_tuple(rows)
+
+    # date => {last regular-session index | nil, last index}, plus the
+    # dates in order.
+    {last_by_date, dates} =
+      rows
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, []}, fn {{date, regular?, _close}, i}, {acc, dates} ->
+        dates = if Map.has_key?(acc, date), do: dates, else: [date | dates]
+
+        acc =
+          Map.update(acc, date, {if(regular?, do: i), i}, fn {last_regular, _last} ->
+            {if(regular?, do: i, else: last_regular), i}
+          end)
+
+        {acc, dates}
+      end)
+
+    %{rows: rows, last_by_date: last_by_date, dates: Enum.reverse(dates)}
+  end
+
+  defp daily_vol_at(%{rows: rows}, index, _window) when index >= tuple_size(rows),
+    do: :insufficient_data
+
+  defp daily_vol_at(%{rows: rows, last_by_date: last_by_date, dates: dates}, index, window) do
+    {today, _regular?, _close} = elem(rows, index)
+
+    prior_closes =
+      dates
+      |> Enum.take_while(&(Date.compare(&1, today) == :lt))
+      |> Enum.take(-(window - 1))
+      |> Enum.map(fn date ->
+        {last_regular, last} = Map.fetch!(last_by_date, date)
+        rows |> elem(last_regular || last) |> elem(2)
+      end)
+
+    trailing = prior_closes ++ [today_close(rows, index, today)]
 
     if length(trailing) < 2 do
       :insufficient_data
@@ -1266,6 +1475,16 @@ defmodule TradingCore.Backtest do
 
       {:ok, stdev(returns)}
     end
+  end
+
+  # Today's close so far: the latest regular-session bar at or before
+  # `index` on `today`, else the bar at `index` itself.
+  defp today_close(rows, index, today) do
+    index
+    |> Stream.iterate(&(&1 - 1))
+    |> Stream.take_while(&(&1 >= 0 and elem(elem(rows, &1), 0) == today))
+    |> Enum.find(index, &elem(elem(rows, &1), 1))
+    |> then(&(rows |> elem(&1) |> elem(2)))
   end
 
   defp stdev(decimals) do
@@ -1298,11 +1517,18 @@ defmodule TradingCore.Backtest do
          exit_rule,
          exit_strategy_config,
          direction,
-         intrabar?
+         intrabar?,
+         flatten_now?
        ) do
     case intrabar? && intrabar_exit(position, bar, direction) do
       {reason, fill_price} ->
         run = close_run(symbol, position, position.direction, fill_price, bar.ts, reason)
+        %{acc | position: nil, runs: [run | acc.runs]}
+
+      # An intrabar stop/target on this bar happened before its close, so
+      # it wins; otherwise the flatten fills at this bar's close.
+      _ when flatten_now? ->
+        run = close_run(symbol, position, position.direction, bar.close, bar.ts, "eod_flatten")
         %{acc | position: nil, runs: [run | acc.runs]}
 
       _ ->
