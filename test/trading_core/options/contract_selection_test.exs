@@ -114,7 +114,7 @@ defmodule TradingCore.Options.ContractSelectionTest do
             {"MU", 10.0},
             {"TLT", 1.0},
             {"XLE", 1.0},
-            {"RSP", 1.0}
+            {"RSP", 5.0}
           ] do
         assert CS.strike_increment(symbol) == increment
         assert CS.strike_increment(symbol, 3.0) == increment
@@ -186,8 +186,8 @@ defmodule TradingCore.Options.ContractSelectionTest do
              ]
     end
 
-    # Spots from IBKR on 2026-10-02 (TLT/XLE/RSP: trading_options_sim, 10-01;
-    # RSP 210.5 rounds half away from zero to 211). The first candidate must be a strike
+    # Spots from IBKR on 2026-10-02 (TLT/XLE: trading_options_sim, 10-01;
+    # RSP: 2026-10-05 close). The first candidate must be a strike
     # on the measured Nov-2026 grid, and so must its neighbours.
     for {symbol, spot, first, up, down} <- [
           {"NVDA", 231.4, 230.0, 235.0, 225.0},
@@ -198,7 +198,8 @@ defmodule TradingCore.Options.ContractSelectionTest do
           {"MU", 1088.0, 1090.0, 1100.0, 1080.0},
           {"TLT", 78.3, 78.0, 79.0, 77.0},
           {"XLE", 62.4, 62.0, 63.0, 61.0},
-          {"RSP", 210.5, 211.0, 212.0, 210.0}
+          {"RSP", 211.8, 210.0, 215.0, 205.0},
+          {"RSP", 213.0, 215.0, 220.0, 210.0}
         ] do
       @symbol symbol
       @spot spot
@@ -206,6 +207,16 @@ defmodule TradingCore.Options.ContractSelectionTest do
       test "#{symbol} at #{spot} probes on-grid strikes" do
         assert {:ok, contracts} = CS.candidates(@symbol, atm(), @spot, @today)
         assert Enum.map(contracts, & &1.strike) == @expected
+      end
+    end
+
+    test "RSP never probes a strike off the $5 grid" do
+      # 211-213 were :not_found live on 2026-10-05; only multiples of 5 list.
+      for spot <- Enum.map(2000..2200, &(&1 / 10)) do
+        assert {:ok, contracts} = CS.candidates("RSP", atm(), spot, @today)
+
+        assert Enum.all?(contracts, &(rem(trunc(&1.strike * 100), 500) == 0)),
+               "RSP at #{spot}: #{inspect(Enum.map(contracts, & &1.strike))}"
       end
     end
 

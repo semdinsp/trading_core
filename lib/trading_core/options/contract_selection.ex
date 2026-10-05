@@ -56,7 +56,19 @@ defmodule TradingCore.Options.ContractSelection do
 
       TLT   ($78)     78C ok                       -> 1.0
       XLE   ($62)     62C ok                       -> 1.0
-      RSP   ($210)   210C ok                       -> 1.0
+
+  Both of those probes are off the $5 grid, so they prove a $1 grid. RSP
+  was first entered at 1.0 from "210C ok" alone, which can't tell a $1
+  grid from a $5 one. Probed on 2026-10-05 after the close (RSP last
+  211.80) through the hub's ContractResolver:
+
+      RSP   ($212)   20261120 P 205/210/215 ok,
+                     211/212/213 not found;
+                     20261218 P 212, 20270115 P 212 not found  -> 5.0
+
+  To measure a grid, probe a strike that is on the candidate grid but
+  not on the next coarser one; a hit on a multiple of both proves
+  nothing.
 
   These are **price-dependent**: an exchange widens a strike grid as the
   underlying's price rises, so a measured increment can go stale after a
@@ -146,7 +158,9 @@ defmodule TradingCore.Options.ContractSelection do
     # Resolved and traded live by trading_options_sim on 2026-09-30/10-01.
     "TLT" => 1.0,
     "XLE" => 1.0,
-    "RSP" => 1.0
+    # $5, probed 2026-10-05; see the moduledoc. Not left to the price
+    # guess, which would say $10 at this price.
+    "RSP" => 5.0
   }
   @default_increment 1.0
 
