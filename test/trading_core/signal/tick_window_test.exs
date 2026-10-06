@@ -391,4 +391,80 @@ defmodule TradingCore.Signal.TickWindowTest do
       assert Map.get(state, :cap_bound_drops, 0) == 0
     end
   end
+
+  describe "compact points" do
+    @t0 ~U[2026-10-06 13:30:00.000000Z]
+    @n 2_000
+
+    # In-memory words per point once `n` points are in the window. Before
+    # integer timestamps a point was ~50+ words (a DateTime alone is ~39).
+    defp words_per_point(state, n), do: :erts_debug.size(state) / n
+
+    defp at(i), do: DateTime.add(@t0, i * 1_000, :microsecond)
+
+    test "a sum point is a handful of words" do
+      sum =
+        Enum.reduce(1..@n, TickWindow.sum_new(), fn i, s ->
+          {s, 0} = TickWindow.sum_push(s, at(i), Decimal.new(i), at(i), 60_000, 100_000)
+          s
+        end)
+
+      assert TickWindow.sum_size(sum) == @n
+      assert words_per_point(sum, @n) < 12
+    end
+
+    test "an rv entry is a handful of words" do
+      rv =
+        Enum.reduce(1..@n, TickWindow.rv_new(5), fn i, r ->
+          {r, 0} = TickWindow.rv_push(r, at(i), 100.0 + i / 100, at(i), 60_000, 100_000)
+          r
+        end)
+
+      assert TickWindow.rv_size(rv) == @n
+      assert words_per_point(rv, @n) < 25
+    end
+
+    test "an ols point is a handful of words" do
+      ols =
+        Enum.reduce(1..@n, TickWindow.ols_new(), fn i, o ->
+          {o, 0} = TickWindow.ols_push(o, at(i), i * 1.0, i * 2.0, at(i), 60_000, 100_000)
+          o
+        end)
+
+      assert TickWindow.ols_size(ols) == @n
+      assert words_per_point(ols, @n) < 20
+    end
+
+    test "the running total is the identical Decimal the plain add/subtract gives" do
+      # Mixed exponents, a negative zero, and expiries at the boundary.
+      values =
+        ["1.50", "-0", "2", "-3.125", "0.0", "1E+2", "-7", "4.000", "-0.5", "9"]
+        |> Enum.map(&Decimal.new/1)
+
+      points = values |> Enum.with_index() |> Enum.map(fn {v, i} -> {at(i * 1_000), v} end)
+
+      # A 3s window at 1s spacing: each push expires points older than 3s.
+      {sum, expected} =
+        Enum.reduce(points, {TickWindow.sum_new(), {[], Decimal.new(0)}}, fn {t, v},
+                                                                             {s, {live, total}} ->
+          {s, 0} = TickWindow.sum_push(s, t, v, t, 3_000, 100_000)
+
+          cutoff = DateTime.add(t, -3_000, :millisecond)
+          live = live ++ [{t, v}]
+
+          {expired, live} =
+            Enum.split_while(live, fn {pt, _} -> DateTime.compare(pt, cutoff) == :lt end)
+
+          total =
+            Enum.reduce(expired, Decimal.add(total, v), fn {_, ev}, acc ->
+              Decimal.sub(acc, ev)
+            end)
+
+          assert TickWindow.sum_total(s) == total
+          {s, {live, total}}
+        end)
+
+      assert TickWindow.sum_total(sum) == elem(expected, 1)
+    end
+  end
 end
