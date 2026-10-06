@@ -30,6 +30,20 @@ defmodule TradingCore.Signal.TickWindow do
       running means and centred co-moments added and removed exactly
       (Welford), rebuilt from the stored points every #{4096} updates.
 
+  ## Compact points
+
+  Points are stored with integer microsecond timestamps
+  (`DateTime.to_unix(at, :microsecond)`), never `DateTime` structs, and
+  `sum_*` stores each `Decimal` as its raw `{sign, coef, exp}` fields,
+  rebuilt into the identical struct on expiry. A `DateTime` is ~39 words
+  and a `Decimal` ~12, so this cuts a point from ~50 words to 5-11: at
+  the open QQQ's 1m `:ofi` window holds tens of thousands of quotes, and
+  struct overhead was most of each worker's heap. The public functions
+  still take `DateTime`s; conversion happens at the push boundary, and
+  window expiry compares integers (`at_us < now_us - window_ms * 1000`),
+  which is the same test as comparing the `DateTime`s at microsecond
+  precision, so results are unchanged.
+
   All of them keep a safety cap on the number of points (the caller
   passes it).
   When the cap has to drop points that are still inside the window, the
@@ -43,8 +57,9 @@ defmodule TradingCore.Signal.TickWindow do
   ## Running sum
   ## -------------------------------------------------------------------
 
+  # A point is {at_us, sign, coef, exp}: see "Compact points".
   @type sum :: %{
-          queue: :queue.queue({DateTime.t(), Decimal.t()}),
+          queue: :queue.queue({integer(), integer(), term(), integer()}),
           total: Decimal.t(),
           size: non_neg_integer()
         }
@@ -68,8 +83,10 @@ defmodule TradingCore.Signal.TickWindow do
         ) ::
           {sum(), non_neg_integer()}
   def sum_push(%{queue: q, total: total, size: size}, at, value, now, window_ms, max_samples) do
-    s = %{queue: :queue.in({at, value}, q), total: Decimal.add(total, value), size: size + 1}
-    s = if window_ms, do: sum_expire(s, DateTime.add(now, -window_ms, :millisecond)), else: s
+    %Decimal{sign: sign, coef: coef, exp: exp} = value
+    point = {to_us(at), sign, coef, exp}
+    s = %{queue: :queue.in(point, q), total: Decimal.add(total, value), size: size + 1}
+    s = if window_ms, do: sum_expire(s, cutoff_us(now, window_ms)), else: s
     sum_cap(s, max_samples, 0)
   end
 
@@ -79,12 +96,12 @@ defmodule TradingCore.Signal.TickWindow do
   @spec sum_size(sum()) :: non_neg_integer()
   def sum_size(%{size: size}), do: size
 
-  defp sum_expire(%{queue: q} = s, cutoff) do
+  defp sum_expire(%{queue: q} = s, cutoff_us) do
     case :queue.peek(q) do
-      {:value, {at, _}} ->
-        if DateTime.compare(at, cutoff) == :lt, do: s |> sum_pop() |> sum_expire(cutoff), else: s
+      {:value, {at_us, _sign, _coef, _exp}} when at_us < cutoff_us ->
+        s |> sum_pop() |> sum_expire(cutoff_us)
 
-      :empty ->
+      _ ->
         s
     end
   end
@@ -95,7 +112,8 @@ defmodule TradingCore.Signal.TickWindow do
   defp sum_cap(s, _max, dropped), do: {s, dropped}
 
   defp sum_pop(%{queue: q, total: total, size: size}) do
-    {{:value, {_at, v}}, q} = :queue.out(q)
+    {{:value, {_at_us, sign, coef, exp}}, q} = :queue.out(q)
+    v = %Decimal{sign: sign, coef: coef, exp: exp}
     %{queue: q, total: Decimal.sub(total, v), size: size - 1}
   end
 
@@ -105,7 +123,7 @@ defmodule TradingCore.Signal.TickWindow do
 
   @typedoc """
   Points are numbered by arrival (`lo`..`hi`). Each entry stores its
-  timestamp, log price, and the squared differences to the points 1 and
+  timestamp (integer microseconds), log price, and the squared differences to the points 1 and
   `k` before it (`nil` if that point was not in the window when it
   arrived).
   """
@@ -113,7 +131,7 @@ defmodule TradingCore.Signal.TickWindow do
           k: pos_integer(),
           lo: integer(),
           hi: integer(),
-          entries: %{integer() => {DateTime.t(), float(), float() | nil, float() | nil}},
+          entries: %{integer() => {integer(), float(), float() | nil, float() | nil}},
           s1: float(),
           sk: float(),
           pushes: non_neg_integer()
@@ -145,13 +163,13 @@ defmodule TradingCore.Signal.TickWindow do
     rv = %{
       rv
       | hi: seq,
-        entries: Map.put(entries, seq, {at, log, d1, dk}),
+        entries: Map.put(entries, seq, {to_us(at), log, d1, dk}),
         s1: rv.s1 + (d1 || 0.0),
         sk: rv.sk + (dk || 0.0),
         pushes: rv.pushes + 1
     }
 
-    rv = if window_ms, do: rv_expire(rv, DateTime.add(now, -window_ms, :millisecond)), else: rv
+    rv = if window_ms, do: rv_expire(rv, cutoff_us(now, window_ms)), else: rv
     {rv, dropped} = rv_cap(rv, max_samples, 0)
 
     rv = if rem(rv.pushes, @resync_every) == 0, do: rv_resync(rv), else: rv
@@ -188,9 +206,9 @@ defmodule TradingCore.Signal.TickWindow do
     %{rv | lo: lo + 1, entries: Map.delete(entries, lo), s1: s1, sk: sk}
   end
 
-  defp rv_expire(%{lo: lo, hi: hi, entries: entries} = rv, cutoff) when lo <= hi do
-    {at, _, _, _} = Map.fetch!(entries, lo)
-    if DateTime.compare(at, cutoff) == :lt, do: rv |> rv_pop() |> rv_expire(cutoff), else: rv
+  defp rv_expire(%{lo: lo, hi: hi, entries: entries} = rv, cutoff_us) when lo <= hi do
+    {at_us, _, _, _} = Map.fetch!(entries, lo)
+    if at_us < cutoff_us, do: rv |> rv_pop() |> rv_expire(cutoff_us), else: rv
   end
 
   defp rv_expire(rv, _cutoff), do: rv
@@ -385,6 +403,7 @@ defmodule TradingCore.Signal.TickWindow do
   vertical line, no fit) is detected exactly rather than through a
   rounding-sized variance.
   """
+  # A point is {seq, at_us, x, y}: see "Compact points".
   @type ols :: %{
           points: :queue.queue(),
           lo: non_neg_integer(),
@@ -433,7 +452,7 @@ defmodule TradingCore.Signal.TickWindow do
         ) ::
           {ols(), non_neg_integer()}
   def ols_push(%{next: seq} = o, at, x, y, now, window_ms, max_samples) do
-    o = o |> ols_add(x, y) |> Map.update!(:points, &:queue.in({seq, at, {x, y}}, &1))
+    o = o |> ols_add(x, y) |> Map.update!(:points, &:queue.in({seq, to_us(at), x, y}, &1))
 
     o = %{
       o
@@ -472,12 +491,12 @@ defmodule TradingCore.Signal.TickWindow do
   # Pops expired, then capped, points off the front, removing each from
   # the moments.
   defp ols_trim(o, now, window_ms, max, dropped \\ 0) do
-    cutoff = if window_ms, do: DateTime.add(now, -window_ms, :millisecond)
+    cutoff_us = if window_ms, do: cutoff_us(now, window_ms)
 
     case :queue.peek(o.points) do
-      {:value, {_seq, at, {x, y}}} ->
+      {:value, {_seq, at_us, x, y}} ->
         cond do
-          cutoff && DateTime.compare(at, cutoff) == :lt ->
+          cutoff_us && at_us < cutoff_us ->
             o |> ols_pop(x, y) |> ols_trim(now, window_ms, max, dropped)
 
           o.size > max ->
@@ -524,7 +543,7 @@ defmodule TradingCore.Signal.TickWindow do
   end
 
   defp ols_resync(%{points: points} = o) do
-    pairs = points |> :queue.to_list() |> Enum.map(&elem(&1, 2))
+    pairs = points |> :queue.to_list() |> Enum.map(fn {_seq, _at_us, x, y} -> {x, y} end)
     n = length(pairs)
 
     if n == 0 do
@@ -542,4 +561,14 @@ defmodule TradingCore.Signal.TickWindow do
       %{o | mx: mx, my: my, cxy: cxy, mxx: mxx}
     end
   end
+
+  ## -------------------------------------------------------------------
+  ## Timestamps
+  ## -------------------------------------------------------------------
+
+  defp to_us(%DateTime{} = at), do: DateTime.to_unix(at, :microsecond)
+
+  # Points with at_us below this are outside the window: the integer form
+  # of DateTime.compare(at, DateTime.add(now, -window_ms, :millisecond)).
+  defp cutoff_us(now, window_ms), do: to_us(now) - window_ms * 1000
 end
