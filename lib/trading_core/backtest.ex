@@ -115,6 +115,38 @@ defmodule TradingCore.Backtest do
   checks and the custom exit rule still run afterwards for a bar with no
   intrabar hit.
 
+  **`exit_strategy` within the bar** (`intrabar: true`). Live applies the
+  ratchet/trail on every tick *before* checking the levels, so the tick
+  that reaches a ratchet trigger clears the take-profit before it can be
+  hit. The backtest reproduces that order on each bar:
+
+    1. The stop as it stood at the bar's open is checked against the
+       adverse extreme (low for a long, high for a short) first, as above.
+    2. `TradingCore.ExitStrategy.check/5` runs against the favourable
+       extreme (high for a long, low for a short).
+       - **Ratchet:** if it fires within the bar, the take-profit is
+         treated as reached first only when the trigger lies beyond it
+         (the ratchet would not fire at the take-profit price itself);
+         then the bar is a `"target_hit"`. Otherwise the trigger came
+         first or at the same price, as live sees it: the take-profit is
+         cleared and the stop moves to its locked level, with no
+         `"target_hit"` on that bar.
+       - **Trailing:** the trail is updated from the favourable extreme
+         (live sees every tick, not only the close). A trail never clears
+         the take-profit, so the take-profit check is unchanged.
+    3. A stop moved within the bar only takes effect from that bar's
+       close check onwards. The bar is never assumed to have hit the new
+       stop after reaching the trigger, since the order of prices inside
+       the bar is unknown.
+
+  (Before 2026-10-07 the ratchet ran only on the close, after the
+  intrabar checks, so a ratchet strategy whose trigger sat at or inside
+  its take-profit banked the take-profit on every winner where live let
+  it run. Intrabar backtests of such strategies from before then
+  understate their winners.) With `intrabar: false` the ratchet already
+  runs on the close before the close-based level check, which is the
+  same order as live at bar resolution.
+
   ## End-of-session flatten
 
   With `flatten_at: ~T[15:55:00]`, every bar's time is read in
@@ -1634,7 +1666,12 @@ defmodule TradingCore.Backtest do
          intrabar?,
          flatten_now?
        ) do
-    case intrabar? && intrabar_exit(position, bar, direction) do
+    {intrabar_hit, position} =
+      if intrabar?,
+        do: intrabar_step(position, bar, direction, exit_strategy_config),
+        else: {nil, position}
+
+    case intrabar_hit do
       {reason, fill_price} ->
         run = close_run(symbol, position, position.direction, fill_price, bar.ts, reason)
         %{acc | position: nil, runs: [run | acc.runs]}
@@ -1737,31 +1774,56 @@ defmodule TradingCore.Backtest do
 
   # {reason, fill_price} if the bar's range reached a level, else nil. The
   # stop wins a bar that touched both (order inside the bar is unknown).
-  defp intrabar_exit(position, bar, "short") do
-    cond do
-      hit_stop_loss?(position, bar.high, "short") ->
-        {"stopped_out", gap_fill(position.stop_loss_price, bar.open, :gt)}
+  # One bar with intrabar: true, in live's order (see "Exits" in the
+  # moduledoc): the stop as of the bar's open against the adverse extreme;
+  # then the exit strategy at the favourable extreme, which may ratchet
+  # (clearing the take-profit) or trail; then the take-profit. Returns
+  # {exit | nil, position}, the position carrying any moved levels.
+  defp intrabar_step(position, bar, direction, exit_strategy_config) do
+    {adverse, favourable} =
+      if direction == "short", do: {bar.high, bar.low}, else: {bar.low, bar.high}
 
-      hit_take_profit?(position, bar.low, "short") ->
-        {"target_hit", gap_fill(position.take_profit_price, bar.open, :lt)}
+    if hit_stop_loss?(position, adverse, direction) do
+      {{"stopped_out", gap_fill(position.stop_loss_price, bar.open, adverse_side(direction))},
+       position}
+    else
+      case exit_strategy_check(position, favourable, direction, exit_strategy_config) do
+        {:ratchet, _new_stop, _updates} ->
+          if target_before_trigger?(position, favourable, direction, exit_strategy_config),
+            do: {target_exit(position, bar, direction), position},
+            else: {nil, apply_ratchet(position, favourable, direction, exit_strategy_config)}
 
-      true ->
-        nil
+        _trail_or_none ->
+          if hit_take_profit?(position, favourable, direction),
+            do: {target_exit(position, bar, direction), position},
+            else: {nil, apply_ratchet(position, favourable, direction, exit_strategy_config)}
+      end
     end
   end
 
-  defp intrabar_exit(position, bar, _long) do
-    cond do
-      hit_stop_loss?(position, bar.low, "long") ->
-        {"stopped_out", gap_fill(position.stop_loss_price, bar.open, :lt)}
+  defp exit_strategy_check(position, price, direction, config),
+    do: ExitStrategy.check(position.entry_price, price, direction, config, position.state)
 
-      hit_take_profit?(position, bar.high, "long") ->
-        {"target_hit", gap_fill(position.take_profit_price, bar.open, :gt)}
+  # The take-profit is reached before a ratchet trigger only when the
+  # trigger lies beyond it: the ratchet would not yet fire at the
+  # take-profit price itself.
+  defp target_before_trigger?(%{take_profit_price: nil}, _favourable, _direction, _config),
+    do: false
 
-      true ->
-        nil
-    end
+  defp target_before_trigger?(position, favourable, direction, config) do
+    hit_take_profit?(position, favourable, direction) and
+      exit_strategy_check(position, position.take_profit_price, direction, config) ==
+        :no_ratchet
   end
+
+  defp target_exit(position, bar, direction),
+    do: {"target_hit", gap_fill(position.take_profit_price, bar.open, favourable_side(direction))}
+
+  defp adverse_side("short"), do: :gt
+  defp adverse_side(_long), do: :lt
+
+  defp favourable_side("short"), do: :lt
+  defp favourable_side(_long), do: :gt
 
   # Fill at `level`, unless the bar opened already beyond it in the
   # `beyond` direction — then at the open, the first price available.
