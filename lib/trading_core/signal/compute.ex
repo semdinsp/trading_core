@@ -570,8 +570,11 @@ defmodule TradingCore.Signal.Compute do
     end
   end
 
+  # :self_zscore honours params["min_span_ms"] as an opt-in warm-up with
+  # no default (derivative_opts/1 only adds it when set); see
+  # Signals.self_zscore/5.
   def step(%Spec{kind: :self_zscore} = spec, state, %{at: now, value: value}) do
-    opts = sampled_window_opts(spec)
+    opts = derivative_opts(spec)
 
     {history, welford, result} =
       Signals.self_zscore(state.history, state.welford, value, now, opts)
@@ -1890,9 +1893,10 @@ defmodule TradingCore.Signal.Compute do
     end
   end
 
-  # sampled_window_opts/1 plus derivative's minimum span:
-  # params["min_span_ms"], else Signals.default_min_span_ms/2. See
-  # "Why a minimum span" on TradingCore.Signals.derivative/4.
+  # sampled_window_opts/1 plus params["min_span_ms"] when it is set. For
+  # :derivative/:second_derivative an unset value means
+  # Signals.default_min_span_ms/2 (applied inside Signals.derivative/4;
+  # see "Why a minimum span" there); :self_zscore has no default.
   defp derivative_opts(%Spec{params: params} = spec) do
     case Map.get(params, "min_span_ms") do
       nil -> sampled_window_opts(spec)
