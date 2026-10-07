@@ -45,6 +45,16 @@ defmodule TradingCore.RuleEngine do
       %{"any" => [condition, condition, ...]}
       %{"not" => condition}
 
+  ## Operators
+
+  Stateless threshold tests: `gt`, `gte`, `lt`, `lte`, `eq` and `ne`
+  (not equal: "exit when the regime is no longer -1"). Transition tests:
+  `crosses_above`, `crosses_below`, `sign_flip`, `changed` (below).
+  `known_ops/0` lists them all. An op not in that list never matches at
+  evaluation time (it is unknown, so it fails closed even under
+  `"not"`); `validate/1` reports it so a caller can reject the rule when
+  it is saved instead.
+
   A missing signal in the snapshot fails closed (the condition is not met)
   — a rule referencing a signal nobody supplied should never be silently
   treated as satisfied. A key present with a `nil` value counts as
@@ -54,7 +64,7 @@ defmodule TradingCore.RuleEngine do
 
   ## Transition operators and the `prev_` convention
 
-  `gt`/`gte`/`lt`/`lte`/`eq` are stateless threshold tests: they ask "is
+  `gt`/`gte`/`lt`/`lte`/`eq`/`ne` are stateless threshold tests: they ask "is
   signal X past threshold T *right now*". A signal jittering around T
   therefore flips true/false/true/false across consecutive evaluations,
   and every `true` is a real trigger. On the exit side that is whipsaw —
@@ -119,9 +129,233 @@ defmodule TradingCore.RuleEngine do
   # (read from `prev_<signal>`) rather than against a threshold alone.
   @transition_ops ["crosses_above", "crosses_below", "sign_flip", "changed"]
 
+  @stateless_ops ["gt", "gte", "lt", "lte", "eq", "ne"]
+
   # The subset of the above that still take a threshold comparand;
   # `sign_flip`/`changed` carry no "value"/"value_signal".
   @thresholded_transition_ops ["crosses_above", "crosses_below"]
+
+  @doc "Every operator `evaluate/2` recognizes: `comparison_ops/0` then `transition_ops/0`."
+  @spec known_ops() :: [String.t()]
+  def known_ops, do: @stateless_ops ++ @transition_ops
+
+  @doc "The stateless threshold operators: `gt`, `gte`, `lt`, `lte`, `eq`, `ne`."
+  @spec comparison_ops() :: [String.t()]
+  def comparison_ops, do: @stateless_ops
+
+  @doc """
+  The transition operators, which also read `prev_<signal>` from the
+  snapshot. A caller that never supplies `prev_` values can use this to
+  reject them in its own rules.
+  """
+  @spec transition_ops() :: [String.t()]
+  def transition_ops, do: @transition_ops
+
+  @typedoc "Where in a rule tree a problem is: map keys and list indices from the root."
+  @type path :: [String.t() | non_neg_integer()]
+
+  @type validation_error ::
+          :unknown_op
+          | :missing_op
+          | :missing_signal
+          | :missing_value
+          | :non_numeric_value
+          | :invalid_value_signal
+          | :invalid_conditions
+          | :empty_any
+          | :transition_op_not_allowed
+          | :invalid_not
+          | :malformed_node
+
+  @doc """
+  Checks a rule tree's shape without evaluating it, so a caller can reject
+  a bad rule when it is saved rather than discover weeks later that it
+  never fires. Walks `"all"`/`"any"`/`"not"` and checks every leaf:
+
+    * `:missing_signal`: no non-empty `"signal"` string.
+    * `:missing_op` / `:unknown_op`: no `"op"`, or one not in `known_ops/0`
+      (e.g. `"neq"`, `"!="`).
+    * `:missing_value`: a stateless op or `crosses_above`/`crosses_below`
+      with neither `"value"` nor `"value_signal"` (or `"value" => nil`).
+      `sign_flip`/`changed` take no comparand.
+    * `:non_numeric_value`: a `"value"` that isn't a number, a `Decimal`
+      or a numeric string.
+    * `:invalid_value_signal`: a `"value_signal"` that isn't a non-empty
+      string.
+    * `:invalid_conditions` / `:invalid_not`: `"all"`/`"any"` not a list,
+      `"not"` not a map.
+    * `:empty_any`: `"any": []`, which can never pass. (`"all": []` is
+      vacuously true and accepted.)
+    * `:transition_op_not_allowed`: a transition op when
+      `allow_transition_ops: false`. Transition ops read `prev_<signal>`,
+      so they only fire where the caller supplies it; an entry path that
+      never does would evaluate them as unknown on every tick. The option
+      defaults to `true`.
+    * `:malformed_node`: a node with none of `"all"`, `"any"`, `"not"`,
+      `"signal"`.
+
+  `nil` and `%{}` are valid at any depth (vacuously true). It accepts
+  everything `evaluate/2` can evaluate and is no stricter. Returns `:ok` or
+  `{:error, [{path, reason}]}` in tree order, where `path` is the keys and
+  list indices from the root, e.g. `["all", 1, "not"]`.
+
+  This only reports. Evaluation is unchanged: anything flagged here is
+  still evaluated as unknown, i.e. it fails closed. `format_errors/1`
+  turns the result into messages; `validate_rules/1` checks an
+  `%{"entry" => ..., "exit" => ...}` pair.
+  """
+  @spec validate(rule() | nil, keyword()) :: :ok | {:error, [{path(), validation_error()}]}
+  def validate(rule, opts \\ []) do
+    case validate_node(rule, [], opts) do
+      [] -> :ok
+      errors -> {:error, errors}
+    end
+  end
+
+  @doc """
+  `validate/2` over a strategy's `%{"entry" => rule, "exit" => rule}`,
+  with each path prefixed by `"entry"` or `"exit"`. A missing side is
+  treated as `nil` (valid). `opts[:entry]` and `opts[:exit]` are the
+  `validate/2` options for each side, e.g.
+  `validate_rules(rules, entry: [allow_transition_ops: false])` for a
+  caller whose entry path never supplies `prev_` values.
+  """
+  @spec validate_rules(map(), keyword()) :: :ok | {:error, [{path(), validation_error()}]}
+  def validate_rules(rules, opts \\ []) when is_map(rules) do
+    errors =
+      Enum.flat_map([entry: "entry", exit: "exit"], fn {side, key} ->
+        validate_node(Map.get(rules, key), [key], Keyword.get(opts, side, []))
+      end)
+
+    if errors == [], do: :ok, else: {:error, errors}
+  end
+
+  @doc """
+  Human-readable messages for `validate/1`'s errors, e.g.
+  `"entry.all[1].not.op: unknown op \"neq\" (use \"ne\")"`. Takes the
+  error list or the whole `{:error, list}` result; `:ok` gives `[]`.
+  """
+  @spec format_errors(:ok | {:error, list()} | list()) :: [String.t()]
+  def format_errors(:ok), do: []
+  def format_errors({:error, errors}), do: format_errors(errors)
+
+  def format_errors(errors) when is_list(errors),
+    do: Enum.map(errors, fn {path, reason} -> "#{format_path(path)}: #{describe(reason)}" end)
+
+  defp format_path([]), do: "rule"
+
+  defp format_path(path) do
+    path
+    |> Enum.map(fn
+      i when is_integer(i) -> "[#{i}]"
+      key -> "." <> key
+    end)
+    |> Enum.join()
+    |> String.trim_leading(".")
+  end
+
+  defp describe(:unknown_op),
+    do: "unknown op (supported: #{Enum.join(@stateless_ops ++ @transition_ops, ", ")})"
+
+  defp describe(:missing_op), do: "missing \"op\""
+  defp describe(:missing_signal), do: "missing \"signal\""
+  defp describe(:missing_value), do: "needs a \"value\" or \"value_signal\""
+  defp describe(:non_numeric_value), do: "\"value\" must be a number or numeric string"
+  defp describe(:invalid_value_signal), do: "\"value_signal\" must be a signal name"
+  defp describe(:invalid_conditions), do: "must be a list of conditions"
+  defp describe(:empty_any), do: "an empty \"any\" can never pass"
+
+  defp describe(:transition_op_not_allowed),
+    do:
+      "transition ops (#{Enum.join(@transition_ops, ", ")}) need prev_ values this path doesn't supply"
+
+  defp describe(:invalid_not), do: "\"not\" must wrap a single condition"
+  defp describe(:malformed_node), do: "not a condition (expects all/any/not or signal/op)"
+
+  defp validate_node(nil, _path, _opts), do: []
+  defp validate_node(rule, _path, _opts) when rule == %{}, do: []
+
+  defp validate_node(%{"all" => conditions}, path, opts),
+    do: validate_list("all", conditions, path, opts)
+
+  defp validate_node(%{"any" => conditions}, path, opts),
+    do: validate_list("any", conditions, path, opts)
+
+  defp validate_node(%{"not" => condition}, path, opts) when is_map(condition),
+    do: validate_node(condition, path ++ ["not"], opts)
+
+  defp validate_node(%{"not" => _other}, path, _opts), do: [{path ++ ["not"], :invalid_not}]
+
+  defp validate_node(%{"signal" => _} = leaf, path, opts), do: validate_leaf(leaf, path, opts)
+  defp validate_node(%{"op" => _} = leaf, path, opts), do: validate_leaf(leaf, path, opts)
+
+  defp validate_node(_malformed, path, _opts), do: [{path, :malformed_node}]
+
+  defp validate_list("any", [], path, _opts), do: [{path ++ ["any"], :empty_any}]
+
+  defp validate_list(key, conditions, path, opts) when is_list(conditions) do
+    conditions
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {condition, i} -> validate_node(condition, path ++ [key, i], opts) end)
+  end
+
+  defp validate_list(key, _conditions, path, _opts), do: [{path ++ [key], :invalid_conditions}]
+
+  defp validate_leaf(leaf, path, opts) do
+    signal_errors =
+      case Map.get(leaf, "signal") do
+        name when is_binary(name) and name != "" -> []
+        _ -> [{path ++ ["signal"], :missing_signal}]
+      end
+
+    op = Map.get(leaf, "op")
+
+    op_errors =
+      cond do
+        is_nil(op) ->
+          [{path ++ ["op"], :missing_op}]
+
+        op in @transition_ops and not Keyword.get(opts, :allow_transition_ops, true) ->
+          [{path ++ ["op"], :transition_op_not_allowed}]
+
+        op in @stateless_ops or op in @transition_ops ->
+          []
+
+        true ->
+          [{path ++ ["op"], :unknown_op}]
+      end
+
+    comparand_errors =
+      if op in @stateless_ops or op in @thresholded_transition_ops,
+        do: validate_comparand(leaf, path),
+        else: []
+
+    signal_errors ++ op_errors ++ comparand_errors
+  end
+
+  defp validate_comparand(%{"value_signal" => name}, _path) when is_binary(name) and name != "",
+    do: []
+
+  defp validate_comparand(%{"value_signal" => _}, path),
+    do: [{path ++ ["value_signal"], :invalid_value_signal}]
+
+  defp validate_comparand(%{"value" => value}, path) when not is_nil(value) do
+    if numeric?(value), do: [], else: [{path ++ ["value"], :non_numeric_value}]
+  end
+
+  defp validate_comparand(_leaf, path), do: [{path ++ ["value"], :missing_value}]
+
+  defp numeric?(value) when is_number(value), do: true
+  defp numeric?(%Decimal{} = value), do: not (Decimal.nan?(value) or Decimal.inf?(value))
+
+  defp numeric?(value) when is_binary(value) do
+    case Decimal.parse(String.trim(value)) do
+      {d, ""} -> numeric?(d)
+      _ -> false
+    end
+  end
+
+  defp numeric?(_value), do: false
 
   @doc """
   `true` if `rule` is satisfied against `snapshot`. A `nil` or empty-map rule
@@ -404,6 +638,8 @@ defmodule TradingCore.RuleEngine do
   end
 
   defp leaf_margin("eq", left, right), do: if(Decimal.equal?(left, right), do: 1.0, else: 0.0)
+  # Like "eq", a pass/fail with no distance to measure.
+  defp leaf_margin("ne", left, right), do: if(Decimal.equal?(left, right), do: 0.0, else: 1.0)
   defp leaf_margin(_unrecognized_op, _left, _right), do: 0.0
 
   # The snapshot key carrying `signal_name`'s value from the previous
@@ -456,6 +692,15 @@ defmodule TradingCore.RuleEngine do
   # A rule literal of `"value" => nil` is malformed JSON for a comparison,
   # not a comparable zero — same fail-closed answer as a missing key.
   defp fetch_comparand(%{"value" => nil}, _snapshot), do: :error
+  # A non-numeric string literal ("abc") is malformed, not a crash:
+  # Decimal.new/1 would raise inside a live exit sweep. validate/1 flags it.
+  defp fetch_comparand(%{"value" => value}, _snapshot) when is_binary(value) do
+    case Decimal.parse(String.trim(value)) do
+      {d, ""} -> {:ok, d}
+      _ -> :error
+    end
+  end
+
   defp fetch_comparand(%{"value" => value}, _snapshot), do: {:ok, to_decimal(value)}
   defp fetch_comparand(_condition, _snapshot), do: :error
 
@@ -489,6 +734,7 @@ defmodule TradingCore.RuleEngine do
   defp compare("lt", left, right), do: Decimal.compare(left, right) == :lt
   defp compare("lte", left, right), do: Decimal.compare(left, right) != :gt
   defp compare("eq", left, right), do: Decimal.compare(left, right) == :eq
+  defp compare("ne", left, right), do: Decimal.compare(left, right) != :eq
   # Unknown rather than false, so a typo'd op fails closed under "not" too.
   defp compare(_unrecognized_op, _left, _right), do: :unknown
 
