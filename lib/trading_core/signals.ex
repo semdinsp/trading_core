@@ -278,9 +278,10 @@ defmodule TradingCore.Signals do
 
   defp span_ms([]), do: 0
 
-  defp span_ms([{newest_at, _} | _] = history) do
-    {oldest_at, _} = List.last(history)
-    DateTime.diff(newest_at, oldest_at, :millisecond)
+  # Entries are any tuple whose first element is its timestamp ({at,
+  # value} or self_zscore's {at, value, float}), newest first.
+  defp span_ms([newest | _] = history) do
+    DateTime.diff(elem(newest, 0), elem(List.last(history), 0), :millisecond)
   end
 
   defp slope(history) when length(history) < 2, do: nil
@@ -555,6 +556,15 @@ defmodule TradingCore.Signals do
   `WelfordAcc`'s own moduledoc explains), then computes
   `(sample - mean) / stdev`.
 
+  `:min_span_ms` is an opt-in warm-up with **no default**: when given, the
+  result is `nil` until the in-window samples span at least that long
+  (newest minus oldest timestamp), so an early-session z-score from a few
+  minutes of samples is never emitted. Unset, behaviour is exactly as
+  before. History older than `:window_ms` is dropped on each new sample,
+  so after a gap longer than the window (an overnight close) the span
+  restarts from the first new sample and each session warms up again;
+  with a window longer than the gap, the earlier samples still count.
+
   Returns `{new_history, new_welford, nil}` when fewer than 2 samples
   remain in the window, or when the window is flat enough that a z-score
   is meaningless — not merely an *exactly* zero variance, but any stdev
@@ -572,7 +582,12 @@ defmodule TradingCore.Signals do
     new_history = sample_and_trim(history, history_entry(now, sample, opts), now, opts)
 
     new_welford = rebuild_welford(new_history)
-    value = zscore(sample, new_welford)
+
+    value =
+      case Keyword.get(opts, :min_span_ms) do
+        nil -> zscore(sample, new_welford)
+        min_span_ms -> if span_ms(new_history) >= min_span_ms, do: zscore(sample, new_welford)
+      end
 
     {new_history, new_welford, value}
   end
