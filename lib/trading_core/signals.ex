@@ -349,6 +349,197 @@ defmodule TradingCore.Signals do
   end
 
   ## ---------------------------------------------------------------------
+  ## MovingAverage
+  ## ---------------------------------------------------------------------
+
+  @typedoc """
+  Running state of `moving_average/4`: `runs` are `{first_bucket,
+  last_bucket, value}` segments of held values, newest first, with
+  integer bucket numbers (see "Time-weighted, by sample-and-hold");
+  `since` is the first bucket covered since the last reset.
+  """
+  @type moving_average_state :: %{
+          runs: [{integer(), integer(), Decimal.t()}],
+          since: integer() | nil
+        }
+
+  @doc "An empty `moving_average/4` state."
+  @spec moving_average_new() :: moving_average_state()
+  def moving_average_new, do: %{runs: [], since: nil}
+
+  @doc """
+  One tick of a time-weighted rolling mean of `value` over `:window_ms`
+  (default #{inspect(@default_window_ms)}) trailing `now`. Returns
+  `{state, mean | nil}`; `nil` while warming up.
+
+  ## Time-weighted, by sample-and-hold
+
+  Time is cut into buckets of `:sample_interval_ms` (default
+  `default_sample_interval_ms/1` of the window, ~#{@samples_per_window}
+  buckets), aligned to the Unix epoch. A bucket's value is the last
+  value received in it, or, if nothing arrived, the value held from
+  before it. The mean is the plain average of the `n = div(window_ms,
+  interval)` buckets ending with `now`'s bucket, so every bucket of time
+  weighs the same however many ticks fell in it: a parent updating at
+  1/s and at 10/s, or a 1-minute replay of it, gives the same mean when
+  it holds the same values. Resolution is one sample interval; values
+  inside a bucket other than its last do not count. Only buckets at or
+  before `now`'s are used (no look-ahead).
+
+  ## Warm-up and resets
+
+  The result is `nil` until the held values cover the whole window
+  (the first covered bucket is at or before the window's first bucket),
+  so a partial window is never averaged. A gap of at least a full window
+  between ticks (an overnight close, a stalled feed) is not held across:
+  the history restarts at the new tick, so the first window of every
+  session warms up again. A restarted process starts empty and warms up
+  the same way.
+
+  `value` is rounded to `:precision` (default #{@default_precision}) on
+  arrival, and the mean is rounded to it as well. Out-of-order ticks
+  (earlier than the newest bucket) are treated as part of the newest
+  bucket.
+  """
+  @spec moving_average(moving_average_state(), sample(), DateTime.t(), keyword()) ::
+          {moving_average_state(), Decimal.t() | nil}
+  def moving_average(state, value, now, opts \\ []) do
+    precision = Keyword.get(opts, :precision, @default_precision)
+    {interval, n} = ma_grid(opts)
+    v = value |> to_decimal() |> Decimal.round(precision)
+    b = bucket(now, interval)
+
+    state = ma_add(state, b, v, n)
+    window_start = b_now(state) - n + 1
+    runs = ma_trim(state.runs, window_start)
+    state = %{state | runs: runs}
+
+    if state.since <= window_start do
+      total =
+        Enum.reduce(runs, Decimal.new(0), fn {first, last, held}, acc ->
+          Decimal.add(acc, Decimal.mult(held, last - first + 1))
+        end)
+
+      {state, total |> Decimal.div(n) |> Decimal.round(precision)}
+    else
+      {state, nil}
+    end
+  end
+
+  @doc """
+  Batch form of `moving_average/4` over chronological `[{at, value}]`
+  points: the mean as of each point, `[{at, mean | nil}]`. Built bucket by
+  bucket from the points directly rather than by folding
+  `moving_average/4`, so the two can be checked against each other; same
+  options and semantics.
+  """
+  @spec moving_average_series([{DateTime.t(), sample()}], keyword()) ::
+          [{DateTime.t(), Decimal.t() | nil}]
+  def moving_average_series(points, opts \\ []) do
+    precision = Keyword.get(opts, :precision, @default_precision)
+    {interval, n} = ma_grid(opts)
+
+    bucketed =
+      Enum.map(points, fn {at, value} ->
+        {at, bucket(at, interval), value |> to_decimal() |> Decimal.round(precision)}
+      end)
+
+    bucketed
+    |> Enum.with_index()
+    |> Enum.map(fn {{at, _b, _v}, i} ->
+      seen = Enum.take(bucketed, i + 1)
+      # Clamp out-of-order buckets forward, as moving_average/4 does.
+      {seen, _} =
+        Enum.map_reduce(seen, nil, fn {a, b, v}, newest ->
+          b = if newest, do: max(b, newest), else: b
+          {{a, b, v}, b}
+        end)
+
+      # The segment since the last gap of at least a full window.
+      segment =
+        seen
+        |> Enum.chunk_while(
+          [],
+          fn {_a, b, _v} = p, acc ->
+            case acc do
+              [{_, prev_b, _} | _] when b - prev_b >= n -> {:cont, Enum.reverse(acc), [p]}
+              _ -> {:cont, [p | acc]}
+            end
+          end,
+          fn acc -> {:cont, Enum.reverse(acc), []} end
+        )
+        |> List.last()
+
+      {_, first_b, _} = hd(segment)
+      {_, now_b, _} = List.last(segment)
+      window_start = now_b - n + 1
+
+      if first_b <= window_start do
+        total =
+          Enum.reduce(window_start..now_b, Decimal.new(0), fn bucket_no, acc ->
+            {_a, _b, held} =
+              segment |> Enum.filter(fn {_, b, _} -> b <= bucket_no end) |> List.last()
+
+            Decimal.add(acc, held)
+          end)
+
+        {at, total |> Decimal.div(n) |> Decimal.round(precision)}
+      else
+        {at, nil}
+      end
+    end)
+  end
+
+  defp ma_grid(opts) do
+    window_ms = Keyword.get(opts, :window_ms, @default_window_ms)
+
+    interval =
+      Keyword.get_lazy(opts, :sample_interval_ms, fn -> default_sample_interval_ms(window_ms) end)
+
+    {interval, max(div(window_ms, interval), 1)}
+  end
+
+  defp b_now(%{runs: [{_first, last, _v} | _]}), do: last
+
+  # Adds `v` in bucket `b`: a restart after a gap of a full window or more,
+  # a replacement within the newest bucket, or the newest run held through
+  # the empty buckets up to `b` and `v` appended. Equal neighbours merge, so
+  # a flat stretch is one run.
+  defp ma_add(%{runs: []}, b, v, _n), do: %{runs: [{b, b, v}], since: b}
+
+  defp ma_add(%{runs: [{first, last, held} | older]} = state, b, v, n) do
+    b = max(b, last)
+
+    cond do
+      b - last >= n ->
+        %{runs: [{b, b, v}], since: b}
+
+      b == last ->
+        runs =
+          if first == last,
+            do: merge_run({b, b, v}, older),
+            else: merge_run({b, b, v}, [{first, last - 1, held} | older])
+
+        %{state | runs: runs}
+
+      true ->
+        %{state | runs: merge_run({b, b, v}, [{first, b - 1, held} | older])}
+    end
+  end
+
+  defp merge_run({_b, last, v}, [{first, _prev_last, held} | older]) when held == v,
+    do: [{first, last, held} | older]
+
+  defp merge_run(run, older), do: [run | older]
+
+  # Drops runs ending before the window and clips the oldest kept one.
+  defp ma_trim(runs, window_start) do
+    runs
+    |> Enum.take_while(fn {_first, last, _v} -> last >= window_start end)
+    |> Enum.map(fn {first, last, v} -> {max(first, window_start), last, v} end)
+  end
+
+  ## ---------------------------------------------------------------------
   ## SelfZscore
   ## ---------------------------------------------------------------------
 

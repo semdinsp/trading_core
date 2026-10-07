@@ -107,6 +107,23 @@ defmodule TradingCore.Signal.ComputePropertyTest do
     end
   end
 
+  property "moving_average: folding step/2 equals replay/3 for any tick series" do
+    check all(ticks <- tick_series_generator()) do
+      spec = %Spec{
+        kind: :moving_average,
+        window_ms: :timer.minutes(5),
+        params: %{"sample_interval_ms" => 5_000}
+      }
+
+      folded = fold(spec, ticks)
+
+      wrapped = %{spec | parent: %Spec{kind: :plain}}
+      replayed = Compute.replay(wrapped, ticks, only: wrapped)
+
+      assert folded == replayed
+    end
+  end
+
   property "percent_deviation: folding step/2 equals replay/3 (both sides on the same tick series)" do
     check all(ticks <- tick_series_generator()) do
       value_base = %Spec{kind: :plain}
