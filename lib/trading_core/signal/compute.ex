@@ -194,7 +194,7 @@ defmodule TradingCore.Signal.Compute do
       `:effective_spread` (read top-of-book quote fields rather than a
       price series — see "Quote merging" above)
     * single-parent (wraps `:parent`'s emitted values): `:derivative`,
-      `:second_derivative`, `:wavelet`, `:self_zscore`
+      `:second_derivative`, `:wavelet`, `:self_zscore`, `:moving_average`
     * dual-parent (`:parent` vs. `:reference`): `:percent_deviation`,
       `:zscore`, `:ratio`, `:regime`
 
@@ -321,6 +321,7 @@ defmodule TradingCore.Signal.Compute do
   def init(%Spec{kind: :rolling_volume}), do: {:ok, %{readings: []}}
 
   def init(%Spec{kind: :self_zscore}), do: {:ok, %{history: [], welford: WelfordAcc.new()}}
+  def init(%Spec{kind: :moving_average}), do: {:ok, %{ma: Signals.moving_average_new()}}
 
   def init(%Spec{kind: kind})
       when kind in [:percent_deviation, :ratio] do
@@ -577,6 +578,16 @@ defmodule TradingCore.Signal.Compute do
 
     state = track_cap_drops(state, state.history, history, now, opts)
     {%{state | history: history, welford: welford}, warm(result)}
+  end
+
+  # :moving_average: a time-weighted rolling mean of its parent, sampled
+  # and held at the same fixed interval as :self_zscore
+  # (params["sample_interval_ms"], else default_sample_interval_ms/1 of
+  # window_ms); :warming_up until the window is fully covered. See
+  # TradingCore.Signals.moving_average/4.
+  def step(%Spec{kind: :moving_average} = spec, state, %{at: now, value: value}) do
+    {ma, result} = Signals.moving_average(state.ma, value, now, sampled_window_opts(spec))
+    {%{state | ma: ma}, warm(result)}
   end
 
   def step(%Spec{kind: :percent_deviation}, state, tick) do
@@ -1725,7 +1736,7 @@ defmodule TradingCore.Signal.Compute do
   # a plain function of the already-computed series instead. Not ready
   # unless the parent actually emitted a real value here.
   defp tick_for(%Spec{kind: kind, parent: parent}, at, _ticks_by_base_and_at, series)
-       when kind in [:derivative, :second_derivative, :wavelet, :self_zscore] do
+       when kind in [:derivative, :second_derivative, :wavelet, :self_zscore, :moving_average] do
     case List.first(Map.fetch!(series, parent)) do
       :warming_up -> :not_ready
       parent_value -> %{at: at, value: parent_value}
@@ -1795,7 +1806,7 @@ defmodule TradingCore.Signal.Compute do
   # "quietly wrong, not obviously broken" failure this library exists to
   # rule out.
   defp validate_node!(%Spec{kind: kind, parent: nil})
-       when kind in [:derivative, :second_derivative, :wavelet, :self_zscore] do
+       when kind in [:derivative, :second_derivative, :wavelet, :self_zscore, :moving_average] do
     raise ArgumentError, "#{inspect(kind)} spec requires a :parent"
   end
 

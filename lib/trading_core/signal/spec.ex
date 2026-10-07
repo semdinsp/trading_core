@@ -15,8 +15,8 @@ defmodule TradingCore.Signal.Spec do
     * `:kind` — which computation to run. One of `TradingCore.Signal.Compute`'s
       known kinds: `:plain`, `:momentum`, `:derivative`, `:second_derivative`,
       `:wavelet`, `:volume`, `:vwap`, `:donchian`, `:rolling_volume`,
-      `:self_zscore`, `:percent_deviation`, `:zscore`, `:regime`, `:ratio`,
-      `:spread`.
+      `:self_zscore`, `:moving_average`, `:percent_deviation`, `:zscore`,
+      `:regime`, `:ratio`, `:spread`.
     * `:symbol` — the underlying instrument this spec is ultimately scoped
       to, or `nil` for a spec whose only inputs are its `:parent`/
       `:reference` (every wrapping kind — see `TradingSignal.Signals.SignalDefinition`'s
@@ -59,6 +59,7 @@ defmodule TradingCore.Signal.Spec do
       somewhere to carry it without extra plumbing later.
     * `:parent` — the single wrapped spec, for a single-parent kind
       (`derivative`, `second_derivative`, `wavelet`, `self_zscore`,
+      `moving_average`,
       `rolling_volume`'s underlying reading source is `:symbol`-driven, not
       `:parent`-driven — see below) or the "value"/"direction" side of a
       dual-parent kind (`percent_deviation`, `zscore`, `ratio`, `regime`).
@@ -142,6 +143,7 @@ defmodule TradingCore.Signal.Spec do
           | :donchian
           | :rolling_volume
           | :self_zscore
+          | :moving_average
           | :percent_deviation
           | :zscore
           | :regime
@@ -189,7 +191,7 @@ defmodule TradingCore.Signal.Spec do
 
   # Mirrors @single_parent_kinds: wrap exactly one parent's own value
   # stream over time.
-  @single_parent_kinds ~w(derivative second_derivative wavelet self_zscore)a
+  @single_parent_kinds ~w(derivative second_derivative wavelet self_zscore moving_average)a
 
   # Mirrors @dual_parent_kinds: compare a "value"/"direction" parent
   # against a separate "reference"/"gate" parent's current value.
