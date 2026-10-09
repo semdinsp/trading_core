@@ -59,6 +59,24 @@ defmodule TradingCore.PositionSizing do
     returned as-is (`true`) or rounded UP to the nearest whole share
     (`false`) — see the moduledoc's "Fractional shares" section.
 
+  - `"fixed_notional"` — `notional / price`: about `config["notional"]`
+    dollars of the instrument. Requires a positive `context[:price]`
+    (`{:error, :price_required}` when missing or zero).
+  - `"percent_equity"` — `equity * percent / price`, `config["percent"]`
+    a fraction (`0.1` = 10%). Requires `context[:equity]`
+    (`:equity_required`) and a positive `context[:price]`.
+  - `"risk_based"` — `equity * risk_percent / |entry_price - stop_loss_price|`,
+    so the distance to the stop risks `config["risk_percent"]` (a
+    fraction) of equity. Requires `context[:equity]`,
+    `context[:entry_price]` and `context[:stop_loss_price]`
+    (`:stop_loss_price_required` when either is missing or they are equal).
+
+  For these three, `context[:fractional_shares_enabled]` is optional:
+  `false` rounds UP to a whole share, like `"volatility_target"`; absent
+  or `true` returns the raw quotient (`trading_system`'s behaviour). A
+  config missing its own key (e.g. `"fixed_notional"` without
+  `"notional"`) is `{:error, :unknown_sizing_method}`.
+
   Returns `{:ok, Decimal.t()}` or `{:error, reason}`. Never fabricates a
   quantity on error — callers must not fall back to a guessed value.
   """
@@ -98,7 +116,57 @@ defmodule TradingCore.PositionSizing do
     end
   end
 
+  def calculate_qty(%{"method" => "fixed_notional", "notional" => notional}, context) do
+    with {:ok, notional} <- to_decimal(notional),
+         {:ok, price} <- positive_price(context) do
+      {:ok, notional |> Decimal.div(price) |> whole_shares(context)}
+    end
+  end
+
+  def calculate_qty(%{"method" => "percent_equity", "percent" => percent}, context) do
+    with {:ok, percent} <- to_decimal(percent),
+         {:ok, equity} <- decimal_context(context, :equity, :equity_required),
+         {:ok, price} <- positive_price(context) do
+      {:ok, equity |> Decimal.mult(percent) |> Decimal.div(price) |> whole_shares(context)}
+    end
+  end
+
+  def calculate_qty(%{"method" => "risk_based", "risk_percent" => risk_percent}, context) do
+    with {:ok, risk_percent} <- to_decimal(risk_percent),
+         {:ok, equity} <- decimal_context(context, :equity, :equity_required),
+         {:ok, entry} <- decimal_context(context, :entry_price, :stop_loss_price_required),
+         {:ok, stop} <- decimal_context(context, :stop_loss_price, :stop_loss_price_required) do
+      distance = entry |> Decimal.sub(stop) |> Decimal.abs()
+
+      if Decimal.eq?(distance, 0) do
+        {:error, :stop_loss_price_required}
+      else
+        {:ok,
+         equity |> Decimal.mult(risk_percent) |> Decimal.div(distance) |> whole_shares(context)}
+      end
+    end
+  end
+
   def calculate_qty(_config, _context), do: {:error, :unknown_sizing_method}
+
+  # A missing or non-positive price can't size anything.
+  defp positive_price(context) do
+    with {:ok, price} <- decimal_context(context, :price, :price_required) do
+      if Decimal.compare(price, 0) == :gt, do: {:ok, price}, else: {:error, :price_required}
+    end
+  end
+
+  defp decimal_context(context, key, error) do
+    with {:ok, value} <- fetch_context(context, key, error), do: to_decimal(value)
+  end
+
+  # Rounds up to a whole share only when fractional shares are explicitly
+  # off; see calculate_qty/2's doc.
+  defp whole_shares(qty, context) do
+    if Map.get(context, :fractional_shares_enabled, true),
+      do: qty,
+      else: Decimal.round(qty, 0, :up)
+  end
 
   @doc """
   Shared glue for the `"volatility_target"` method: resolves `:symbol` and

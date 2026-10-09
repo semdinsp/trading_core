@@ -57,6 +57,11 @@ defmodule TradingCore.Backtest do
       `20`); intraday bars are collapsed to one close per trading day
       first (see `estimate_daily_vol/3`). Ignored entirely if
       `position_sizing["method"] != "volatility_target"`.
+    - `:sizing_equity` — a fixed account size (a `Decimal` or number) for
+      `"percent_equity"` and `"risk_based"` sizing; a backtest has no live
+      equity. Required for those two methods (`{:error,
+      :sizing_equity_required}` otherwise); ignored by the others.
+      `"fixed_notional"` needs no equity: it sizes `notional / entry_price`.
     - `:sizing_vol` — the `daily_vol` estimator for `"volatility_target"`
       sizing: `:stdev` (default; standard deviation of the last
       `:volatility_window` daily close-to-close returns) or `:ewma`,
@@ -538,7 +543,9 @@ defmodule TradingCore.Backtest do
   `{:error, reason}` if `opts[:signal_specs]` is missing/malformed for a
   signal the rules actually reference, `{:error, :invalid_flatten_at}`
   if `opts[:flatten_at]` is neither `nil` nor a `Time`,
-  `{:error, :invalid_sizing_vol}` for an unknown `opts[:sizing_vol]`, or a required
+  `{:error, :invalid_sizing_vol}` for an unknown `opts[:sizing_vol]`,
+  `{:error, :sizing_equity_required}` for `"percent_equity"`/`"risk_based"`
+  sizing without a positive `opts[:sizing_equity]`, or a required
   `position_sizing` context value is missing for every symbol (nothing
   to backtest).
   """
@@ -558,7 +565,8 @@ defmodule TradingCore.Backtest do
 
     with :ok <- validate_specs(needed_names, signal_specs),
          :ok <- validate_flatten_at(Keyword.get(opts, :flatten_at)),
-         :ok <- validate_sizing_vol(Keyword.get(opts, :sizing_vol, :stdev)) do
+         :ok <- validate_sizing_vol(Keyword.get(opts, :sizing_vol, :stdev)),
+         :ok <- validate_sizing_equity(strategy, Keyword.get(opts, :sizing_equity)) do
       global_series = compute_global_series(signal_specs, bars_by_symbol, literal_series)
 
       runs =
@@ -574,6 +582,22 @@ defmodule TradingCore.Backtest do
   defp validate_flatten_at(nil), do: :ok
   defp validate_flatten_at(%Time{}), do: :ok
   defp validate_flatten_at(_other), do: {:error, :invalid_flatten_at}
+
+  # A backtest has no live account equity: the equity-based methods need a
+  # caller-chosen :sizing_equity, and get an error rather than a guess.
+  defp validate_sizing_equity(strategy, sizing_equity) do
+    method = get_in(strategy, ["position_sizing", "method"])
+
+    cond do
+      method not in ["percent_equity", "risk_based"] -> :ok
+      positive_number?(sizing_equity) -> :ok
+      true -> {:error, :sizing_equity_required}
+    end
+  end
+
+  defp positive_number?(%Decimal{} = d), do: Decimal.compare(d, 0) == :gt
+  defp positive_number?(n) when is_number(n), do: n > 0
+  defp positive_number?(_), do: false
 
   defp validate_sizing_vol(mode) when mode in [:stdev, :ewma], do: :ok
   defp validate_sizing_vol(_other), do: {:error, :invalid_sizing_vol}
@@ -1370,6 +1394,7 @@ defmodule TradingCore.Backtest do
 
       sizing_context =
         build_sizing_context(position_sizing_config, entry_price, bars, index, opts)
+        |> Map.put(:stop_loss_price, stop_loss_price)
 
       case PositionSizing.calculate_qty(position_sizing_config, sizing_context) do
         {:ok, qty} ->
@@ -1485,6 +1510,21 @@ defmodule TradingCore.Backtest do
       :insufficient_data ->
         %{}
     end
+  end
+
+  # fixed_notional / percent_equity / risk_based: the entry price, an
+  # account size from opts[:sizing_equity] (run/3 refuses to start without
+  # one for the two equity methods), and the entry for risk_based's stop
+  # distance (the stop itself is added by the caller). Fractional, as for
+  # volatility_target: a backtest never sends a real order.
+  defp build_sizing_context(%{"method" => method}, entry_price, _bars, _index, opts)
+       when method in ["fixed_notional", "percent_equity", "risk_based"] do
+    %{
+      price: entry_price,
+      entry_price: entry_price,
+      equity: Keyword.get(opts, :sizing_equity),
+      fractional_shares_enabled: true
+    }
   end
 
   defp build_sizing_context(_config, _entry_price, _bars, _index, _opts), do: %{}
