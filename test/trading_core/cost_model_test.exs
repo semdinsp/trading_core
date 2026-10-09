@@ -169,6 +169,129 @@ defmodule TradingCore.CostModelTest do
     end
   end
 
+  describe "simulate_fill_price/4 with :max_spread_bps (the bad-quote guard)" do
+    # 10 bps flat fallback, no impact scaling; guard at 25 bps of last.
+    @guard [
+      slippage_bps: Decimal.new(10),
+      large_position_notional_threshold: nil,
+      max_spread_bps: 25
+    ]
+    @no_guard Keyword.delete(@guard, :max_spread_bps)
+    @qty Decimal.new(100)
+
+    defp quote(bid, ask, last) do
+      %{bid: bid && Decimal.new(bid), ask: ask && Decimal.new(ask), last: Decimal.new(last)}
+    end
+
+    defp fill(price_data, side, opts),
+      do: CostModel.simulate_fill_price(price_data, side, @qty, opts)
+
+    test "a normal quote uses the half-spread" do
+      # 100.00 / 100.10: 10 bps wide, last inside -> half-spread 0.05
+      q = quote("100.00", "100.10", "100.05")
+      assert Decimal.equal?(fill(q, "buy", @guard), Decimal.new("100.10"))
+      assert Decimal.equal?(fill(q, "sell", @guard), Decimal.new("100.00"))
+    end
+
+    test "a stale quote (last outside bid/ask) uses the flat fallback" do
+      # last 101 above the ask: 10 bps of 101 = 0.101
+      q = quote("100.00", "100.10", "101")
+      assert Decimal.equal?(fill(q, "buy", @guard), Decimal.new("101.101"))
+      assert Decimal.equal?(fill(q, "sell", @guard), Decimal.new("100.899"))
+    end
+
+    test "a crossed quote (bid > ask) uses the flat fallback" do
+      q = quote("100.10", "100.00", "100.05")
+      # 10 bps of 100.05 = 0.10005
+      assert Decimal.equal?(fill(q, "buy", @guard), Decimal.new("100.15005"))
+    end
+
+    test "a spread wider than max_spread_bps uses the flat fallback" do
+      # the WFC incident shape: 79.01 / 80.69 around ~79.85 (~210 bps wide)
+      q = quote("79.01", "80.69", "79.85")
+      # 10 bps of 79.85 = 0.07985, not the 0.84 half-spread
+      assert Decimal.equal?(fill(q, "buy", @guard), Decimal.new("79.92985"))
+      # without the guard the half-spread applies, as before
+      assert Decimal.equal?(fill(q, "buy", @no_guard), Decimal.new("80.69"))
+    end
+
+    test "a spread exactly at max_spread_bps is still used" do
+      # 25 bps of 100.00 = 0.25
+      q = quote("99.875", "100.125", "100.00")
+      assert Decimal.equal?(fill(q, "buy", @guard), Decimal.new("100.125"))
+    end
+
+    test "nil bid/ask uses the flat fallback, guard or not" do
+      q = quote(nil, nil, "100")
+      assert Decimal.equal?(fill(q, "buy", @guard), Decimal.new("100.1"))
+      assert fill(q, "buy", @guard) == fill(q, "buy", @no_guard)
+    end
+
+    test "without :max_spread_bps the result is exactly as before for every quote shape" do
+      for q <- [
+            quote("100.00", "100.10", "100.05"),
+            quote("100.00", "100.10", "101"),
+            quote("100.10", "100.00", "100.05"),
+            quote("79.01", "80.69", "79.85"),
+            quote(nil, nil, "100")
+          ],
+          side <- ["buy", "sell"] do
+        assert fill(q, side, @no_guard) == fill(q, side, @no_guard ++ [max_spread_bps: nil])
+      end
+    end
+
+    test "float quotes (a real feed's shape) go through the guard too" do
+      q = %{bid: 79.01, ask: 80.69, last: 79.85}
+      assert Decimal.equal?(fill(q, "buy", @guard), Decimal.new("79.92985"))
+    end
+
+    test "the guard composes with the impact multiplier" do
+      # notional 100 * 100.05 = 10_005 over a 5_001 threshold -> ~2x impact
+      opts = Keyword.put(@guard, :large_position_notional_threshold, Decimal.new(5_000))
+      q = quote("79.01", "80.69", "79.85")
+      # 10 bps fallback 0.07985 x (7985 / 5000 = 1.597)
+      assert Decimal.equal?(
+               fill(q, "buy", opts),
+               Decimal.add(
+                 Decimal.new("79.85"),
+                 Decimal.mult(Decimal.new("0.07985"), Decimal.new("1.597"))
+               )
+             )
+    end
+  end
+
+  describe "max_spread_bps_for/1" do
+    test "25 bps for equities, nil (guard off) otherwise" do
+      assert CostModel.max_spread_bps_for("equity") == 25
+      assert CostModel.max_spread_bps_for("option") == nil
+      assert CostModel.max_spread_bps_for(nil) == nil
+    end
+  end
+
+  describe "order_commission/4" do
+    test "a stock order is TradingCore.Costs.IBKR.order_cost/4 on the notional" do
+      for {qty, price, side, atom} <- [
+            {"100", "50.25", "buy", :buy},
+            {"1", "10", "sell", :sell},
+            {"5000", "3.10", "sell", :sell}
+          ] do
+        qty = Decimal.new(qty)
+        price = Decimal.new(price)
+
+        assert CostModel.order_commission(qty, price, side) ==
+                 TradingCore.Costs.IBKR.order_cost(qty, Decimal.mult(qty, price), atom)
+      end
+    end
+
+    test "an option order (multiplier 100) is option_cost/3 on contracts x premium x 100" do
+      qty = Decimal.new(3)
+      premium = Decimal.new("2.15")
+
+      assert CostModel.order_commission(qty, premium, "sell", Decimal.new(100)) ==
+               TradingCore.Costs.IBKR.option_cost(qty, Decimal.new("645.00"), :sell)
+    end
+  end
+
   describe "commission/2" do
     test "per-share cost applies once it exceeds the minimum" do
       # 1000 shares * $0.005 = $5.00, above the $1.00 minimum
