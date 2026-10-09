@@ -357,16 +357,18 @@ defmodule TradingCore.Signals do
   Running state of `moving_average/4`: `runs` are `{first_bucket,
   last_bucket, value}` segments of held values, newest first, with
   integer bucket numbers (see "Time-weighted, by sample-and-hold");
-  `since` is the first bucket covered since the last reset.
+  `since` is the first bucket covered since the last reset; `session` is
+  the last `:session_reset` key seen (`nil` without that option).
   """
   @type moving_average_state :: %{
           runs: [{integer(), integer(), Decimal.t()}],
-          since: integer() | nil
+          since: integer() | nil,
+          session: term()
         }
 
   @doc "An empty `moving_average/4` state."
   @spec moving_average_new() :: moving_average_state()
-  def moving_average_new, do: %{runs: [], since: nil}
+  def moving_average_new, do: %{runs: [], since: nil, session: nil}
 
   @doc """
   One tick of a time-weighted rolling mean of `value` over `:window_ms`
@@ -397,6 +399,16 @@ defmodule TradingCore.Signals do
   session warms up again. A restarted process starts empty and warms up
   the same way.
 
+  `:session_reset` (optional) is a 1-arity function of a tick's time, e.g.
+  `&TradingCore.Session.us_equities/1`, the same convention `:vwap`,
+  `:volume` and `:zscore` use. When its value changes between ticks the
+  history is discarded before the new tick is added, so the mean is built
+  only from the new session: with `us_equities/1`, pre-open ticks stay in
+  the prior session's bucket and the first window after 09:30 ET warms up
+  from post-open values only. This matters for a feed that ticks before
+  the open (NYSE TICK), where the gap reset never fires. Unset, nothing
+  changes; the gap reset still applies either way (a mid-session outage).
+
   `value` is rounded to `:precision` (default #{@default_precision}) on
   arrival, and the mean is rounded to it as well. Out-of-order ticks
   (earlier than the newest bucket) are treated as part of the newest
@@ -410,7 +422,7 @@ defmodule TradingCore.Signals do
     v = value |> to_decimal() |> Decimal.round(precision)
     b = bucket(now, interval)
 
-    state = ma_add(state, b, v, n)
+    state = state |> ma_session(now, Keyword.get(opts, :session_reset)) |> ma_add(b, v, n)
     window_start = b_now(state) - n + 1
     runs = ma_trim(state.runs, window_start)
     state = %{state | runs: runs}
@@ -440,6 +452,9 @@ defmodule TradingCore.Signals do
     precision = Keyword.get(opts, :precision, @default_precision)
     {interval, n} = ma_grid(opts)
 
+    session_reset = Keyword.get(opts, :session_reset)
+    session_of = fn at -> if session_reset, do: session_reset.(at) end
+
     bucketed =
       Enum.map(points, fn {at, value} ->
         {at, bucket(at, interval), value |> to_decimal() |> Decimal.round(precision)}
@@ -456,15 +471,21 @@ defmodule TradingCore.Signals do
           {{a, b, v}, b}
         end)
 
-      # The segment since the last gap of at least a full window.
+      # The segment since the last gap of at least a full window, or the
+      # last :session_reset change.
       segment =
         seen
         |> Enum.chunk_while(
           [],
-          fn {_a, b, _v} = p, acc ->
+          fn {a, b, _v} = p, acc ->
             case acc do
-              [{_, prev_b, _} | _] when b - prev_b >= n -> {:cont, Enum.reverse(acc), [p]}
-              _ -> {:cont, [p | acc]}
+              [{prev_a, prev_b, _} | _] ->
+                if b - prev_b >= n or session_of.(a) != session_of.(prev_a),
+                  do: {:cont, Enum.reverse(acc), [p]},
+                  else: {:cont, [p | acc]}
+
+              _ ->
+                {:cont, [p | acc]}
             end
           end,
           fn acc -> {:cont, Enum.reverse(acc), []} end
@@ -506,14 +527,14 @@ defmodule TradingCore.Signals do
   # a replacement within the newest bucket, or the newest run held through
   # the empty buckets up to `b` and `v` appended. Equal neighbours merge, so
   # a flat stretch is one run.
-  defp ma_add(%{runs: []}, b, v, _n), do: %{runs: [{b, b, v}], since: b}
+  defp ma_add(%{runs: []} = state, b, v, _n), do: Map.merge(state, %{runs: [{b, b, v}], since: b})
 
   defp ma_add(%{runs: [{first, last, held} | older]} = state, b, v, n) do
     b = max(b, last)
 
     cond do
       b - last >= n ->
-        %{runs: [{b, b, v}], since: b}
+        Map.merge(state, %{runs: [{b, b, v}], since: b})
 
       b == last ->
         runs =
@@ -525,6 +546,20 @@ defmodule TradingCore.Signals do
 
       true ->
         %{state | runs: merge_run({b, b, v}, [{first, b - 1, held} | older])}
+    end
+  end
+
+  # A new :session_reset key empties the history (the tick is then added to
+  # an empty state); the key is remembered either way.
+  defp ma_session(state, _now, nil), do: state
+
+  defp ma_session(state, now, session_reset) when is_function(session_reset, 1) do
+    session = session_reset.(now)
+
+    case Map.get(state, :session) do
+      nil -> Map.put(state, :session, session)
+      ^session -> state
+      _other -> %{runs: [], since: nil, session: session}
     end
   end
 

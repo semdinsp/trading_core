@@ -586,10 +586,20 @@ defmodule TradingCore.Signal.Compute do
   # :moving_average: a time-weighted rolling mean of its parent, sampled
   # and held at the same fixed interval as :self_zscore
   # (params["sample_interval_ms"], else default_sample_interval_ms/1 of
-  # window_ms); :warming_up until the window is fully covered. See
+  # window_ms); :warming_up until the window is fully covered. Honours
+  # params["session_reset"] like :vwap/:volume/:zscore. See
   # TradingCore.Signals.moving_average/4.
   def step(%Spec{kind: :moving_average} = spec, state, %{at: now, value: value}) do
-    {ma, result} = Signals.moving_average(state.ma, value, now, sampled_window_opts(spec))
+    opts =
+      case Map.get(spec.params, "session_reset") do
+        reset when is_function(reset, 1) ->
+          Keyword.put(sampled_window_opts(spec), :session_reset, reset)
+
+        _ ->
+          sampled_window_opts(spec)
+      end
+
+    {ma, result} = Signals.moving_average(state.ma, value, now, opts)
     {%{state | ma: ma}, warm(result)}
   end
 
