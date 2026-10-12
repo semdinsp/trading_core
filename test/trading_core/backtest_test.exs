@@ -907,14 +907,19 @@ defmodule TradingCore.BacktestTest do
 
       signal_specs = %{"close_price" => %{kind: :price}}
 
+      # Six daily returns before the signal: enough for the default
+      # :min_sizing_vol_returns (5).
       bars = [
         daily(0, 98, 99, 97, 98),
         daily(1, 99, 100, 98, 99),
-        daily(2, 99, 101, 98, 101),
-        # entry fires here (close 105 > 100), fills at bar 4's open
-        daily(3, 101, 106, 100, 105),
-        daily(4, 106, 108, 105, 106),
-        daily(5, 106, 107, 105, 106)
+        daily(2, 99, 100, 96, 97),
+        daily(3, 97, 100, 96, 99),
+        daily(4, 99, 100, 97, 98),
+        daily(5, 98, 100, 97, 99),
+        # entry fires here (close 105 > 100), fills at bar 7's open
+        daily(6, 101, 106, 100, 105),
+        daily(7, 106, 108, 105, 106),
+        daily(8, 106, 107, 105, 106)
       ]
 
       bars_by_symbol = %{"AAPL" => bars}

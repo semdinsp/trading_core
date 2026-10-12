@@ -57,6 +57,20 @@ defmodule TradingCore.Backtest do
       `20`); intraday bars are collapsed to one close per trading day
       first (see `estimate_daily_vol/3`). Ignored entirely if
       `position_sizing["method"] != "volatility_target"`.
+    - `:trade_from` — a `Date` (US/Eastern). Bars before it are history
+      only: they build signal state, global series, the daily-close index
+      for sizing volatility and the stop volatility, but no entry is
+      taken before it, so no run starts (or carries in) from the warm-up.
+      Default `nil`: every bar may trade.
+    - `:min_sizing_vol_returns` — the fewest daily returns
+      `"volatility_target"` sizing will estimate from (default
+      5); with fewer, the entry is skipped (`:insufficient_data`), as it
+      already is with none. One overnight return on a quiet open can read
+      near-zero volatility and size an enormous position.
+    - `:min_stop_vol_returns` — the same floor for a
+      `"volatility_multiple"` stop's volatility (default `1`, i.e. off);
+      below it the stop falls back to `percent_of_entry`, as it already
+      does with no history.
     - `:sizing_equity` — a fixed account size (a `Decimal` or number) for
       `"percent_equity"` and `"risk_based"` sizing; a backtest has no live
       equity. Required for those two methods (`{:error,
@@ -530,6 +544,7 @@ defmodule TradingCore.Backtest do
         }
 
   @default_volatility_window 20
+  @default_min_sizing_vol_returns 5
   # trading_hub's trailing_ewma_vol_sync/4 defaults, which live
   # volatility_target sizing uses via trading_system's DailyVolCache.
   @hub_vol_lookback_days 14
@@ -544,6 +559,7 @@ defmodule TradingCore.Backtest do
   signal the rules actually reference, `{:error, :invalid_flatten_at}`
   if `opts[:flatten_at]` is neither `nil` nor a `Time`,
   `{:error, :invalid_sizing_vol}` for an unknown `opts[:sizing_vol]`,
+  `{:error, :invalid_trade_from}` for a `:trade_from` that isn't a `Date`,
   `{:error, :sizing_equity_required}` for `"percent_equity"`/`"risk_based"`
   sizing without a positive `opts[:sizing_equity]`, or a required
   `position_sizing` context value is missing for every symbol (nothing
@@ -566,7 +582,8 @@ defmodule TradingCore.Backtest do
     with :ok <- validate_specs(needed_names, signal_specs),
          :ok <- validate_flatten_at(Keyword.get(opts, :flatten_at)),
          :ok <- validate_sizing_vol(Keyword.get(opts, :sizing_vol, :stdev)),
-         :ok <- validate_sizing_equity(strategy, Keyword.get(opts, :sizing_equity)) do
+         :ok <- validate_sizing_equity(strategy, Keyword.get(opts, :sizing_equity)),
+         :ok <- validate_trade_from(Keyword.get(opts, :trade_from)) do
       global_series = compute_global_series(signal_specs, bars_by_symbol, literal_series)
 
       runs =
@@ -598,6 +615,10 @@ defmodule TradingCore.Backtest do
   defp positive_number?(%Decimal{} = d), do: Decimal.compare(d, 0) == :gt
   defp positive_number?(n) when is_number(n), do: n > 0
   defp positive_number?(_), do: false
+
+  defp validate_trade_from(nil), do: :ok
+  defp validate_trade_from(%Date{}), do: :ok
+  defp validate_trade_from(_other), do: {:error, :invalid_trade_from}
 
   defp validate_sizing_vol(mode) when mode in [:stdev, :ewma], do: :ok
   defp validate_sizing_vol(_other), do: {:error, :invalid_sizing_vol}
@@ -949,6 +970,7 @@ defmodule TradingCore.Backtest do
     indexed_pairs = bars |> Enum.zip(Enum.drop(bars, 1) ++ [nil]) |> Enum.with_index()
     flatten_at = Keyword.get(opts, :flatten_at)
     intrabar? = Keyword.get(opts, :intrabar, false)
+    trade_from = Keyword.get(opts, :trade_from)
 
     # Built once per symbol; only volatility_target sizing reads it.
     opts =
@@ -981,7 +1003,8 @@ defmodule TradingCore.Backtest do
 
         case acc.position do
           nil ->
-            if entry_allowed?(bar, next_bar, session, next_session) do
+            if tradeable?(bar, trade_from) and
+                 entry_allowed?(bar, next_bar, session, next_session) do
               maybe_enter(
                 acc,
                 symbol,
@@ -1025,6 +1048,15 @@ defmodule TradingCore.Backtest do
   ## -----------------------------------------------------------------------
   ## End-of-session flatten (opts[:flatten_at])
   ## -----------------------------------------------------------------------
+
+  # opts[:trade_from]: bars from earlier US/Eastern dates are warm-up only,
+  # so they never open a position (and nothing can carry into the window).
+  defp tradeable?(_bar, nil), do: true
+
+  defp tradeable?(%{ts: ts}, trade_from) do
+    date = ts |> DateTime.shift_zone!(@eastern) |> DateTime.to_date()
+    Date.compare(date, trade_from) != :lt
+  end
 
   # Without :flatten_at nothing is session-aware: every bar may enter and
   # nothing is flattened, exactly as before the option existed.
@@ -1451,7 +1483,8 @@ defmodule TradingCore.Backtest do
       vol_opts = [
         as_of: as_of,
         lookback_days: Keyword.get(opts, :stop_vol_lookback_days, 14),
-        lambda: Keyword.get(opts, :stop_vol_lambda, 0.94)
+        lambda: Keyword.get(opts, :stop_vol_lambda, 0.94),
+        min_returns: Keyword.get(opts, :min_stop_vol_returns, 1)
       ]
 
       case Volatility.ewma_daily_vol(known, vol_opts) do
@@ -1484,13 +1517,15 @@ defmodule TradingCore.Backtest do
 
     day_index = Keyword.get_lazy(opts, :__day_index__, fn -> day_index(bars) end)
 
+    min_returns = Keyword.get(opts, :min_sizing_vol_returns, @default_min_sizing_vol_returns)
+
     estimate =
       case Keyword.get(opts, :sizing_vol, :stdev) do
         :ewma ->
-          ewma_daily_vol_at(day_index, index, opts)
+          ewma_daily_vol_at(day_index, index, opts, min_returns)
 
         :stdev ->
-          daily_vol_at(day_index, index, window)
+          daily_vol_at(day_index, index, window, min_returns)
       end
 
     case estimate do
@@ -1562,7 +1597,7 @@ defmodule TradingCore.Backtest do
   @spec estimate_daily_vol([bar()], non_neg_integer(), pos_integer()) ::
           {:ok, Decimal.t()} | :insufficient_data
   def estimate_daily_vol(bars, index, window) do
-    bars |> Enum.take(index + 1) |> day_index() |> daily_vol_at(index, window)
+    bars |> Enum.take(index + 1) |> day_index() |> daily_vol_at(index, window, 1)
   end
 
   # Per-bar facts for daily-close lookups, built in one pass: each bar's
@@ -1609,13 +1644,15 @@ defmodule TradingCore.Backtest do
     %{rows: rows, last_by_date: last_by_date, dates: Enum.reverse(dates)}
   end
 
-  defp daily_vol_at(%{rows: rows}, index, _window) when index >= tuple_size(rows),
+  defp daily_vol_at(%{rows: rows}, index, _window, _min_returns) when index >= tuple_size(rows),
     do: :insufficient_data
 
-  defp daily_vol_at(day_index, index, window) do
+  # Fewer than `min_returns` daily returns (closes - 1) is not enough to
+  # size from; see :min_sizing_vol_returns.
+  defp daily_vol_at(day_index, index, window, min_returns) do
     trailing = day_index |> daily_closes_at(index, window) |> Enum.map(&elem(&1, 1))
 
-    if length(trailing) < 2 do
+    if length(trailing) < 2 or length(trailing) - 1 < min_returns do
       :insufficient_data
     else
       returns =
@@ -1647,7 +1684,8 @@ defmodule TradingCore.Backtest do
   # The hub's estimator (TradingCore.Volatility.ewma_daily_vol/2, which
   # matches trailing_ewma_vol_sync/4) over the same daily closes. Its
   # window is calendar days, so `lookback_days + 1` closes always cover it.
-  defp ewma_daily_vol_at(%{rows: rows} = day_index, index, opts) when index < tuple_size(rows) do
+  defp ewma_daily_vol_at(%{rows: rows} = day_index, index, opts, min_returns)
+       when index < tuple_size(rows) do
     lookback_days = Keyword.get(opts, :sizing_vol_lookback_days, @hub_vol_lookback_days)
     {today, _regular?, _close} = elem(rows, index)
 
@@ -1657,11 +1695,12 @@ defmodule TradingCore.Backtest do
     |> Volatility.ewma_daily_vol(
       as_of: today,
       lookback_days: lookback_days,
-      lambda: Keyword.get(opts, :sizing_vol_lambda, @hub_vol_lambda)
+      lambda: Keyword.get(opts, :sizing_vol_lambda, @hub_vol_lambda),
+      min_returns: min_returns
     )
   end
 
-  defp ewma_daily_vol_at(_day_index, _index, _opts), do: :insufficient_data
+  defp ewma_daily_vol_at(_day_index, _index, _opts, _min_returns), do: :insufficient_data
 
   # Today's close so far: the latest regular-session bar at or before
   # `index` on `today`, else the bar at `index` itself.

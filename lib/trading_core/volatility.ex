@@ -47,7 +47,10 @@ defmodule TradingCore.Volatility do
   would have known. Returns `{:ok, Decimal.t()}`, or `:insufficient_data`
   with fewer than two days (no return) in the window.
 
-  Options: `:lookback_days`, `:lambda`, `:as_of` (`Date.t()`).
+  Options: `:lookback_days`, `:lambda`, `:as_of` (`Date.t()`), and
+  `:min_returns` (default 1): fewer daily returns than this in the window
+  is `:insufficient_data`, so a caller can refuse to act on a figure
+  built from one or two returns.
   """
   @spec ewma_daily_vol([bar()], keyword()) :: {:ok, Decimal.t()} | :insufficient_data
   def ewma_daily_vol(bars, opts \\ []) when is_list(bars) do
@@ -70,10 +73,11 @@ defmodule TradingCore.Volatility do
           end)
           |> Enum.map(&elem(&1, 1))
 
-        case abs_log_returns(closes) do
-          [] -> :insufficient_data
-          returns -> {:ok, returns |> ewma_vol(lambda) |> Decimal.from_float()}
-        end
+        returns = abs_log_returns(closes)
+
+        if returns == [] or length(returns) < Keyword.get(opts, :min_returns, 1),
+          do: :insufficient_data,
+          else: {:ok, returns |> ewma_vol(lambda) |> Decimal.from_float()}
     end
   end
 
