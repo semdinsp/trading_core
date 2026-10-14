@@ -66,6 +66,27 @@ defmodule TradingCore.CostModel do
   `max_spread_bps_for/1` gives the value for an asset class (equities
   only, since an option premium is legitimately quoted wide).
 
+  ## Filling at the touch on a fresh quote: `:max_quote_age_ms`
+
+  On fast names the last trade often sits a tick outside a quote that has
+  already moved, which the guard above reads as stale. With
+  `:max_quote_age_ms` set and `price_data[:quote_at]` present, staleness is
+  judged from the quote's own timestamp instead: a quote no older than
+  `max_quote_age_ms` before `opts[:now]` (default `DateTime.utc_now/0`)
+  whose bid and ask are present, positive and not crossed fills **at the
+  touch**, wherever `last` is: a buy at the ask, a sell at the bid, with
+  the impact multiplier still scaling the half-spread
+  (`mid ± multiplier × half_spread`).
+
+  A fresh quote is real even when wide (an illiquid name's spread can
+  legitimately exceed the 25 bps stale-data guard), so it is never sent to
+  the flat fallback, which would charge it less than a tight quote. Its
+  half-spread is only capped at `:max_fresh_spread_bps / 2` of mid, against
+  an absurd print; that guard defaults to 100 bps whenever
+  `:max_spread_bps` is set and is off otherwise. Without
+  `:max_quote_age_ms` or `quote_at`, or for a stale, crossed or one-sided
+  quote, everything is exactly as before.
+
   ## Commission: `order_commission/4` (and the superseded `commission/2`)
 
   `order_commission/4` is IBKR's real per-**order** cost, base plus the
@@ -111,6 +132,10 @@ defmodule TradingCore.CostModel do
   # traded is a liquid US large cap or ETF quoted a cent or two wide.
   @equity_max_spread_bps 25
 
+  # Default cap on a FRESH quote's spread, in bps of mid, when the stale
+  # guard (:max_spread_bps) is on; see "Filling at the touch".
+  @default_max_fresh_spread_bps 100
+
   @doc """
   The `:max_spread_bps` guard to pass `simulate_fill_price/4` for an
   instrument's `asset_class`: #{@equity_max_spread_bps} for `"equity"`,
@@ -147,6 +172,11 @@ defmodule TradingCore.CostModel do
   This crashed every live-price entry attempt before the coercion was
   added — callers never need to coerce `price_data` themselves.
 
+  With `opts[:max_quote_age_ms]` and `price_data[:quote_at]` (a `DateTime`
+  or Unix ms), a fresh, sane quote fills at the touch instead; see
+  "Filling at the touch" in the moduledoc. Related opts: `:now` (default
+  `DateTime.utc_now/0`) and `:max_fresh_spread_bps`.
+
   The same fallback applies when the quote looks bad and
   `opts[:max_spread_bps]` is set: `last` outside `[bid, ask]` (stale or
   crossed), or a spread wider than `max_spread_bps` of `last`. Without the
@@ -166,6 +196,24 @@ defmodule TradingCore.CostModel do
     max_spread_bps = Keyword.get(opts, :max_spread_bps)
 
     price_data = coerce_price_data(price_data)
+
+    case fresh_touch(price_data, opts, max_spread_bps) do
+      {:ok, mid, half_spread} ->
+        multiplier = impact_multiplier(mid, qty, threshold)
+        adverse = Decimal.mult(half_spread, multiplier)
+
+        case side do
+          "buy" -> Decimal.add(mid, adverse)
+          "sell" -> Decimal.sub(mid, adverse)
+        end
+
+      :not_fresh ->
+        last_based_fill(price_data, side, qty, slippage_bps, threshold, max_spread_bps)
+    end
+  end
+
+  # The pre-existing model: last ± (half-spread or flat fallback) × impact.
+  defp last_based_fill(price_data, side, qty, slippage_bps, threshold, max_spread_bps) do
     last = price_data[:last]
 
     base_slippage =
@@ -182,6 +230,49 @@ defmodule TradingCore.CostModel do
       "sell" -> Decimal.sub(last, total_slippage)
     end
   end
+
+  # {:ok, mid, half_spread} for a fresh, sane quote (see "Filling at the
+  # touch"), else :not_fresh. The half-spread is capped at
+  # max_fresh_spread_bps / 2 of mid when that guard is on.
+  defp fresh_touch(price_data, opts, max_spread_bps) do
+    with max_age when is_integer(max_age) <- Keyword.get(opts, :max_quote_age_ms),
+         {:ok, quote_at} <- quote_time(price_data[:quote_at]),
+         now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0),
+         true <- DateTime.diff(now, quote_at, :millisecond) <= max_age,
+         %{bid: %Decimal{} = bid, ask: %Decimal{} = ask} <- price_data,
+         true <- Decimal.compare(bid, 0) == :gt and Decimal.compare(bid, ask) != :gt do
+      mid = bid |> Decimal.add(ask) |> Decimal.div(2)
+      half_spread = ask |> Decimal.sub(bid) |> Decimal.div(2)
+
+      {:ok, mid, cap_fresh_half_spread(half_spread, mid, fresh_guard(opts, max_spread_bps))}
+    else
+      _ -> :not_fresh
+    end
+  end
+
+  defp fresh_guard(opts, max_spread_bps) do
+    Keyword.get_lazy(opts, :max_fresh_spread_bps, fn ->
+      if max_spread_bps, do: @default_max_fresh_spread_bps
+    end)
+  end
+
+  defp cap_fresh_half_spread(half_spread, _mid, nil), do: half_spread
+
+  defp cap_fresh_half_spread(half_spread, mid, guard_bps) do
+    cap = mid |> Decimal.mult(guard_bps) |> Decimal.div(20_000)
+    Decimal.min(half_spread, cap)
+  end
+
+  defp quote_time(%DateTime{} = at), do: {:ok, at}
+
+  defp quote_time(ms) when is_integer(ms) do
+    case DateTime.from_unix(ms, :millisecond) do
+      {:ok, at} -> {:ok, at}
+      _ -> :error
+    end
+  end
+
+  defp quote_time(_other), do: :error
 
   defp coerce_price_data(price_data) do
     price_data
