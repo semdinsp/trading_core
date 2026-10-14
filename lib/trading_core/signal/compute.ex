@@ -223,6 +223,7 @@ defmodule TradingCore.Signal.Compute do
   to the value type, the DAG-composition rules, or `replay/3` itself.
   """
 
+  alias TradingCore.Microstructure
   alias TradingCore.Signal.{Spec, TickWindow}
   alias TradingCore.{Signals, WelfordAcc}
 
@@ -1313,40 +1314,11 @@ defmodule TradingCore.Signal.Compute do
   # the price move itself is information, and dropping the tick would
   # lose it. (On the measured Polygon feed sizes are always present; this
   # is for a feed that omits them.)
-  defp ofi_contribution(prev, curr) do
-    Decimal.add(
-      bid_contribution(prev.bid, prev.bid_size, curr.bid, curr.bid_size),
-      ask_contribution(prev.ask, prev.ask_size, curr.ask, curr.ask_size)
-    )
-  end
-
-  defp bid_contribution(prev_price, prev_size, curr_price, curr_size) do
-    prev_size = prev_size || Decimal.new(0)
-    curr_size = curr_size || Decimal.new(0)
-
-    case Decimal.compare(curr_price, prev_price) do
-      # Bid rose: the size at the new, better level is new buying interest.
-      :gt -> curr_size
-      # Unchanged: only the change in resting size is new.
-      :eq -> Decimal.sub(curr_size, prev_size)
-      # Bid fell: the whole previous level was pulled or hit.
-      :lt -> Decimal.negate(prev_size)
-    end
-  end
-
-  defp ask_contribution(prev_price, prev_size, curr_price, curr_size) do
-    prev_size = prev_size || Decimal.new(0)
-    curr_size = curr_size || Decimal.new(0)
-
-    case Decimal.compare(curr_price, prev_price) do
-      # Ask fell: the size at the new, better offer is new selling interest.
-      :lt -> Decimal.negate(curr_size)
-      # Unchanged: added offer size is sell pressure, removed is buy.
-      :eq -> Decimal.sub(prev_size, curr_size)
-      # Ask rose: the whole previous offer was lifted or pulled.
-      :gt -> prev_size
-    end
-  end
+  # The per-event CKS step lives in TradingCore.Microstructure, shared with
+  # trading_micro and trading_backtest. Its defaults (a nil size counts as
+  # 0, a zero price is a price) are this kind's behaviour; prices here are
+  # always present, since the quote is ready.
+  defp ofi_contribution(prev, curr), do: Microstructure.ofi_contribution(prev, curr)
 
   # Trade size, defaulting to 1 when the feed does not supply one.
   #
@@ -1396,36 +1368,14 @@ defmodule TradingCore.Signal.Compute do
 
   # Lee-Ready: compare against the prevailing mid, falling back to the
   # tick rule exactly at mid (or with no usable quote).
-  defp trade_sign(:lee_ready, price, %{bid: bid, ask: ask} = quote_state, state)
-       when not is_nil(bid) and not is_nil(ask) do
-    if quoted_spread(quote_state, %Spec{kind: :quoted_spread, params: %{}}) == nil do
-      trade_sign(:tick_rule, price, quote_state, state)
-    else
-      case Decimal.compare(price, mid_price(bid, ask)) do
-        :gt -> 1
-        :lt -> -1
-        :eq -> trade_sign(:tick_rule, price, quote_state, state)
-      end
-    end
-  end
-
+  # Lee-Ready and the tick rule live in TradingCore.Microstructure (shared
+  # with trading_micro and trading_backtest); see trade_sign/5 and
+  # tick_sign/3 there. A zero-tick inherits the previous sign.
   defp trade_sign(:lee_ready, price, quote_state, state),
-    do: trade_sign(:tick_rule, price, quote_state, state)
+    do: Microstructure.trade_sign(price, quote_state, state.last_price, state.last_sign)
 
-  # Tick rule: up = buy, down = sell, unchanged = carry the previous sign
-  # forward. A zero-tick inherits rather than counting as neutral — a
-  # trade at an unchanged price is conventionally attributed to whichever
-  # side was pressing last, and treating it as 0 would systematically
-  # understate flow on a quiet tape where most prints repeat.
-  defp trade_sign(:tick_rule, _price, _quote_state, %{last_price: nil}), do: nil
-
-  defp trade_sign(:tick_rule, price, _quote_state, %{last_price: last, last_sign: last_sign}) do
-    case Decimal.compare(price, last) do
-      :gt -> 1
-      :lt -> -1
-      :eq -> last_sign
-    end
-  end
+  defp trade_sign(:tick_rule, price, _quote_state, state),
+    do: Microstructure.tick_sign(price, state.last_price, state.last_sign)
 
   # "tick_count" subsamples every kth print; "time" first thins the
   # series to one print per subsample_ms bucket, then runs the estimator
