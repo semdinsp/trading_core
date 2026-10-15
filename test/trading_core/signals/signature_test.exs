@@ -157,18 +157,161 @@ defmodule TradingCore.Signals.SignatureTest do
       end
     end
 
+    test "log_volume and log_cum_volume channels" do
+      t0 = ~U[2026-10-14 14:00:00Z]
+      vols = [0, 9, 99, 999]
+
+      ticks =
+        for {v, i} <- Enum.with_index(vols),
+            do: %{at: DateTime.add(t0, i * 60), value: 100.0, volume: v}
+
+      # log(1 + v) for v = 0, 9, 99, 999 is 0, ln 10, 2 ln 10, 3 ln 10 against time 0..3: a straight line
+      s = spec(%{"channels" => ["time", "log_volume"], "window" => 4})
+      assert List.last(run(s, ticks)) == Decimal.new("0E-8")
+
+      # cumulative 0, 9, 108, 1107: total level-1 increment is log(1108)
+      s =
+        spec(%{
+          "channels" => ["time", "log_cum_volume"],
+          "window" => 4,
+          "output" => "level1",
+          "index" => 1
+        })
+
+      assert Decimal.equal?(
+               List.last(run(s, ticks)),
+               Decimal.from_float(:math.log(1108)) |> Decimal.round(8)
+             )
+    end
+
+    @t0 ~U[2026-10-14 14:00:00Z]
+
+    defp at(ms), do: DateTime.add(@t0, ms, :millisecond)
+
+    # The same bars, but the symbol and the reference arrive as separate
+    # ticks inside each minute, then one tick opens the next minute.
+    defp split_ticks(points) do
+      points
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {[x, y], i} ->
+        [%{at: at(i * 60_000 + 1_000), value: x}, %{at: at(i * 60_000 + 30_000), reference: y}]
+      end)
+    end
+
+    test "bar_interval_ms: split symbol/reference ticks give the same area as combined bars" do
+      clocked = spec(%{"bar_interval_ms" => 60_000})
+      # a bar closes when the next minute's first tick arrives
+      trailing = fn points -> %{at: at(length(points) * 60_000 + 1_000), value: 0.0} end
+
+      assert List.last(run(clocked, split_ticks(@ccw) ++ [trailing.(@ccw)])) ==
+               Decimal.new("1.00000000")
+
+      # both channels moving together: a straight line, area 0
+      diagonal = for k <- 0..5, do: [1.0 * k, 1.0 * k]
+
+      assert List.last(run(clocked, split_ticks(diagonal) ++ [trailing.(diagonal)])) ==
+               Decimal.new("0E-8")
+
+      # without bar_interval_ms each one-sided tick is a bar: the line
+      # becomes a staircase with the symbol always moving first, and the
+      # area is a positive artefact
+      per_tick = List.last(run(spec(%{"window" => 9}), split_ticks(diagonal)))
+      assert Decimal.compare(per_tick, 0) == :gt
+    end
+
+    test "bar_interval_ms: a bar takes the last value in its interval and sums volume" do
+      s =
+        spec(%{
+          "bar_interval_ms" => 60_000,
+          "window" => 2,
+          "channels" => ["price", "volume"],
+          "output" => "level1",
+          "index" => 1
+        })
+
+      out =
+        run(s, [
+          %{at: at(0), value: 1.0, volume: 5},
+          %{at: at(10_000), value: 2.0, volume: 7},
+          %{at: at(60_000), value: 3.0, volume: 100},
+          %{at: at(120_000), value: 4.0, volume: 1}
+        ])
+
+      # bar 1: price 2, volume 12; bar 2: price 3, volume 100.
+      # level1 of cumulative volume is 112 - 12 = 100.
+      assert out == [:warming_up, :warming_up, :warming_up, Decimal.new("100.00000000")]
+
+      # price channel: last-in-interval 2 -> 3, increment 1
+      s1 = %{s | params: Map.put(s.params, "index", 0)}
+
+      assert List.last(
+               run(s1, [
+                 %{at: at(0), value: 1.0},
+                 %{at: at(10_000), value: 2.0},
+                 %{at: at(60_000), value: 3.0},
+                 %{at: at(120_000), value: 9.0}
+               ])
+             ) == Decimal.new("1.00000000")
+    end
+
+    test "bar_interval_ms: between closes it repeats the last value; empty intervals add no bar" do
+      s = spec(%{"bar_interval_ms" => 60_000})
+      line = for k <- 0..5, do: %{at: at(k * 60_000), value: 1.0 * k, reference: 2.0 * k}
+      # a mid-minute tick and a tick 10 minutes later: no flat fill bars
+      extra = [
+        %{at: at(5 * 60_000 + 30_000), value: 5.0},
+        %{at: at(15 * 60_000), value: 6.0, reference: 12.0}
+      ]
+
+      out = run(s, line ++ extra)
+
+      assert Enum.take(out, 5) == List.duplicate(:warming_up, 5)
+      assert Enum.at(out, 5) == Decimal.new("0E-8")
+      assert Enum.at(out, 6) == Enum.at(out, 5)
+      assert %Decimal{} = Enum.at(out, 7)
+    end
+
+    test "bar_interval_ms: a late tick counts toward the open bar" do
+      s =
+        spec(%{
+          "bar_interval_ms" => 60_000,
+          "window" => 2,
+          "channels" => ["price", "volume"],
+          "output" => "level1",
+          "index" => 1
+        })
+
+      out =
+        run(s, [
+          %{at: at(60_000), value: 1.0, volume: 1},
+          %{at: at(30_000), value: 1.0, volume: 4},
+          %{at: at(120_000), value: 1.0, volume: 10},
+          %{at: at(180_000), value: 1.0, volume: 0}
+        ])
+
+      assert List.last(out) == Decimal.new("10.00000000")
+    end
+
+    test "bar_interval_ms: invalid bar_interval_ms raises" do
+      for bad <- [0, -1, 1.5, "60000"] do
+        assert_raise ArgumentError, fn -> Compute.init(spec(%{"bar_interval_ms" => bad})) end
+      end
+    end
+
     property "replay/3 equals folding step/2" do
       check all(
               xs <- list_of(float(min: 50.0, max: 150.0), min_length: 2, max_length: 40),
               ys <- list_of(float(min: 50.0, max: 150.0), length: length(xs)),
               normalize <- boolean(),
+              clocked <- boolean(),
               max_runs: 80
             ) do
         s =
           spec(%{
             "window" => 6,
             "normalize" => normalize,
-            "channels" => ["log_price", "reference_log_price"]
+            "channels" => ["log_price", "reference_log_price"],
+            "bar_interval_ms" => if(clocked, do: 90_000)
           })
 
         ts = ticks(Enum.zip_with(xs, ys, &[&1, &2]))

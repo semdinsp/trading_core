@@ -327,7 +327,9 @@ defmodule TradingCore.Signal.Compute do
 
   def init(%Spec{kind: :signature} = spec) do
     _validated = signature_config!(spec)
-    {:ok, %{bars: :queue.new(), size: 0, price: nil, reference: nil}}
+
+    {:ok,
+     %{bars: :queue.new(), size: 0, price: nil, reference: nil, pending: nil, last: :warming_up}}
   end
 
   def init(%Spec{kind: kind})
@@ -613,34 +615,35 @@ defmodule TradingCore.Signal.Compute do
   # :signature: the level-1/2 path signature of the last params["window"]
   # bars (default 30) over 2-4 channels, recomputed in full each step, and
   # one scalar read from it. See signature_config!/1 for the params and
-  # TradingCore.Signals.Signature for the math. A tick is one bar:
+  # TradingCore.Signals.Signature for the math. Ticks carry
   # %{at, value, reference, volume}; the last known value/reference is
   # held when a tick carries only one of them, as :spread does.
-  def step(%Spec{kind: :signature} = spec, state, %{at: _now} = tick) do
+  #
+  # How ticks become bars:
+  #   * no params["bar_interval_ms"]: every tick is one bar. Only correct
+  #     when the caller sends one combined tick per bar (a bar replay).
+  #     With separate symbol and reference ticks, `window` counts ticks and
+  #     each one-sided tick adds a staircase step whose area is pure
+  #     artefact, so a live feed should set bar_interval_ms.
+  #   * params["bar_interval_ms"]: ticks are bucketed on the clock
+  #     (floor(at / interval)). A bar closes when the first tick of a later
+  #     bucket arrives and takes the last held value/reference of its
+  #     interval and the summed volume of its ticks. Intervals with no
+  #     ticks produce no bar (no carry-forward fill, so an overnight gap is
+  #     not a run of flat bars). Between closes the step returns the value
+  #     computed at the last close. A late tick (earlier bucket) counts
+  #     toward the open bar.
+  def step(%Spec{kind: :signature} = spec, state, %{at: at} = tick) do
     config = signature_config!(spec)
 
-    state =
-      state
-      |> hold(:price, Map.get(tick, :value))
-      |> hold(:reference, Map.get(tick, :reference))
-
-    case signature_bar(state, tick, config) do
+    case config.bar_interval_ms do
       nil ->
-        {state, :warming_up}
+        state = hold_signature_tick(state, tick)
+        push_signature_bar(state, signature_bar(state, tick_volume(tick), config), config)
 
-      bar ->
-        bars = :queue.in(bar, state.bars)
-
-        {bars, size} =
-          if state.size + 1 > config.window,
-            do: {:queue.drop(bars), state.size},
-            else: {bars, state.size + 1}
-
-        state = %{state | bars: bars, size: size}
-
-        if size < config.window,
-          do: {state, :warming_up},
-          else: {state, signature_value(:queue.to_list(bars), config)}
+      interval_ms ->
+        bucket = Integer.floor_div(DateTime.to_unix(at, :millisecond), interval_ms)
+        step_signature_clocked(state, tick, bucket, config)
     end
   end
 
@@ -1860,19 +1863,22 @@ defmodule TradingCore.Signal.Compute do
   ## :signature helpers
   ## -----------------------------------------------------------------------
 
-  @signature_channels ~w(price log_price reference reference_log_price volume time)
+  @signature_channels ~w(price log_price reference reference_log_price volume log_volume log_cum_volume time)
   @signature_outputs ~w(levy_area level1 level2)
 
   # Validates and reads the :signature params; raises ArgumentError on a
   # bad config (an invalid spec is a setup mistake, not a runtime state).
   #   "channels"  2-4 of #{inspect(@signature_channels)}
   #   "window"    bars, an integer >= 2 (default 30)
+  #   "bar_interval_ms"  a positive integer: sample bars on this clock
+  #               (see step/3); absent/nil: one bar per tick
   #   "normalize" per-channel z-score within the window (default true)
   #   "output"    "levy_area" | "level2" (both need "pair": [i, j], i != j
   #               for levy_area) | "level1" (needs "index": i)
   defp signature_config!(%Spec{params: params}) do
     channels = Map.get(params, "channels")
     window = Map.get(params, "window", 30)
+    bar_interval_ms = Map.get(params, "bar_interval_ms")
     normalize = Map.get(params, "normalize", true)
     output = Map.get(params, "output", "levy_area")
     d = if is_list(channels), do: length(channels), else: 0
@@ -1886,6 +1892,9 @@ defmodule TradingCore.Signal.Compute do
 
     unless is_integer(window) and window >= 2,
       do: raise(ArgumentError, ":signature \"window\" must be an integer >= 2 bars")
+
+    unless is_nil(bar_interval_ms) or (is_integer(bar_interval_ms) and bar_interval_ms > 0),
+      do: raise(ArgumentError, ":signature \"bar_interval_ms\" must be a positive integer")
 
     unless is_boolean(normalize),
       do: raise(ArgumentError, ":signature \"normalize\" must be a boolean")
@@ -1929,7 +1938,8 @@ defmodule TradingCore.Signal.Compute do
       window: window,
       normalize: normalize,
       output: output,
-      selector: selector
+      selector: selector,
+      bar_interval_ms: bar_interval_ms
     }
   end
 
@@ -1938,9 +1948,61 @@ defmodule TradingCore.Signal.Compute do
   defp hold(state, key, value),
     do: Map.put(state, key, value |> to_decimal() |> Decimal.to_float())
 
+  defp hold_signature_tick(state, tick) do
+    state
+    |> hold(:price, Map.get(tick, :value))
+    |> hold(:reference, Map.get(tick, :reference))
+  end
+
+  defp step_signature_clocked(state, tick, bucket, config) do
+    volume = tick_volume(tick)
+
+    case state.pending do
+      %{bucket: open} = pending when bucket > open ->
+        # Close the open bar from the values held before this tick.
+        bar = signature_bar(state, pending.volume, config)
+        {state, out} = push_signature_bar(state, bar, config)
+        out = if bar, do: out, else: state.last
+
+        state =
+          state
+          |> hold_signature_tick(tick)
+          |> Map.merge(%{pending: %{bucket: bucket, volume: volume}, last: out})
+
+        {state, out}
+
+      %{volume: open_volume} = pending ->
+        state = hold_signature_tick(state, tick)
+        {%{state | pending: %{pending | volume: open_volume + volume}}, state.last}
+
+      nil ->
+        state = hold_signature_tick(state, tick)
+        {%{state | pending: %{bucket: bucket, volume: volume}}, state.last}
+    end
+  end
+
+  # Appends a bar (dropping the oldest past `window`) and reads the value,
+  # or :warming_up until the window is full or while there's no bar.
+  defp push_signature_bar(state, nil, _config), do: {state, :warming_up}
+
+  defp push_signature_bar(state, bar, config) do
+    bars = :queue.in(bar, state.bars)
+
+    {bars, size} =
+      if state.size + 1 > config.window,
+        do: {:queue.drop(bars), state.size},
+        else: {bars, state.size + 1}
+
+    state = %{state | bars: bars, size: size}
+
+    if size < config.window,
+      do: {state, :warming_up},
+      else: {state, signature_value(:queue.to_list(bars), config)}
+  end
+
   # One bar's raw inputs, or nil while a channel it needs has no value yet
   # (or a log channel would take the log of a non-positive price).
-  defp signature_bar(state, tick, %{channels: channels}) do
+  defp signature_bar(state, volume, %{channels: channels}) do
     needs = fn names -> Enum.any?(channels, &(&1 in names)) end
 
     cond do
@@ -1953,7 +2015,7 @@ defmodule TradingCore.Signal.Compute do
         nil
 
       true ->
-        %{price: state.price, reference: state.reference, volume: tick_volume(tick)}
+        %{price: state.price, reference: state.reference, volume: volume}
     end
   end
 
@@ -1995,6 +2057,9 @@ defmodule TradingCore.Signal.Compute do
   defp channel_value("reference", bar, _k, _cum), do: bar.reference
   defp channel_value("reference_log_price", bar, _k, _cum), do: :math.log(bar.reference)
   defp channel_value("volume", _bar, _k, cum), do: cum
+  # log(1 + v): a bar with no volume (a quote-only interval) stays finite.
+  defp channel_value("log_volume", bar, _k, _cum), do: :math.log(1 + bar.volume)
+  defp channel_value("log_cum_volume", _bar, _k, cum), do: :math.log(1 + cum)
   defp channel_value("time", _bar, k, _cum), do: k * 1.0
 
   @doc """
