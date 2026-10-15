@@ -329,7 +329,19 @@ defmodule TradingCore.Signal.Compute do
     _validated = signature_config!(spec)
 
     {:ok,
-     %{bars: :queue.new(), size: 0, price: nil, reference: nil, pending: nil, last: :warming_up}}
+     %{
+       bars: :queue.new(),
+       size: 0,
+       pending: nil,
+       last: :warming_up,
+       session: nil,
+       price: nil,
+       reference: nil,
+       quote: new_quote_state(),
+       prev_quote: nil,
+       mid: nil,
+       cum_ofi: nil
+     }}
   end
 
   def init(%Spec{kind: kind})
@@ -633,17 +645,43 @@ defmodule TradingCore.Signal.Compute do
   #     not a run of flat bars). Between closes the step returns the value
   #     computed at the last close. A late tick (earlier bucket) counts
   #     toward the open bar.
+  #
+  # Quote channels ("mid", "cum_ofi") take quote ticks
+  # %{at, bid, ask, bid_size, ask_size} instead, merged with merge_quote/3
+  # as :ofi does; they combine only with "time". A quote tick that leaves
+  # the book not ready (a side missing, or the sides further apart than
+  # params["max_quote_staleness_ms"]) is ignored for bars, so it neither
+  # opens nor closes one. "cum_ofi" is the running sum of :ofi's
+  # per-update contribution since init or the last session reset, never
+  # trimmed to the window (a Levy area is translation-invariant). "mid"
+  # updates only on a book with ask above bid.
+  #
+  # params["session_reset"] (an injected fn, as on :moving_average) clears
+  # the bars, the open bar, the held values and cum_ofi when it returns a
+  # new session, so no window straddles the overnight gap.
+  # params["max_window_span_ms"] reports :warming_up while the window's
+  # bars span longer than that, newest bar start minus oldest.
   def step(%Spec{kind: :signature} = spec, state, %{at: at} = tick) do
     config = signature_config!(spec)
+    state = maybe_reset_signature_session(state, at, config.session_reset)
+    t_ms = DateTime.to_unix(at, :millisecond)
 
-    case config.bar_interval_ms do
-      nil ->
-        state = hold_signature_tick(state, tick)
-        push_signature_bar(state, signature_bar(state, tick_volume(tick), config), config)
+    case absorb_signature_tick(state, tick, at, config) do
+      :ignored ->
+        # Keep the merged sides so a later update can pair with them.
+        {%{state | quote: merge_quote(state.quote, tick, at)}, state.last}
 
-      interval_ms ->
-        bucket = Integer.floor_div(DateTime.to_unix(at, :millisecond), interval_ms)
-        step_signature_clocked(state, tick, bucket, config)
+      {:ok, absorbed} ->
+        case config.bar_interval_ms do
+          nil ->
+            bar = signature_bar(absorbed, tick_volume(tick), t_ms, config)
+            {absorbed, out} = push_signature_bar(absorbed, bar, config)
+            {%{absorbed | last: out}, out}
+
+          interval_ms ->
+            bucket = Integer.floor_div(t_ms, interval_ms)
+            step_signature_clocked(state, absorbed, tick, bucket, config)
+        end
     end
   end
 
@@ -1863,7 +1901,9 @@ defmodule TradingCore.Signal.Compute do
   ## :signature helpers
   ## -----------------------------------------------------------------------
 
-  @signature_channels ~w(price log_price reference reference_log_price volume log_volume log_cum_volume time)
+  @signature_quote_channels ~w(mid cum_ofi)
+  @signature_channels ~w(price log_price reference reference_log_price volume log_volume log_cum_volume time) ++
+                        @signature_quote_channels
   @signature_outputs ~w(levy_area level1 level2)
 
   # Validates and reads the :signature params; raises ArgumentError on a
@@ -1875,6 +1915,10 @@ defmodule TradingCore.Signal.Compute do
   #   "normalize" per-channel z-score within the window (default true)
   #   "output"    "levy_area" | "level2" (both need "pair": [i, j], i != j
   #               for levy_area) | "level1" (needs "index": i)
+  #   "session_reset"         a 1-arity fn, at -> session (see step/3)
+  #   "max_window_span_ms"    a positive integer (see step/3)
+  #   "max_quote_staleness_ms" quote channels only, as on :ofi
+  # Quote channels ("mid", "cum_ofi") combine only with "time".
   defp signature_config!(%Spec{params: params}) do
     channels = Map.get(params, "channels")
     window = Map.get(params, "window", 30)
@@ -1889,6 +1933,27 @@ defmodule TradingCore.Signal.Compute do
           ArgumentError,
           ":signature needs 2-4 \"channels\" from #{inspect(@signature_channels)}"
         )
+
+    quote? = Enum.any?(channels, &(&1 in @signature_quote_channels))
+
+    if quote? and not Enum.all?(channels, &(&1 in ["time" | @signature_quote_channels])),
+      do:
+        raise(
+          ArgumentError,
+          ":signature quote channels (mid, cum_ofi) combine only with \"time\", " <>
+            "not price/reference/volume channels: #{inspect(channels)}"
+        )
+
+    session_reset = Map.get(params, "session_reset")
+    max_window_span_ms = Map.get(params, "max_window_span_ms")
+
+    unless is_nil(session_reset) or is_function(session_reset, 1),
+      do: raise(ArgumentError, ":signature \"session_reset\" must be a 1-arity function")
+
+    unless is_nil(max_window_span_ms) or
+             (is_integer(max_window_span_ms) and max_window_span_ms > 0),
+           do:
+             raise(ArgumentError, ":signature \"max_window_span_ms\" must be a positive integer")
 
     unless is_integer(window) and window >= 2,
       do: raise(ArgumentError, ":signature \"window\" must be an integer >= 2 bars")
@@ -1939,7 +2004,11 @@ defmodule TradingCore.Signal.Compute do
       normalize: normalize,
       output: output,
       selector: selector,
-      bar_interval_ms: bar_interval_ms
+      bar_interval_ms: bar_interval_ms,
+      quote?: quote?,
+      session_reset: session_reset,
+      max_window_span_ms: max_window_span_ms,
+      max_quote_staleness_ms: Map.get(params, "max_quote_staleness_ms")
     }
   end
 
@@ -1948,41 +2017,73 @@ defmodule TradingCore.Signal.Compute do
   defp hold(state, key, value),
     do: Map.put(state, key, value |> to_decimal() |> Decimal.to_float())
 
-  defp hold_signature_tick(state, tick) do
-    state
-    |> hold(:price, Map.get(tick, :value))
-    |> hold(:reference, Map.get(tick, :reference))
+  # {:ok, state with this tick's values held}, or :ignored for a quote
+  # tick that leaves the book not ready.
+  defp absorb_signature_tick(state, tick, _at, %{quote?: false}) do
+    {:ok,
+     state
+     |> hold(:price, Map.get(tick, :value))
+     |> hold(:reference, Map.get(tick, :reference))}
   end
 
-  defp step_signature_clocked(state, tick, bucket, config) do
+  defp absorb_signature_tick(state, tick, at, %{quote?: true} = config) do
+    quote_state = merge_quote(state.quote, tick, at)
+
+    if quote_ready?(quote_state, config.max_quote_staleness_ms) do
+      cum_ofi =
+        case state.prev_quote do
+          nil ->
+            state.cum_ofi || 0.0
+
+          prev ->
+            case ofi_contribution(prev, quote_state) do
+              nil -> state.cum_ofi
+              contribution -> state.cum_ofi + Decimal.to_float(contribution)
+            end
+        end
+
+      {:ok,
+       %{
+         state
+         | quote: quote_state,
+           prev_quote: quote_state,
+           cum_ofi: cum_ofi,
+           mid: quote_mid(quote_state) || state.mid
+       }}
+    else
+      :ignored
+    end
+  end
+
+  defp quote_mid(%{bid: bid, ask: ask}) do
+    if Decimal.compare(ask, bid) == :gt,
+      do: bid |> mid_price(ask) |> Decimal.to_float(),
+      else: nil
+  end
+
+  # `state` holds the values before this tick, `absorbed` after it. A tick
+  # in a later bucket closes the open bar from `state`'s values.
+  defp step_signature_clocked(state, absorbed, tick, bucket, config) do
     volume = tick_volume(tick)
 
     case state.pending do
       %{bucket: open} = pending when bucket > open ->
-        # Close the open bar from the values held before this tick.
-        bar = signature_bar(state, pending.volume, config)
-        {state, out} = push_signature_bar(state, bar, config)
+        bar = signature_bar(state, pending.volume, open * config.bar_interval_ms, config)
+        {absorbed, out} = push_signature_bar(absorbed, bar, config)
         out = if bar, do: out, else: state.last
-
-        state =
-          state
-          |> hold_signature_tick(tick)
-          |> Map.merge(%{pending: %{bucket: bucket, volume: volume}, last: out})
-
-        {state, out}
+        {%{absorbed | pending: %{bucket: bucket, volume: volume}, last: out}, out}
 
       %{volume: open_volume} = pending ->
-        state = hold_signature_tick(state, tick)
-        {%{state | pending: %{pending | volume: open_volume + volume}}, state.last}
+        {%{absorbed | pending: %{pending | volume: open_volume + volume}}, state.last}
 
       nil ->
-        state = hold_signature_tick(state, tick)
-        {%{state | pending: %{bucket: bucket, volume: volume}}, state.last}
+        {%{absorbed | pending: %{bucket: bucket, volume: volume}}, state.last}
     end
   end
 
-  # Appends a bar (dropping the oldest past `window`) and reads the value,
-  # or :warming_up until the window is full or while there's no bar.
+  # Appends a bar (dropping the oldest past `window`) and reads the value:
+  # :warming_up until the window is full, while there's no bar, or while
+  # the window spans longer than max_window_span_ms.
   defp push_signature_bar(state, nil, _config), do: {state, :warming_up}
 
   defp push_signature_bar(state, bar, config) do
@@ -1995,14 +2096,50 @@ defmodule TradingCore.Signal.Compute do
 
     state = %{state | bars: bars, size: size}
 
-    if size < config.window,
-      do: {state, :warming_up},
-      else: {state, signature_value(:queue.to_list(bars), config)}
+    cond do
+      size < config.window -> {state, :warming_up}
+      too_wide?(bars, config.max_window_span_ms) -> {state, :warming_up}
+      true -> {state, signature_value(:queue.to_list(bars), config)}
+    end
   end
 
-  # One bar's raw inputs, or nil while a channel it needs has no value yet
-  # (or a log channel would take the log of a non-positive price).
-  defp signature_bar(state, volume, %{channels: channels}) do
+  defp too_wide?(_bars, nil), do: false
+
+  defp too_wide?(bars, max_span_ms) do
+    {:value, oldest} = :queue.peek(bars)
+    {:value, newest} = :queue.peek_r(bars)
+    newest.t - oldest.t > max_span_ms
+  end
+
+  defp maybe_reset_signature_session(state, _at, nil), do: state
+
+  defp maybe_reset_signature_session(state, at, session_reset) do
+    session = session_reset.(at)
+
+    if state.session != nil and session != state.session do
+      %{
+        state
+        | bars: :queue.new(),
+          size: 0,
+          pending: nil,
+          last: :warming_up,
+          price: nil,
+          reference: nil,
+          quote: new_quote_state(),
+          prev_quote: nil,
+          mid: nil,
+          cum_ofi: nil,
+          session: session
+      }
+    else
+      %{state | session: session}
+    end
+  end
+
+  # One bar's raw inputs (t: its start in unix ms), or nil while a channel
+  # it needs has no value yet (or a log channel would take the log of a
+  # non-positive price).
+  defp signature_bar(state, volume, t_ms, %{channels: channels}) do
     needs = fn names -> Enum.any?(channels, &(&1 in names)) end
 
     cond do
@@ -2014,8 +2151,21 @@ defmodule TradingCore.Signal.Compute do
           not positive_or_unneeded?(state.reference, needs.(~w(reference_log_price))) ->
         nil
 
+      needs.(["mid"]) and state.mid == nil ->
+        nil
+
+      needs.(["cum_ofi"]) and state.cum_ofi == nil ->
+        nil
+
       true ->
-        %{price: state.price, reference: state.reference, volume: volume}
+        %{
+          t: t_ms,
+          price: state.price,
+          reference: state.reference,
+          mid: state.mid,
+          cum_ofi: state.cum_ofi,
+          volume: volume
+        }
     end
   end
 
@@ -2060,6 +2210,8 @@ defmodule TradingCore.Signal.Compute do
   # log(1 + v): a bar with no volume (a quote-only interval) stays finite.
   defp channel_value("log_volume", bar, _k, _cum), do: :math.log(1 + bar.volume)
   defp channel_value("log_cum_volume", _bar, _k, cum), do: :math.log(1 + cum)
+  defp channel_value("mid", bar, _k, _cum), do: bar.mid
+  defp channel_value("cum_ofi", bar, _k, _cum), do: bar.cum_ofi
   defp channel_value("time", _bar, k, _cum), do: k * 1.0
 
   @doc """

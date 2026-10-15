@@ -298,6 +298,242 @@ defmodule TradingCore.Signals.SignatureTest do
       end
     end
 
+    defp qspec(params) do
+      %Spec{
+        kind: :signature,
+        symbol: "QQQ",
+        params:
+          Map.merge(
+            %{
+              "channels" => ["cum_ofi", "mid"],
+              "window" => 8,
+              "bar_interval_ms" => 1000,
+              "normalize" => true,
+              "pair" => [0, 1]
+            },
+            params
+          )
+      }
+    end
+
+    defp sec(s, ms \\ 0), do: DateTime.add(@t0, s * 1000 + ms, :millisecond)
+
+    defp quote_tick(s, bid, ask, bid_size, ask_size),
+      do: %{at: sec(s), bid: bid, ask: ask, bid_size: bid_size, ask_size: ask_size}
+
+    # Cleanly separated events (ask size is always 0, and a price move
+    # resets the bid size to 0, so a move contributes no OFI):
+    #   :flow  bid size 0 -> 100 at the same price: OFI +100, mid unchanged
+    #   :move  bid and ask up a cent with zero sizes: mid +0.01, OFI 0
+    defp quote_events(order, cycles) do
+      events = List.duplicate(order, cycles) |> List.flatten()
+
+      {ticks, _} =
+        events
+        |> Enum.with_index()
+        |> Enum.map_reduce(100.0, fn
+          {:flow, i}, bid -> {quote_tick(i, bid, bid + 0.02, 100, 0), bid}
+          {:move, i}, bid -> {quote_tick(i, bid + 0.01, bid + 0.03, 0, 0), bid + 0.01}
+        end)
+
+      ticks
+    end
+
+    defp values(out), do: Enum.filter(out, &match?(%Decimal{}, &1))
+
+    # One quote per second. OFI comes only from the bid side (bid price
+    # fixed, bid size = 10_000 + ofi_k, so each update adds ofi_k - ofi_k-1);
+    # mid moves only through the ask price, whose size is 0 so it adds no
+    # OFI. The ask sits far above the bid so the book never crosses (a
+    # crossed book freezes the mid). `lag` > 0: mid follows OFI by `lag`
+    # bars; < 0: mid leads.
+    defp lead_lag_quotes(walk, lag) do
+      n = length(walk) - abs(lag)
+      ofi = if lag >= 0, do: Enum.drop(walk, lag), else: Enum.take(walk, n)
+      mid = if lag >= 0, do: Enum.take(walk, n), else: Enum.drop(walk, -lag)
+
+      Enum.zip_with([ofi, mid, Enum.to_list(0..(n - 1))], fn [o, m, i] ->
+        quote_tick(i, 100.0, 200.0 + 0.01 * m, 10_000 + o, 0)
+      end)
+    end
+
+    # A lag-1 random walk gives a strong but not perfect sign over a finite
+    # window: at least 90% of windows, and the mean, on the expected side.
+    defp mostly?(values, side) do
+      values != [] and
+        Enum.count(values, &(Decimal.compare(&1, 0) == side)) >= 0.9 * length(values) and
+        Decimal.compare(Enum.reduce(values, &Decimal.add/2), 0) == side
+    end
+
+    test "quote channels: OFI leading mid gives a positive area, mid leading OFI a negative one" do
+      :rand.seed(:exsss, {2, 7, 1})
+
+      for _ <- 1..20 do
+        walk = Enum.scan(1..80, 0, fn _, acc -> acc + round(10 * :rand.normal()) end)
+        spec = qspec(%{"window" => 40})
+
+        lead = run(spec, lead_lag_quotes(walk, 1)) |> values()
+        lag = run(spec, lead_lag_quotes(walk, -1)) |> values()
+        assert mostly?(lead, :gt) and mostly?(lag, :lt)
+      end
+    end
+
+    test "quote channels: cum_ofi keeps the full running sum past the window" do
+      spec = qspec(%{"window" => 3, "normalize" => false})
+      {:ok, st} = Compute.init(spec)
+
+      st =
+        Enum.reduce(quote_events([:flow, :move], 6), st, fn tick, st ->
+          {st, _} = Compute.step(spec, st, tick)
+          st
+        end)
+
+      # 6 flow events of +100, well past a 3-bar window; the very first
+      # quote has no prior book, so it contributes nothing
+      assert st.cum_ofi == 500.0
+      # the newest closed bar (the open one is the last :move)
+      {:value, newest} = :queue.peek_r(st.bars)
+      assert newest.cum_ofi == 500.0
+      assert st.size == 3
+    end
+
+    test "quote channels: one-sided updates hold the other side; a quote-free second adds no bar" do
+      spec = qspec(%{"window" => 2, "normalize" => false, "output" => "level1", "index" => 1})
+
+      out =
+        run(spec, [
+          %{at: sec(0), bid: 10.0, bid_size: 5},
+          %{at: sec(0, 500), ask: 10.2, ask_size: 5},
+          # second 1: bid only, ask held at 10.2 -> mid 10.1
+          %{at: sec(1), bid: 10.0, bid_size: 5},
+          # seconds 2-4: nothing; second 5: ask only -> mid 10.2
+          %{at: sec(5), ask: 10.4, ask_size: 5},
+          %{at: sec(6), bid: 10.0, bid_size: 5}
+        ])
+
+      # bars: s0 mid 10.1, s1 mid 10.1, s5 mid 10.2 (no bars for s2-s4).
+      # Window [s1, s5] mid increment is 0.1.
+      assert List.last(out) == Decimal.new("0.10000000")
+    end
+
+    test "quote channels: a quote with stale sides is ignored" do
+      spec =
+        qspec(%{
+          "window" => 2,
+          "normalize" => false,
+          "output" => "level1",
+          "index" => 1,
+          "max_quote_staleness_ms" => 1000
+        })
+
+      out =
+        run(spec, [
+          quote_tick(0, 10.0, 10.2, 1, 1),
+          quote_tick(1, 10.0, 10.2, 1, 1),
+          # bid printed 5s after the last ask: not ready, ignored
+          %{at: sec(6), bid: 11.0, bid_size: 1},
+          %{at: sec(7), ask: 11.2, ask_size: 1},
+          quote_tick(8, 10.0, 10.2, 1, 1)
+        ])
+
+      # bars: s0, s1, s7 (fresh pair 11.0/11.2, mid 11.1). s6 made no bar.
+      assert Enum.at(out, 2) == Enum.at(out, 1)
+      assert List.last(out) == Decimal.new("1.00000000")
+    end
+
+    test "quote channels mixed with price/volume channels raise; time is allowed" do
+      for channels <- [["mid", "price"], ["cum_ofi", "volume"], ["mid", "reference_log_price"]] do
+        assert_raise ArgumentError, fn -> Compute.init(qspec(%{"channels" => channels})) end
+      end
+
+      assert {:ok, _} = Compute.init(qspec(%{"channels" => ["time", "cum_ofi", "mid"]}))
+    end
+
+    test "session_reset clears the bars and restarts cum_ofi; an unbroken session does not" do
+      day = fn at -> DateTime.to_date(at) end
+      spec = qspec(%{"window" => 3, "session_reset" => day})
+      ticks = quote_events([:flow, :move], 4)
+      next_day = Enum.map(ticks, &%{&1 | at: DateTime.add(&1.at, 1, :day)})
+
+      {:ok, st} = Compute.init(spec)
+
+      fold = fn ticks, st ->
+        Enum.reduce(ticks, st, fn t, st -> elem(Compute.step(spec, st, t), 0) end)
+      end
+
+      # 4 flows, the first without a prior book
+      st = fold.(ticks, st)
+      assert st.cum_ofi == 300.0 and st.size == 3
+
+      # first tick of the next day: everything restarts
+      {st2, out} = Compute.step(spec, st, hd(next_day))
+      assert out == :warming_up
+      assert st2.size == 0 and st2.pending.bucket != nil
+      assert st2.cum_ofi == 0.0
+
+      st2 = fold.(tl(next_day), st2)
+      assert st2.cum_ofi == 300.0
+
+      # the same ticks without a day change never reset
+      st3 =
+        fold.(
+          ticks ++ Enum.map(ticks, &%{&1 | at: DateTime.add(&1.at, 60)}),
+          elem(Compute.init(spec), 1)
+        )
+
+      # no reset: the second batch adds to the first. Its first flow comes
+      # after a higher bid (a fall, -0 prior size), so it adds 0: 300 + 300
+      assert st3.cum_ofi == 600.0 and st3.size == 3
+    end
+
+    test "max_window_span_ms reports :warming_up while the window spans too long" do
+      spec = qspec(%{"window" => 2, "max_window_span_ms" => 2000, "normalize" => false})
+
+      out =
+        run(spec, [
+          quote_tick(0, 10.0, 10.2, 1, 1),
+          quote_tick(1, 10.1, 10.3, 1, 1),
+          quote_tick(2, 10.2, 10.4, 1, 1),
+          # 10 seconds later. Each tick closes the previous second's bar:
+          # s12 closes s2 (window [s1, s2]), s13 closes s12 (window
+          # [s2, s12], 10s span), s14 closes s13 (window [s12, s13])
+          quote_tick(12, 10.3, 10.5, 1, 1),
+          quote_tick(13, 10.4, 10.6, 1, 1),
+          quote_tick(14, 10.5, 10.7, 1, 1)
+        ])
+
+      assert [:warming_up, :warming_up, %Decimal{}, %Decimal{}, :warming_up, %Decimal{}] = out
+    end
+
+    test "invalid session_reset / max_window_span_ms raise" do
+      for bad <- [
+            %{"session_reset" => "daily"},
+            %{"session_reset" => fn -> 1 end},
+            %{"max_window_span_ms" => 0}
+          ] do
+        assert_raise ArgumentError, fn -> Compute.init(qspec(bad)) end
+      end
+    end
+
+    property "quote mode: replay/3 equals folding step/2" do
+      check all(
+              moves <- list_of(member_of([:flow, :move, :both]), min_length: 2, max_length: 40),
+              gaps <- list_of(integer(1..3), length: length(moves))
+            ) do
+        {ticks, _} =
+          moves
+          |> Enum.zip(Enum.scan(gaps, &(&1 + &2)))
+          |> Enum.map_reduce(100.0, fn
+            {:flow, s}, bid -> {quote_tick(s, bid, bid + 0.02, 50 + s, 10), bid}
+            {:move, s}, bid -> {quote_tick(s, bid + 0.01, bid + 0.03, 10, 20), bid + 0.01}
+            {:both, s}, bid -> {quote_tick(s, bid - 0.01, bid + 0.01, 30, s), bid - 0.01}
+          end)
+
+        spec = qspec(%{"window" => 4})
+        assert run(spec, ticks) == Compute.replay(spec, ticks, only: spec)
+      end
+    end
+
     property "replay/3 equals folding step/2" do
       check all(
               xs <- list_of(float(min: 50.0, max: 150.0), min_length: 2, max_length: 40),
