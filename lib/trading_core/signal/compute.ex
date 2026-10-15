@@ -224,6 +224,7 @@ defmodule TradingCore.Signal.Compute do
   """
 
   alias TradingCore.Microstructure
+  alias TradingCore.Signals.Signature
   alias TradingCore.Signal.{Spec, TickWindow}
   alias TradingCore.{Signals, WelfordAcc}
 
@@ -323,6 +324,11 @@ defmodule TradingCore.Signal.Compute do
 
   def init(%Spec{kind: :self_zscore}), do: {:ok, %{history: [], welford: WelfordAcc.new()}}
   def init(%Spec{kind: :moving_average}), do: {:ok, %{ma: Signals.moving_average_new()}}
+
+  def init(%Spec{kind: :signature} = spec) do
+    _validated = signature_config!(spec)
+    {:ok, %{bars: :queue.new(), size: 0, price: nil, reference: nil}}
+  end
 
   def init(%Spec{kind: kind})
       when kind in [:percent_deviation, :ratio] do
@@ -602,6 +608,40 @@ defmodule TradingCore.Signal.Compute do
 
     {ma, result} = Signals.moving_average(state.ma, value, now, opts)
     {%{state | ma: ma}, warm(result)}
+  end
+
+  # :signature: the level-1/2 path signature of the last params["window"]
+  # bars (default 30) over 2-4 channels, recomputed in full each step, and
+  # one scalar read from it. See signature_config!/1 for the params and
+  # TradingCore.Signals.Signature for the math. A tick is one bar:
+  # %{at, value, reference, volume}; the last known value/reference is
+  # held when a tick carries only one of them, as :spread does.
+  def step(%Spec{kind: :signature} = spec, state, %{at: _now} = tick) do
+    config = signature_config!(spec)
+
+    state =
+      state
+      |> hold(:price, Map.get(tick, :value))
+      |> hold(:reference, Map.get(tick, :reference))
+
+    case signature_bar(state, tick, config) do
+      nil ->
+        {state, :warming_up}
+
+      bar ->
+        bars = :queue.in(bar, state.bars)
+
+        {bars, size} =
+          if state.size + 1 > config.window,
+            do: {:queue.drop(bars), state.size},
+            else: {bars, state.size + 1}
+
+        state = %{state | bars: bars, size: size}
+
+        if size < config.window,
+          do: {state, :warming_up},
+          else: {state, signature_value(:queue.to_list(bars), config)}
+    end
   end
 
   def step(%Spec{kind: :percent_deviation}, state, tick) do
@@ -1685,7 +1725,7 @@ defmodule TradingCore.Signal.Compute do
   # a :spread node directly; this clause forwards it unmodified same as
   # every other base kind's single-price tick.
   defp tick_for(%Spec{kind: kind} = node, at, ticks_by_base_and_at, _series)
-       when kind in [:plain, :volume, :vwap, :donchian, :rolling_volume, :spread] do
+       when kind in [:plain, :volume, :vwap, :donchian, :rolling_volume, :spread, :signature] do
     case Map.fetch(ticks_by_base_and_at, node) do
       {:ok, %{^at => tick}} -> tick
       _ -> :not_ready
@@ -1815,6 +1855,147 @@ defmodule TradingCore.Signal.Compute do
   """
   @spec donchian_bands(map()) :: {Decimal.t(), Decimal.t(), Decimal.t()} | nil
   def donchian_bands(%{window: window}), do: TickWindow.extremes_bands(window)
+
+  ## -----------------------------------------------------------------------
+  ## :signature helpers
+  ## -----------------------------------------------------------------------
+
+  @signature_channels ~w(price log_price reference reference_log_price volume time)
+  @signature_outputs ~w(levy_area level1 level2)
+
+  # Validates and reads the :signature params; raises ArgumentError on a
+  # bad config (an invalid spec is a setup mistake, not a runtime state).
+  #   "channels"  2-4 of #{inspect(@signature_channels)}
+  #   "window"    bars, an integer >= 2 (default 30)
+  #   "normalize" per-channel z-score within the window (default true)
+  #   "output"    "levy_area" | "level2" (both need "pair": [i, j], i != j
+  #               for levy_area) | "level1" (needs "index": i)
+  defp signature_config!(%Spec{params: params}) do
+    channels = Map.get(params, "channels")
+    window = Map.get(params, "window", 30)
+    normalize = Map.get(params, "normalize", true)
+    output = Map.get(params, "output", "levy_area")
+    d = if is_list(channels), do: length(channels), else: 0
+
+    unless is_list(channels) and d in 2..4 and Enum.all?(channels, &(&1 in @signature_channels)),
+      do:
+        raise(
+          ArgumentError,
+          ":signature needs 2-4 \"channels\" from #{inspect(@signature_channels)}"
+        )
+
+    unless is_integer(window) and window >= 2,
+      do: raise(ArgumentError, ":signature \"window\" must be an integer >= 2 bars")
+
+    unless is_boolean(normalize),
+      do: raise(ArgumentError, ":signature \"normalize\" must be a boolean")
+
+    unless output in @signature_outputs,
+      do:
+        raise(
+          ArgumentError,
+          ":signature \"output\" must be one of #{inspect(@signature_outputs)}"
+        )
+
+    index_ok? = fn i -> is_integer(i) and i >= 0 and i < d end
+
+    selector =
+      case {output, Map.get(params, "pair"), Map.get(params, "index")} do
+        {"level1", _, i} ->
+          if index_ok?.(i),
+            do: i,
+            else: raise(ArgumentError, ":signature level1 needs \"index\" in 0..#{d - 1}")
+
+        {"levy_area", [i, j], _} ->
+          if index_ok?.(i) and index_ok?.(j) and i != j,
+            do: {i, j},
+            else:
+              raise(
+                ArgumentError,
+                ":signature levy_area needs \"pair\": [i, j], two different channels"
+              )
+
+        {"level2", [i, j], _} ->
+          if index_ok?.(i) and index_ok?.(j),
+            do: {i, j},
+            else: raise(ArgumentError, ":signature level2 needs \"pair\": [i, j] in 0..#{d - 1}")
+
+        _ ->
+          raise ArgumentError, ":signature #{output} needs a \"pair\" (or \"index\" for level1)"
+      end
+
+    %{
+      channels: channels,
+      window: window,
+      normalize: normalize,
+      output: output,
+      selector: selector
+    }
+  end
+
+  defp hold(state, _key, nil), do: state
+
+  defp hold(state, key, value),
+    do: Map.put(state, key, value |> to_decimal() |> Decimal.to_float())
+
+  # One bar's raw inputs, or nil while a channel it needs has no value yet
+  # (or a log channel would take the log of a non-positive price).
+  defp signature_bar(state, tick, %{channels: channels}) do
+    needs = fn names -> Enum.any?(channels, &(&1 in names)) end
+
+    cond do
+      needs.(~w(price log_price)) and
+          not positive_or_unneeded?(state.price, needs.(~w(log_price))) ->
+        nil
+
+      needs.(~w(reference reference_log_price)) and
+          not positive_or_unneeded?(state.reference, needs.(~w(reference_log_price))) ->
+        nil
+
+      true ->
+        %{price: state.price, reference: state.reference, volume: tick_volume(tick)}
+    end
+  end
+
+  defp positive_or_unneeded?(nil, _log?), do: false
+  defp positive_or_unneeded?(value, true), do: value > 0
+  defp positive_or_unneeded?(_value, false), do: true
+
+  defp tick_volume(tick) do
+    case Map.get(tick, :volume) do
+      nil -> 0.0
+      v -> v |> to_decimal() |> Decimal.to_float()
+    end
+  end
+
+  defp signature_value(bars, %{channels: channels} = config) do
+    {path, _cum} =
+      bars
+      |> Enum.with_index()
+      |> Enum.map_reduce(0.0, fn {bar, k}, cum_volume ->
+        cum_volume = cum_volume + bar.volume
+        {Enum.map(channels, &channel_value(&1, bar, k, cum_volume)), cum_volume}
+      end)
+
+    path = if config.normalize, do: Signature.normalize(path), else: path
+    sig = Signature.signature(path)
+
+    value =
+      case {config.output, config.selector} do
+        {"levy_area", {i, j}} -> Signature.levy_area(sig, i, j)
+        {"level2", {i, j}} -> sig.level2 |> Enum.at(i) |> Enum.at(j)
+        {"level1", i} -> Enum.at(sig.level1, i)
+      end
+
+    value |> Decimal.from_float() |> Decimal.round(8)
+  end
+
+  defp channel_value("price", bar, _k, _cum), do: bar.price
+  defp channel_value("log_price", bar, _k, _cum), do: :math.log(bar.price)
+  defp channel_value("reference", bar, _k, _cum), do: bar.reference
+  defp channel_value("reference_log_price", bar, _k, _cum), do: :math.log(bar.reference)
+  defp channel_value("volume", _bar, _k, cum), do: cum
+  defp channel_value("time", _bar, k, _cum), do: k * 1.0
 
   @doc """
   `{newest_at, oldest_at}` of the prices a `:donchian` state's window
