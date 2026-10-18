@@ -2,7 +2,8 @@ defmodule TradingCore.Signals.VsCloses do
   @moduledoc """
   A live price measured against its own recent daily closes: the
   percentage away from their mean (`"pct"`) or the z-score against them
-  (`"zscore"`). Backs trading_signal's `vix_vs_closes` and `vs_closes`
+  (`"zscore"`). Also the realized volatility of those closes
+  (`"realized_vol"`), which ignores the live price. Backs trading_signal's `vix_vs_closes` and `vs_closes`
   source types (e.g. `ibkr_vix_vs_5d_avg_pct`,
   `massive_qqq_vs_20d_zscore`), and lets trading_backtest replay them.
 
@@ -17,6 +18,22 @@ defmodule TradingCore.Signals.VsCloses do
   bar never counts. `series/5` computes each tick against the baseline
   for that tick's own date.
 
+  ## Realized volatility
+
+  `"realized_vol"` is close-to-close realized vol over the last `days`
+  daily **returns**, so it reads `days + 1` closes (`closes_needed/2`):
+
+      RV = sqrt(Σ r² / N) × sqrt(252) × 100,   r = ln(c_t / c_{t-1})
+
+  Annualized and in percent, so it reads in VIX's units (e.g. 14.2).
+
+  It is the **zero-mean** RMS of the returns, not the n − 1 sample
+  standard deviation. That is the usual realized-vol convention, and at a
+  short window it matters: demeaning a 5-day window that trended removes
+  the trend from the volatility, understating it. It is fixed for a
+  session (prior closes only), so every tick of the day gets the same
+  value.
+
   ## Arithmetic and precision
 
   Mean and standard deviation are computed in floats, exactly as
@@ -28,16 +45,28 @@ defmodule TradingCore.Signals.VsCloses do
   """
 
   @type output :: String.t()
-  @type baseline :: %{
-          required(:mean) => float(),
-          required(:n) => pos_integer(),
-          optional(:sd) => float()
-        }
+  @type baseline ::
+          %{
+            required(:mean) => float(),
+            required(:n) => pos_integer(),
+            optional(:sd) => float()
+          }
+          | %{required(:rv) => float(), required(:n) => pos_integer()}
 
   @timezone "America/New_York"
   @precision 8
   @default_max_staleness_days 5
   @min_zscore_samples 3
+  @trading_days_per_year 252
+
+  @doc """
+  How many daily closes `output` needs for a `days` setting: `days + 1`
+  for `"realized_vol"` (`days` counts returns), `days` otherwise. Pass it
+  to `closes_before/4`; `series/5` does.
+  """
+  @spec closes_needed(pos_integer(), output()) :: pos_integer()
+  def closes_needed(days, "realized_vol"), do: days + 1
+  def closes_needed(days, _output), do: days
 
   @doc """
   The last `days` daily closes from US/Eastern dates strictly before
@@ -77,13 +106,35 @@ defmodule TradingCore.Signals.VsCloses do
   end
 
   @doc """
-  The baseline of `closes` for `output`: `%{mean, n}` for `"pct"`, plus
-  the sample standard deviation `sd` (n − 1) for `"zscore"`. `nil` for no
-  closes, or for `"zscore"` with fewer than #{@min_zscore_samples}.
+  The baseline of `closes` (newest first, as `closes_before/4` returns
+  them) for `output`: `%{mean, n}` for `"pct"`, plus the sample standard
+  deviation `sd` (n − 1) for `"zscore"`. `nil` for no closes, or for
+  `"zscore"` with fewer than #{@min_zscore_samples}.
+
+  For `"realized_vol"`, `%{rv, n}` with `n` the number of returns (see
+  "Realized volatility" above); `nil` for fewer than 2 closes or any
+  close `<= 0`.
   """
   @spec baseline([Decimal.t() | number()] | nil, output()) :: baseline() | nil
   def baseline(nil, _output), do: nil
   def baseline([], _output), do: nil
+
+  def baseline(closes, "realized_vol") do
+    floats = closes |> Enum.map(&to_float/1) |> Enum.reverse()
+
+    if length(floats) < 2 or Enum.any?(floats, &(&1 <= 0)) do
+      nil
+    else
+      returns =
+        floats
+        |> Enum.chunk_every(2, 1, :discard)
+        |> Enum.map(fn [prev, curr] -> :math.log(curr / prev) end)
+
+      n = length(returns)
+      rms = :math.sqrt(Enum.sum(Enum.map(returns, &(&1 * &1))) / n)
+      %{rv: rms * :math.sqrt(@trading_days_per_year) * 100, n: n}
+    end
+  end
 
   def baseline(closes, output) do
     floats = Enum.map(closes, &to_float/1)
@@ -110,10 +161,15 @@ defmodule TradingCore.Signals.VsCloses do
     * `"zscore"`: `(price − mean) / sd`; `nil` when the closes are flat,
       `sd <= max(|mean| × 1e-6, 1e-12)`.
 
-  `nil` for a `nil` or non-numeric price or a `nil` baseline.
+    * `"realized_vol"`: the baseline's `rv`. The price is ignored, so
+      every tick of a session returns the same value.
+
+  `nil` for a `nil` or non-numeric price (except `"realized_vol"`) or a
+  `nil` baseline.
   """
   @spec compute(Decimal.t() | number() | nil, baseline() | nil, output()) :: Decimal.t() | nil
   def compute(_price, nil, _output), do: nil
+  def compute(_price, %{rv: rv}, "realized_vol"), do: round_out(rv)
 
   def compute(price, baseline, output) do
     case to_float(price) do
@@ -136,14 +192,17 @@ defmodule TradingCore.Signals.VsCloses do
 
   @doc """
   Batch form for replay: one value per tick in `ticks` (`[{DateTime.t(),
-  price}]`), each computed against the baseline of the `days` closes
-  strictly before that tick's own US/Eastern date (no look-ahead).
+  price}]`), each computed against the baseline of the
+  `closes_needed(days, output)` closes strictly before that tick's own
+  US/Eastern date (no look-ahead).
   Returns `[{at, value | nil}]` in the ticks' order; baselines are built
   once per date. Same options as `closes_before/4`.
   """
   @spec series([{DateTime.t(), term()}], [map()], pos_integer(), output(), keyword()) ::
           [{DateTime.t(), Decimal.t() | nil}]
   def series(ticks, daily_bars, days, output, opts \\ []) do
+    needed = closes_needed(days, output)
+
     {values, _cache} =
       Enum.map_reduce(ticks, %{}, fn {at, price}, cache ->
         date = et_date(at)
@@ -154,7 +213,7 @@ defmodule TradingCore.Signals.VsCloses do
               {base, cache}
 
             :error ->
-              base = daily_bars |> closes_before(date, days, opts) |> baseline(output)
+              base = daily_bars |> closes_before(date, needed, opts) |> baseline(output)
               {base, Map.put(cache, date, base)}
           end
 

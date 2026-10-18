@@ -139,4 +139,83 @@ defmodule TradingCore.Signals.VsClosesTest do
                [{~U[2026-10-03 14:00:00Z], nil}]
     end
   end
+
+  describe "realized_vol" do
+    # Six closes alternating +1% / -1%, 2026-10-01 .. 2026-10-08, plus a
+    # wild close on 2026-10-09 that a 10-09 session must never see.
+    @rv_days [
+      ~D[2026-10-01],
+      ~D[2026-10-02],
+      ~D[2026-10-05],
+      ~D[2026-10-06],
+      ~D[2026-10-07],
+      ~D[2026-10-08]
+    ]
+    defp rv_closes, do: Enum.scan([100.0, 1.01, 0.99, 1.01, 0.99, 1.01], &(&1 * &2))
+    defp rv_bars, do: Enum.zip_with(@rv_days, rv_closes(), &bar/2)
+
+    # sqrt(mean(r^2)) * sqrt(252) * 100 over three ln(1.01) and two ln(0.99)
+    @rv_expected :math.sqrt((3 * :math.log(1.01) ** 2 + 2 * :math.log(0.99) ** 2) / 5) *
+                   :math.sqrt(252) * 100
+
+    test "closes_needed: days returns need days + 1 closes; other outputs unchanged" do
+      assert VsCloses.closes_needed(5, "realized_vol") == 6
+      assert VsCloses.closes_needed(5, "pct") == 5
+      assert VsCloses.closes_needed(5, "zscore") == 5
+    end
+
+    test "zero-mean annualized RMS of log returns, in percent" do
+      closes = VsCloses.closes_before(rv_bars(), ~D[2026-10-09], 6)
+      assert %{rv: rv, n: 5} = VsCloses.baseline(closes, "realized_vol")
+      assert_in_delta rv, @rv_expected, 1.0e-9
+      assert_in_delta rv, 15.86, 0.01
+    end
+
+    test "zero-mean, not demeaned: a steady trend has positive vol" do
+      # +1% every day: the sample sd would be 0, the RMS is ln(1.01) annualized
+      closes = Enum.scan([100.0, 1.01, 1.01, 1.01], &(&1 * &2)) |> Enum.reverse()
+      %{rv: rv} = VsCloses.baseline(closes, "realized_vol")
+      assert_in_delta rv, :math.log(1.01) * :math.sqrt(252) * 100, 1.0e-9
+    end
+
+    test "nil for fewer than 2 closes or a non-positive close" do
+      assert VsCloses.baseline([d(100)], "realized_vol") == nil
+      assert VsCloses.baseline([d(100), d(0), d(99)], "realized_vol") == nil
+      assert VsCloses.baseline([d(100), d(-1)], "realized_vol") == nil
+      assert VsCloses.baseline(nil, "realized_vol") == nil
+    end
+
+    test "compute ignores the price, rounds to 8 places, nil for a nil baseline" do
+      base = %{rv: 15.123456789, n: 5}
+      assert VsCloses.compute(d(10), base, "realized_vol") == Decimal.new("15.12345679")
+      assert VsCloses.compute(d(9999), base, "realized_vol") == Decimal.new("15.12345679")
+      assert VsCloses.compute(nil, base, "realized_vol") == Decimal.new("15.12345679")
+      assert VsCloses.compute(d(10), nil, "realized_vol") == nil
+    end
+
+    test "series: no look-ahead, needs days + 1 prior closes, same value all session" do
+      bars = rv_bars() ++ [bar(~D[2026-10-09], 500.0)]
+
+      ticks = [
+        # 10-08: only 5 prior closes (10-01..10-07) -> nil for 5 returns
+        {~U[2026-10-08 14:00:00Z], d(1)},
+        # 10-09: 6 prior closes; its own 500 close never counts
+        {~U[2026-10-09 14:00:00Z], d(1)},
+        {~U[2026-10-09 19:00:00Z], d(2)}
+      ]
+
+      expected = @rv_expected |> Decimal.from_float() |> Decimal.round(8)
+
+      assert [{_, nil}, {_, ^expected}, {_, ^expected}] =
+               VsCloses.series(ticks, bars, 5, "realized_vol")
+    end
+
+    test "series: a stale newest close is nil" do
+      ticks = [{~U[2026-10-20 14:00:00Z], d(1)}]
+      assert [{_, nil}] = VsCloses.series(ticks, rv_bars(), 5, "realized_vol")
+
+      assert [{_, %Decimal{}}] =
+               VsCloses.series(ticks, rv_bars(), 5, "realized_vol", max_staleness_days: 12)
+    end
+  end
 end
