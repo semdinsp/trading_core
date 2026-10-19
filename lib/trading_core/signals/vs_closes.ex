@@ -238,7 +238,7 @@ defmodule TradingCore.Signals.VsCloses do
 
   defp et_date(at), do: at |> DateTime.shift_zone!(@timezone) |> DateTime.to_date()
 
-  defp round_out(x), do: x |> Decimal.from_float() |> Decimal.round(@precision)
+  defp round_out(x), do: x |> Decimal.from_float() |> TradingCore.Decimals.round(@precision)
 
   defp to_decimal(%Decimal{} = d), do: {:ok, d}
   defp to_decimal(x) when is_float(x), do: {:ok, Decimal.from_float(x)}

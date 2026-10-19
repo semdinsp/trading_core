@@ -141,5 +141,5 @@ defmodule TradingCore.Options.GammaExposure do
 
   defp contribution(_contract, _scale), do: :skip
 
-  defp dollars(value), do: TradingCore.Decimals.round_integral(value, :half_up)
+  defp dollars(value), do: TradingCore.Decimals.round(value, 0, :half_up)
 end

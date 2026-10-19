@@ -236,14 +236,14 @@ defmodule TradingCore.Signals do
   @spec derivative(history(), sample(), DateTime.t(), keyword()) :: {history(), Decimal.t() | nil}
   def derivative(history, new_sample, now, opts \\ []) do
     precision = Keyword.get(opts, :precision, @default_precision)
-    rounded = new_sample |> to_decimal() |> Decimal.round(precision)
+    rounded = new_sample |> to_decimal() |> TradingCore.Decimals.round(precision)
     new_history = sample_and_trim(history, {now, rounded}, now, opts)
 
     value =
       if span_ms(new_history) >= min_span_ms(opts) do
         case slope(new_history) do
           nil -> nil
-          slope -> Decimal.round(slope, precision)
+          slope -> TradingCore.Decimals.round(slope, precision)
         end
       end
 
@@ -326,7 +326,7 @@ defmodule TradingCore.Signals do
     if Decimal.compare(cum_volume, 0) == :gt do
       cum_pv
       |> Decimal.div(cum_volume)
-      |> Decimal.round(precision)
+      |> TradingCore.Decimals.round(precision)
     end
   end
 
@@ -419,7 +419,7 @@ defmodule TradingCore.Signals do
   def moving_average(state, value, now, opts \\ []) do
     precision = Keyword.get(opts, :precision, @default_precision)
     {interval, n} = ma_grid(opts)
-    v = value |> to_decimal() |> Decimal.round(precision)
+    v = value |> to_decimal() |> TradingCore.Decimals.round(precision)
     b = bucket(now, interval)
 
     state = state |> ma_session(now, Keyword.get(opts, :session_reset)) |> ma_add(b, v, n)
@@ -433,7 +433,7 @@ defmodule TradingCore.Signals do
           Decimal.add(acc, Decimal.mult(held, last - first + 1))
         end)
 
-      {state, total |> Decimal.div(n) |> Decimal.round(precision)}
+      {state, total |> Decimal.div(n) |> TradingCore.Decimals.round(precision)}
     else
       {state, nil}
     end
@@ -457,7 +457,7 @@ defmodule TradingCore.Signals do
 
     bucketed =
       Enum.map(points, fn {at, value} ->
-        {at, bucket(at, interval), value |> to_decimal() |> Decimal.round(precision)}
+        {at, bucket(at, interval), value |> to_decimal() |> TradingCore.Decimals.round(precision)}
       end)
 
     bucketed
@@ -505,7 +505,7 @@ defmodule TradingCore.Signals do
             Decimal.add(acc, held)
           end)
 
-        {at, total |> Decimal.div(n) |> Decimal.round(precision)}
+        {at, total |> Decimal.div(n) |> TradingCore.Decimals.round(precision)}
       else
         {at, nil}
       end
@@ -613,7 +613,7 @@ defmodule TradingCore.Signals do
           {history(), WelfordAcc.t(), Decimal.t() | nil}
   def self_zscore(history, _welford, new_sample, now, opts \\ []) do
     precision = Keyword.get(opts, :precision, @default_precision)
-    sample = new_sample |> to_decimal() |> Decimal.round(precision)
+    sample = new_sample |> to_decimal() |> TradingCore.Decimals.round(precision)
     new_history = sample_and_trim(history, history_entry(now, sample, opts), now, opts)
 
     new_welford = rebuild_welford(new_history)
@@ -752,7 +752,7 @@ defmodule TradingCore.Signals do
       |> Decimal.sub(reference)
       |> Decimal.div(reference)
       |> Decimal.mult(100)
-      |> Decimal.round(precision)
+      |> TradingCore.Decimals.round(precision)
     end
   end
 
@@ -772,7 +772,7 @@ defmodule TradingCore.Signals do
     if Decimal.compare(reference, 0) == :eq do
       nil
     else
-      value |> Decimal.div(reference) |> Decimal.round(precision)
+      value |> Decimal.div(reference) |> TradingCore.Decimals.round(precision)
     end
   end
 
@@ -803,7 +803,7 @@ defmodule TradingCore.Signals do
           {history(), WelfordAcc.t(), Decimal.t() | nil}
   def spread_zscore(history, _welford, value, reference, now, opts \\ []) do
     precision = Keyword.get(opts, :precision, @default_precision)
-    spread = value |> Decimal.sub(reference) |> Decimal.round(precision)
+    spread = value |> Decimal.sub(reference) |> TradingCore.Decimals.round(precision)
     new_history = sample_and_trim(history, {now, spread}, now, opts)
 
     new_welford = rebuild_welford(new_history)
@@ -1168,8 +1168,8 @@ defmodule TradingCore.Signals do
     window_ms = Keyword.get(opts, :window_ms, @default_window_ms)
     max_history_samples = Keyword.get(opts, :max_history_samples, @default_max_history_samples)
 
-    rounded_x = log_x |> to_decimal() |> Decimal.round(precision)
-    rounded_y = log_y |> to_decimal() |> Decimal.round(precision)
+    rounded_x = log_x |> to_decimal() |> TradingCore.Decimals.round(precision)
+    rounded_y = log_y |> to_decimal() |> TradingCore.Decimals.round(precision)
 
     # Per tick unless the caller asks for sampling: kyle_lambda relies on
     # one point per tick here, and only :spread opts in.
@@ -1188,8 +1188,12 @@ defmodule TradingCore.Signals do
 
     value =
       case ols(new_history) do
-        nil -> nil
-        {beta, alpha} -> {Decimal.round(beta, precision), Decimal.round(alpha, precision)}
+        nil ->
+          nil
+
+        {beta, alpha} ->
+          {TradingCore.Decimals.round(beta, precision),
+           TradingCore.Decimals.round(alpha, precision)}
       end
 
     {new_history, value}
@@ -1281,8 +1285,8 @@ defmodule TradingCore.Signals do
       else
         {beta, alpha} = new_mean
 
-        {Decimal.round(Decimal.from_float(beta), precision),
-         Decimal.round(Decimal.from_float(alpha), precision)}
+        {TradingCore.Decimals.round(Decimal.from_float(beta), precision),
+         TradingCore.Decimals.round(Decimal.from_float(alpha), precision)}
       end
 
     {{new_mean, new_cov}, value}
@@ -1339,7 +1343,7 @@ defmodule TradingCore.Signals do
     |> to_decimal()
     |> Decimal.sub(Decimal.mult(beta, to_decimal(log_x)))
     |> Decimal.sub(alpha)
-    |> Decimal.round(precision)
+    |> TradingCore.Decimals.round(precision)
   end
 
   @doc """

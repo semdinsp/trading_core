@@ -222,19 +222,18 @@ defmodule TradingCore.RoundNumbers do
   defp snap(level, tick, rounding) do
     level
     |> Decimal.div(tick)
-    |> TradingCore.Decimals.round_integral(rounding)
+    |> TradingCore.Decimals.round(0, rounding)
     |> Decimal.mult(tick)
   end
 
   defp floor_to(x, step),
-    do:
-      x |> Decimal.div(step) |> TradingCore.Decimals.round_integral(:floor) |> Decimal.mult(step)
+    do: x |> Decimal.div(step) |> TradingCore.Decimals.round(0, :floor) |> Decimal.mult(step)
 
   defp ceil_to(x, step),
     do:
       x
       |> Decimal.div(step)
-      |> TradingCore.Decimals.round_integral(:ceiling)
+      |> TradingCore.Decimals.round(0, :ceiling)
       |> Decimal.mult(step)
 
   defp normalize_side(s) when s in ["short", :short], do: :short

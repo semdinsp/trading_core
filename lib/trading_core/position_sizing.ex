@@ -108,7 +108,7 @@ defmodule TradingCore.PositionSizing do
       qty = Decimal.div(target_dollar_volatility, Decimal.mult(daily_vol, price))
 
       qty =
-        if fractional_shares_enabled, do: qty, else: TradingCore.Decimals.round_integral(qty, :up)
+        if fractional_shares_enabled, do: qty, else: TradingCore.Decimals.round(qty, 0, :up)
 
       {:ok, qty}
     else
@@ -166,7 +166,7 @@ defmodule TradingCore.PositionSizing do
   defp whole_shares(qty, context) do
     if Map.get(context, :fractional_shares_enabled, true),
       do: qty,
-      else: TradingCore.Decimals.round_integral(qty, :up)
+      else: TradingCore.Decimals.round(qty, 0, :up)
   end
 
   @doc """

@@ -345,7 +345,7 @@ defmodule TradingCore.Options.ContractSelection do
   defp parse_strike(strike) when is_number(strike) or is_binary(strike) do
     case Decimal.parse(to_string(strike)) do
       {decimal, ""} ->
-        case decimal |> Decimal.round(2) |> Decimal.to_float() do
+        case decimal |> TradingCore.Decimals.round(2) |> Decimal.to_float() do
           strike when strike > 0 -> {:ok, strike}
           _non_positive -> {:error, :unsupported_leg_config}
         end

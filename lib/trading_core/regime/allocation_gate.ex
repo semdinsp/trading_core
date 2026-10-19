@@ -238,7 +238,7 @@ defmodule TradingCore.Regime.AllocationGate do
     cap
     |> Decimal.sub(used)
     |> Decimal.max(Decimal.new(0))
-    |> Decimal.round(@dollar_precision, :floor)
+    |> TradingCore.Decimals.round(@dollar_precision, :floor)
   end
 
   # Largest whole number of lots whose cost (qty × unit) fits in headroom.
@@ -269,7 +269,7 @@ defmodule TradingCore.Regime.AllocationGate do
   defp floor_lots(qty, lot) do
     qty
     |> Decimal.div(lot)
-    |> TradingCore.Decimals.round_integral(:floor)
+    |> TradingCore.Decimals.round(0, :floor)
     |> Decimal.max(Decimal.new(0))
     |> Decimal.mult(lot)
   end
@@ -339,7 +339,10 @@ defmodule TradingCore.Regime.AllocationGate do
   defp optional_pct(equity, pct) do
     with {:ok, pct} <- Decimals.parse(pct, :non_neg, []) do
       {:ok,
-       equity |> Decimal.mult(pct) |> Decimal.div(100) |> Decimal.round(@dollar_precision, :floor)}
+       equity
+       |> Decimal.mult(pct)
+       |> Decimal.div(100)
+       |> TradingCore.Decimals.round(@dollar_precision, :floor)}
     end
   end
 
