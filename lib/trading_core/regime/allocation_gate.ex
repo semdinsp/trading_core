@@ -269,7 +269,7 @@ defmodule TradingCore.Regime.AllocationGate do
   defp floor_lots(qty, lot) do
     qty
     |> Decimal.div(lot)
-    |> Decimal.round(0, :floor)
+    |> TradingCore.Decimals.round_integral(:floor)
     |> Decimal.max(Decimal.new(0))
     |> Decimal.mult(lot)
   end

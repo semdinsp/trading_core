@@ -175,7 +175,7 @@ defmodule TradingCore.Regime do
     n = length(sorted)
     rank = Decimal.mult(Decimal.from_float(p * 1.0), Decimal.new(n - 1))
 
-    lower_index = rank |> Decimal.round(0, :floor) |> Decimal.to_integer()
+    lower_index = rank |> TradingCore.Decimals.round_integral(:floor) |> Decimal.to_integer()
     upper_index = min(lower_index + 1, n - 1)
 
     fraction = Decimal.sub(rank, Decimal.new(lower_index))
