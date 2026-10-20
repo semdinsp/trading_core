@@ -63,9 +63,9 @@ defmodule TradingCore.Regime.Exposure do
       |> Decimal.abs()
       |> Decimal.mult(beta)
       |> Decimal.mult(direction_sign(direction))
-      |> Decimal.round(@dollar_precision)
+      |> TradingCore.Decimals.round(@dollar_precision)
     else
-      :error -> Decimal.round(Decimal.new(0), @dollar_precision)
+      :error -> TradingCore.Decimals.round(Decimal.new(0), @dollar_precision)
     end
   end
 
@@ -173,9 +173,9 @@ defmodule TradingCore.Regime.Exposure do
   defp round_totals(totals) do
     %{
       totals
-      | open_risk: Decimal.round(totals.open_risk, @dollar_precision),
-        gross_notional: Decimal.round(totals.gross_notional, @dollar_precision),
-        net_beta_dollars: Decimal.round(totals.net_beta_dollars, @dollar_precision)
+      | open_risk: TradingCore.Decimals.round(totals.open_risk, @dollar_precision),
+        gross_notional: TradingCore.Decimals.round(totals.gross_notional, @dollar_precision),
+        net_beta_dollars: TradingCore.Decimals.round(totals.net_beta_dollars, @dollar_precision)
     }
   end
 
@@ -187,7 +187,7 @@ defmodule TradingCore.Regime.Exposure do
   end
 
   defp scale(value, multiplier),
-    do: value |> Decimal.mult(multiplier) |> Decimal.round(@risk_precision, :ceiling)
+    do: value |> Decimal.mult(multiplier) |> TradingCore.Decimals.round(@risk_precision, :ceiling)
 
   defp positive?(nil, _multiplier), do: false
 

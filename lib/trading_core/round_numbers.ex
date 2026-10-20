@@ -220,14 +220,21 @@ defmodule TradingCore.RoundNumbers do
   defp snap_direction(_kind, _side, _action), do: :half_up
 
   defp snap(level, tick, rounding) do
-    level |> Decimal.div(tick) |> Decimal.round(0, rounding) |> Decimal.mult(tick)
+    level
+    |> Decimal.div(tick)
+    |> TradingCore.Decimals.round(0, rounding)
+    |> Decimal.mult(tick)
   end
 
   defp floor_to(x, step),
-    do: x |> Decimal.div(step) |> Decimal.round(0, :floor) |> Decimal.mult(step)
+    do: x |> Decimal.div(step) |> TradingCore.Decimals.round(0, :floor) |> Decimal.mult(step)
 
   defp ceil_to(x, step),
-    do: x |> Decimal.div(step) |> Decimal.round(0, :ceiling) |> Decimal.mult(step)
+    do:
+      x
+      |> Decimal.div(step)
+      |> TradingCore.Decimals.round(0, :ceiling)
+      |> Decimal.mult(step)
 
   defp normalize_side(s) when s in ["short", :short], do: :short
   defp normalize_side(_long), do: :long

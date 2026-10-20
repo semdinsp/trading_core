@@ -93,7 +93,7 @@ defmodule TradingCore.Intraday.NoiseBand do
          {:ok, today_open} <- Decimals.parse(today_open, :pos, []),
          {:ok, width} <- Decimals.parse(width, :pos, []),
          {:ok, value} <- band_ratio(last, today_open, prior_close, width, opts) do
-      Decimal.round(value, @precision)
+      TradingCore.Decimals.round(value, @precision)
     else
       :error -> nil
     end
@@ -123,7 +123,7 @@ defmodule TradingCore.Intraday.NoiseBand do
         moves
         |> Enum.reduce(Decimal.new(0), &Decimal.add/2)
         |> Decimal.div(lookback)
-        |> Decimal.round(@precision)
+        |> TradingCore.Decimals.round(@precision)
 
       {:ok, mean}
     else

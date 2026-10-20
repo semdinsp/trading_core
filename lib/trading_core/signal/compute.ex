@@ -1276,7 +1276,7 @@ defmodule TradingCore.Signal.Compute do
   defp round_to_precision(value, params) do
     case Map.get(params, "precision") do
       nil -> value
-      precision -> Decimal.round(value, precision)
+      precision -> TradingCore.Decimals.round(value, precision)
     end
   end
 
@@ -1356,8 +1356,8 @@ defmodule TradingCore.Signal.Compute do
       # :precision before they enter the fit, beta rounded on the way out.
       # The fit itself is TickWindow's running OLS over the full window
       # (default 5 minutes, as before) instead of the last 500 trades.
-      x = signed_volume |> Decimal.round(precision) |> Decimal.to_float()
-      y = mid_return |> Decimal.round(precision) |> Decimal.to_float()
+      x = signed_volume |> TradingCore.Decimals.round(precision) |> Decimal.to_float()
+      y = mid_return |> TradingCore.Decimals.round(precision) |> Decimal.to_float()
       window_ms = Keyword.get(opts, :window_ms, :timer.minutes(5))
 
       {ols, dropped} =
@@ -1378,7 +1378,7 @@ defmodule TradingCore.Signal.Compute do
           {state, :warming_up}
 
         {beta, _alpha} ->
-          beta = beta |> Decimal.from_float() |> Decimal.round(precision)
+          beta = beta |> Decimal.from_float() |> TradingCore.Decimals.round(precision)
           {state, round_to_precision(beta, spec.params)}
       end
     end
@@ -2199,7 +2199,7 @@ defmodule TradingCore.Signal.Compute do
         {"level1", i} -> Enum.at(sig.level1, i)
       end
 
-    value |> Decimal.from_float() |> Decimal.round(8)
+    value |> Decimal.from_float() |> TradingCore.Decimals.round(8)
   end
 
   defp channel_value("price", bar, _k, _cum), do: bar.price

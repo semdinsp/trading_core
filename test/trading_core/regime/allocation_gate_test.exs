@@ -276,6 +276,17 @@ defmodule TradingCore.Regime.AllocationGateTest do
                )
     end
 
+    test "an enormous equity doesn't raise from dollar rounding (decimal >= 3.2.0)" do
+      result =
+        AllocationGate.decide(
+          entry([]),
+          @empty_book,
+          %{@budget | equity: d("1E+40"), buckets: %{"tick" => %{}}}
+        )
+
+      assert elem(result, 0) in [:allow, :resize, :reject]
+    end
+
     test "an enormous headroom/unit ratio terminates" do
       result =
         AllocationGate.decide(
