@@ -224,7 +224,7 @@ defmodule TradingCore.Signal.Compute do
   """
 
   alias TradingCore.Microstructure
-  alias TradingCore.Signals.Signature
+  alias TradingCore.Signals.{BarIndicators, Signature}
   alias TradingCore.Signal.{Spec, TickWindow}
   alias TradingCore.{Signals, WelfordAcc}
 
@@ -324,6 +324,29 @@ defmodule TradingCore.Signal.Compute do
 
   def init(%Spec{kind: :self_zscore}), do: {:ok, %{history: [], welford: WelfordAcc.new()}}
   def init(%Spec{kind: :moving_average}), do: {:ok, %{ma: Signals.moving_average_new()}}
+
+  def init(%Spec{kind: kind} = spec) when kind in [:atr, :adx] do
+    _validated = bar_kind_config!(spec)
+
+    {:ok,
+     %{
+       bars: BarIndicators.bars_new(),
+       ind: bar_indicator_new(kind),
+       session: nil,
+       last: :warming_up,
+       bar_closed: false
+     }}
+  end
+
+  def init(%Spec{kind: :ibs} = spec) do
+    _validated = session_reset!(spec)
+    {:ok, %{session: nil, high: nil, low: nil}}
+  end
+
+  def init(%Spec{kind: :bollinger_bandwidth} = spec) do
+    _validated = bollinger_config!(spec)
+    {:ok, %{history: [], welford: WelfordAcc.new(), session: nil}}
+  end
 
   def init(%Spec{kind: :signature} = spec) do
     _validated = signature_config!(spec)
@@ -622,6 +645,93 @@ defmodule TradingCore.Signal.Compute do
 
     {ma, result} = Signals.moving_average(state.ma, value, now, opts)
     {%{state | ma: ma}, warm(result)}
+  end
+
+  # :atr / :adx: Wilder's ATR or ADX over clocked OHLC bars built from
+  # %{at, value} ticks (TradingCore.Signals.BarIndicators has the math and
+  # the bar rules). Params (see bar_kind_config!/1): "period" (default
+  # 14), "bar_interval_ms" (default 60_000), "output", "session_reset".
+  #
+  # The value changes only when a bar closes, i.e. on the first tick of a
+  # later interval. Between closes the step returns the value from the
+  # last close, and state.bar_closed is false; it is true exactly on the
+  # step that closed a bar, so a caller that broadcasts only on a close
+  # reads it. "session_reset" (an injected fn, as on :moving_average)
+  # clears the bars and the smoothing on a new session, so no bar or
+  # average straddles the overnight gap; the previous session's last,
+  # still-open bar is dropped with it.
+  def step(%Spec{kind: kind} = spec, state, %{at: at} = tick) when kind in [:atr, :adx] do
+    config = bar_kind_config!(spec)
+    state = maybe_reset_bar_session(state, at, config.session_reset, kind)
+
+    case Map.get(tick, :value) do
+      nil ->
+        {%{state | bar_closed: false}, state.last}
+
+      value ->
+        value = value |> to_decimal() |> Decimal.to_float()
+        {bars, closed} = BarIndicators.bars_push(state.bars, at, value, config.bar_interval_ms)
+
+        case closed do
+          nil ->
+            {%{state | bars: bars, bar_closed: false}, state.last}
+
+          bar ->
+            ind = bar_indicator_push(kind, state.ind, bar, config.period)
+            out = kind |> bar_indicator_value(ind, config.output) |> round_float_out()
+            {%{state | bars: bars, ind: ind, last: out, bar_closed: true}, out}
+        end
+    end
+  end
+
+  # :ibs: internal bar strength of the session so far,
+  # (last − session low) / (session high − session low), from %{at,
+  # value} ticks. :warming_up (no number) while high == low. Read near the
+  # close (~15:50 ET) it matches the classic end-of-day IBS.
+  # params["session_reset"] (an injected fn) starts a new session's high
+  # and low; without it the "session" is everything since init.
+  def step(%Spec{kind: :ibs} = spec, state, %{at: at} = tick) do
+    state = maybe_reset_ibs_session(state, at, session_reset!(spec))
+
+    case Map.get(tick, :value) do
+      nil ->
+        {state, ibs_value(state, nil)}
+
+      value ->
+        v = value |> to_decimal() |> Decimal.to_float()
+        state = %{state | high: max(state.high || v, v), low: min(state.low || v, v)}
+        {state, ibs_value(state, v)}
+    end
+  end
+
+  # :bollinger_bandwidth: Bollinger bands over the time window
+  # (spec.window_ms), sampled at fixed intervals exactly like :self_zscore
+  # (params["sample_interval_ms"], else default_sample_interval_ms/1 of
+  # window_ms), so the history cap doesn't bite on a busy feed. middle =
+  # mean, bands = middle ± k·sd with the SAMPLE sd (n − 1, as
+  # WelfordAcc/:self_zscore use). params: "k" (default 2), "output"
+  # ("bandwidth" = 2k·sd / mean × 100, or "percent_b" = (last − lower) /
+  # (upper − lower)), "min_span_ms" (default window_ms minus one sample
+  # interval: the window must be covered before it emits),
+  # "session_reset". percent_b is :warming_up on a flat window (the same
+  # relative sd floor :self_zscore uses); bandwidth is :warming_up when
+  # mean <= 0.
+  def step(%Spec{kind: :bollinger_bandwidth} = spec, state, %{at: now} = tick) do
+    config = bollinger_config!(spec)
+    state = maybe_reset_bollinger_session(state, now, config.session_reset)
+
+    case Map.get(tick, :value) do
+      nil ->
+        {state, :warming_up}
+
+      value ->
+        {history, welford, _z} =
+          Signals.self_zscore(state.history, state.welford, value, now, config.window_opts)
+
+        state = %{state | history: history, welford: welford}
+        last = value |> to_decimal() |> Decimal.to_float()
+        {state, bollinger_value(history, welford, last, config)}
+    end
   end
 
   # :signature: the level-1/2 path signature of the last params["window"]
@@ -1766,7 +1876,19 @@ defmodule TradingCore.Signal.Compute do
   # a :spread node directly; this clause forwards it unmodified same as
   # every other base kind's single-price tick.
   defp tick_for(%Spec{kind: kind} = node, at, ticks_by_base_and_at, _series)
-       when kind in [:plain, :volume, :vwap, :donchian, :rolling_volume, :spread, :signature] do
+       when kind in [
+              :plain,
+              :volume,
+              :vwap,
+              :donchian,
+              :rolling_volume,
+              :spread,
+              :signature,
+              :atr,
+              :adx,
+              :ibs,
+              :bollinger_bandwidth
+            ] do
     case Map.fetch(ticks_by_base_and_at, node) do
       {:ok, %{^at => tick}} -> tick
       _ -> :not_ready
@@ -1896,6 +2018,178 @@ defmodule TradingCore.Signal.Compute do
   """
   @spec donchian_bands(map()) :: {Decimal.t(), Decimal.t(), Decimal.t()} | nil
   def donchian_bands(%{window: window}), do: TickWindow.extremes_bands(window)
+
+  ## -----------------------------------------------------------------------
+  ## :atr / :adx / :ibs / :bollinger_bandwidth helpers
+  ## -----------------------------------------------------------------------
+
+  @bar_kind_outputs %{atr: ~w(atr atr_pct), adx: ~w(adx plus_di minus_di)}
+  @default_bar_interval_ms 60_000
+  @default_bar_period 14
+
+  # Validates and reads the :atr/:adx params; raises ArgumentError on a
+  # bad config (a setup mistake, not a runtime state).
+  defp bar_kind_config!(%Spec{kind: kind, params: params} = spec) do
+    period = Map.get(params, "period", @default_bar_period)
+    interval = Map.get(params, "bar_interval_ms", @default_bar_interval_ms)
+    outputs = Map.fetch!(@bar_kind_outputs, kind)
+    output = Map.get(params, "output", hd(outputs))
+
+    unless is_integer(period) and period >= 1,
+      do: raise(ArgumentError, ":#{kind} \"period\" must be a positive integer")
+
+    unless is_integer(interval) and interval > 0,
+      do: raise(ArgumentError, ":#{kind} \"bar_interval_ms\" must be a positive integer")
+
+    unless output in outputs,
+      do: raise(ArgumentError, ":#{kind} \"output\" must be one of #{inspect(outputs)}")
+
+    %{
+      period: period,
+      bar_interval_ms: interval,
+      output: output,
+      session_reset: session_reset!(spec)
+    }
+  end
+
+  defp session_reset!(%Spec{kind: kind, params: params}) do
+    case Map.get(params, "session_reset") do
+      nil -> nil
+      reset when is_function(reset, 1) -> reset
+      _ -> raise ArgumentError, ":#{kind} \"session_reset\" must be a 1-arity function"
+    end
+  end
+
+  defp bar_indicator_new(:atr), do: BarIndicators.atr_new()
+  defp bar_indicator_new(:adx), do: BarIndicators.adx_new()
+
+  defp bar_indicator_push(:atr, ind, bar, period), do: BarIndicators.atr_push(ind, bar, period)
+  defp bar_indicator_push(:adx, ind, bar, period), do: BarIndicators.adx_push(ind, bar, period)
+
+  defp bar_indicator_value(:atr, ind, "atr"), do: BarIndicators.atr_value(ind)
+  defp bar_indicator_value(:atr, ind, "atr_pct"), do: BarIndicators.atr_pct_value(ind)
+  defp bar_indicator_value(:adx, ind, "adx"), do: BarIndicators.adx_value(ind)
+
+  defp bar_indicator_value(:adx, ind, output) do
+    case BarIndicators.di(ind) do
+      nil -> nil
+      {plus_di, _} when output == "plus_di" -> plus_di
+      {_, minus_di} -> minus_di
+    end
+  end
+
+  defp round_float_out(nil), do: :warming_up
+  defp round_float_out(x), do: x |> Decimal.from_float() |> TradingCore.Decimals.round(8)
+
+  defp maybe_reset_bar_session(state, _at, nil, _kind), do: state
+
+  defp maybe_reset_bar_session(state, at, session_reset, kind) do
+    session = session_reset.(at)
+
+    if state.session != nil and session != state.session do
+      %{
+        state
+        | bars: BarIndicators.bars_new(),
+          ind: bar_indicator_new(kind),
+          last: :warming_up,
+          bar_closed: false,
+          session: session
+      }
+    else
+      %{state | session: session}
+    end
+  end
+
+  defp maybe_reset_ibs_session(state, _at, nil), do: state
+
+  defp maybe_reset_ibs_session(state, at, session_reset) do
+    session = session_reset.(at)
+
+    if state.session != nil and session != state.session,
+      do: %{state | high: nil, low: nil, session: session},
+      else: %{state | session: session}
+  end
+
+  defp ibs_value(%{high: high, low: low}, _last) when high == nil or high == low, do: :warming_up
+  defp ibs_value(_state, nil), do: :warming_up
+
+  defp ibs_value(%{high: high, low: low}, last),
+    do: round_float_out((last - low) / (high - low))
+
+  @bollinger_outputs ~w(bandwidth percent_b)
+
+  defp bollinger_config!(%Spec{params: params, window_ms: window_ms} = spec) do
+    k = Map.get(params, "k", 2)
+    output = Map.get(params, "output", "bandwidth")
+
+    unless is_integer(window_ms) and window_ms > 0,
+      do: raise(ArgumentError, ":bollinger_bandwidth needs a window (window_ms)")
+
+    unless is_number(k) and k > 0,
+      do: raise(ArgumentError, ":bollinger_bandwidth \"k\" must be a positive number")
+
+    unless output in @bollinger_outputs,
+      do:
+        raise(
+          ArgumentError,
+          ":bollinger_bandwidth \"output\" must be one of #{inspect(@bollinger_outputs)}"
+        )
+
+    opts = sampled_window_opts(spec)
+
+    interval =
+      Keyword.get_lazy(opts, :sample_interval_ms, fn ->
+        Signals.default_sample_interval_ms(window_ms)
+      end)
+
+    %{
+      k: k * 1.0,
+      output: output,
+      window_opts: opts,
+      min_span_ms: Map.get(params, "min_span_ms", max(window_ms - interval, 0)),
+      session_reset: session_reset!(spec)
+    }
+  end
+
+  defp maybe_reset_bollinger_session(state, _now, nil), do: state
+
+  defp maybe_reset_bollinger_session(state, now, session_reset) do
+    session = session_reset.(now)
+
+    if state.session != nil and session != state.session,
+      do: %{state | history: [], welford: WelfordAcc.new(), session: session},
+      else: %{state | session: session}
+  end
+
+  defp bollinger_value(history, welford, last, config) do
+    if welford.count < 2 or history_span_ms(history) < config.min_span_ms do
+      :warming_up
+    else
+      mean = welford.mean
+      sd = :math.sqrt(WelfordAcc.variance(welford))
+
+      value =
+        case config.output do
+          "bandwidth" ->
+            if mean > 0, do: 2 * config.k * sd / mean * 100
+
+          "percent_b" ->
+            # Same relative floor on sd as :self_zscore's z-score: a flat
+            # window has no meaningful position within its bands.
+            if sd > max(abs(mean) * 1.0e-6, 1.0e-12),
+              do: (last - (mean - config.k * sd)) / (2 * config.k * sd)
+        end
+
+      round_float_out(value)
+    end
+  end
+
+  # History entries are newest first, each a tuple whose first element is
+  # its timestamp.
+  defp history_span_ms([]), do: 0
+
+  defp history_span_ms([newest | _] = history),
+    do: DateTime.diff(elem(newest, 0), elem(List.last(history), 0), :millisecond)
 
   ## -----------------------------------------------------------------------
   ## :signature helpers
