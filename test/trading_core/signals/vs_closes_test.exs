@@ -218,4 +218,118 @@ defmodule TradingCore.Signals.VsClosesTest do
                VsCloses.series(ticks, rv_bars(), 5, "realized_vol", max_staleness_days: 12)
     end
   end
+
+  describe "rsi and daily atr" do
+    # Consecutive weekdays ending Tue 2026-10-20, oldest first.
+    defp weekdays(n) do
+      Stream.iterate(~D[2026-10-20], &Date.add(&1, -1))
+      |> Stream.reject(&(Date.day_of_week(&1) in [6, 7]))
+      |> Enum.take(n)
+      |> Enum.reverse()
+    end
+
+    defp walk(n), do: Enum.scan(1..n, 100.0, fn i, acc -> acc + :math.sin(i * 1.7) * 1.3 end)
+
+    defp ohlc_bars(n) do
+      Enum.zip_with(weekdays(n), walk(n), fn date, c ->
+        date
+        |> bar(c)
+        |> Map.merge(%{high: c + 0.8 + rem(round(c * 10), 3) * 0.2, low: c - 0.9})
+      end)
+    end
+
+    # Independent Wilder RSI over a whole close series (oldest first).
+    defp reference_rsi(closes, p) do
+      changes = closes |> Enum.chunk_every(2, 1, :discard) |> Enum.map(fn [a, b] -> b - a end)
+      {seed, rest} = Enum.split(changes, p)
+      g0 = Enum.sum(Enum.map(seed, &max(&1, 0.0))) / p
+      l0 = Enum.sum(Enum.map(seed, &max(-&1, 0.0))) / p
+
+      {g, l} =
+        Enum.reduce(rest, {g0, l0}, fn c, {g, l} ->
+          {(g * (p - 1) + max(c, 0.0)) / p, (l * (p - 1) + max(-c, 0.0)) / p}
+        end)
+
+      100 - 100 / (1 + g / l)
+    end
+
+    test "closes_needed: 10 x period + 1 for the Wilder outputs" do
+      assert VsCloses.closes_needed(2, "rsi") == 21
+      assert VsCloses.closes_needed(14, "atr") == 141
+      assert VsCloses.closes_needed(14, "atr_pct") == 141
+    end
+
+    test "rsi: prior closes plus the live price as today's provisional close" do
+      closes = walk(21)
+
+      prior =
+        VsCloses.closes_before(Enum.zip_with(weekdays(21), closes, &bar/2), ~D[2026-10-21], 21)
+
+      base = VsCloses.baseline(prior, "rsi", 2)
+
+      for live <- [95.0, 100.0, 104.0] do
+        want = reference_rsi(closes ++ [live], 2) |> Decimal.from_float() |> Decimal.round(8)
+        assert VsCloses.compute(live, base, "rsi") == want
+      end
+    end
+
+    test "rsi: 100 with no losses, 50 with no change, nil without enough closes" do
+      up = for i <- 0..20, do: 100.0 + i
+
+      assert VsCloses.compute(121.0, VsCloses.baseline(Enum.reverse(up), "rsi", 2), "rsi") ==
+               Decimal.new("100.00000000")
+
+      flat = List.duplicate(100.0, 21)
+
+      assert VsCloses.compute(100.0, VsCloses.baseline(flat, "rsi", 2), "rsi") ==
+               Decimal.new("50.00000000")
+
+      assert VsCloses.baseline([d(1), d(2)], "rsi", 2) == nil
+      assert_raise ArgumentError, fn -> VsCloses.baseline([d(1), d(2), d(3)], "rsi") end
+    end
+
+    test "rsi series: no look-ahead, today's own close never counts" do
+      bars = Enum.zip_with(weekdays(21), walk(21), &bar/2) ++ [bar(~D[2026-10-21], 999.0)]
+      ticks = [{~U[2026-10-21 14:00:00Z], 101.0}, {~U[2026-10-21 19:00:00Z], 97.0}]
+      [{_, a}, {_, b}] = VsCloses.series(ticks, bars, 2, "rsi")
+
+      base = bars |> VsCloses.closes_before(~D[2026-10-21], 21) |> VsCloses.baseline("rsi", 2)
+      assert a == VsCloses.compute(101.0, base, "rsi")
+      assert b == VsCloses.compute(97.0, base, "rsi")
+      # one fewer prior close: nil
+      assert [{_, nil}] = VsCloses.series(ticks |> Enum.take(1), tl(bars), 2, "rsi")
+    end
+
+    test "daily atr / atr_pct: Wilder over prior bars, each TR with its previous close" do
+      bars = ohlc_bars(31)
+      prior = VsCloses.bars_before(bars, ~D[2026-10-21], 31)
+      base = VsCloses.baseline(prior, "atr", 3)
+
+      rows = Enum.map(bars, &%{h: &1.high, l: &1.low, c: &1.close})
+
+      trs =
+        rows
+        |> Enum.chunk_every(2, 1, :discard)
+        |> Enum.map(fn [p, r] -> Enum.max([r.h - r.l, abs(r.h - p.c), abs(r.l - p.c)]) end)
+
+      {seed, rest} = Enum.split(trs, 3)
+      want = Enum.reduce(rest, Enum.sum(seed) / 3, fn tr, a -> (a * 2 + tr) / 3 end)
+
+      assert_in_delta base.atr, want, 1.0e-9
+      assert VsCloses.compute(123.0, base, "atr") == VsCloses.compute(nil, base, "atr")
+
+      assert VsCloses.compute(nil, base, "atr_pct") ==
+               (want / List.last(rows).c * 100) |> Decimal.from_float() |> Decimal.round(8)
+    end
+
+    test "daily atr series: needs 10 x period + 1 prior bars; ignores bars without high/low" do
+      bars = ohlc_bars(31)
+      ticks = [{~U[2026-10-21 14:00:00Z], 1.0}]
+      assert [{_, %Decimal{}}] = VsCloses.series(ticks, bars, 3, "atr")
+      assert [{_, nil}] = VsCloses.series(ticks, tl(bars), 3, "atr")
+
+      no_range = Enum.map(bars, &Map.drop(&1, [:high]))
+      assert [{_, nil}] = VsCloses.series(ticks, no_range, 3, "atr_pct")
+    end
+  end
 end
