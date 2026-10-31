@@ -312,6 +312,45 @@ defmodule TradingCore.Regime do
     |> Decimal.round(8)
   end
 
+  @doc """
+  The Donchian channel value of `live` against the channel of `closes`
+  (the prior sessions' daily closes, so the channel excludes today):
+
+    * `"breakout"`: `1` above the channel's high, `-1` below its low, `0`
+      inside. Strict: the channel excludes today, so equalling the prior
+      high is not a breakout.
+    * `"position"`: `(live - low) / (high - low)`, clamped to 0..1 and
+      rounded to 8dp. `nil` for a flat channel (high == low).
+
+  Moved from `TradingSignal.Signals.TrendState.channel/3` (its
+  `daily_channel` rule) so the live signals and trading_backtest's replay
+  of them share one computation. `closes` must be non-empty.
+  """
+  @spec channel([Decimal.t()], Decimal.t(), String.t()) :: integer() | Decimal.t() | nil
+  def channel(closes, live, "breakout") do
+    {low, high} = Enum.min_max_by(closes, & &1, Decimal)
+
+    cond do
+      Decimal.gt?(live, high) -> 1
+      Decimal.lt?(live, low) -> -1
+      true -> 0
+    end
+  end
+
+  def channel(closes, live, "position") do
+    {low, high} = Enum.min_max_by(closes, & &1, Decimal)
+    range = Decimal.sub(high, low)
+
+    if Decimal.gt?(range, 0) do
+      live
+      |> Decimal.sub(low)
+      |> Decimal.div(range)
+      |> Decimal.max(0)
+      |> Decimal.min(1)
+      |> Decimal.round(8)
+    end
+  end
+
   ## ---------------------------------------------------------------------
   ## Encoding
   ## ---------------------------------------------------------------------
