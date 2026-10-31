@@ -276,6 +276,42 @@ defmodule TradingCore.Regime do
     end
   end
 
+  @doc """
+  The `window`-session SMA of `prior_closes` (oldest first, sessions
+  strictly before today) with `today_close` as today's live close, and
+  that SMA's 1-session slope — the `sma`/`slope` inputs
+  `classify_trend/4` expects. Returns `{sma_today, slope}`, each rounded
+  to 8 decimal places, or `{nil, nil}` with fewer than `window` prior
+  closes (not enough history for yesterday's SMA, so no slope).
+
+  `sma_today` averages the last `window - 1` prior closes plus
+  `today_close`; `sma_yesterday` averages the last `window` prior closes;
+  `slope = sma_today - sma_yesterday`. Moved from
+  `TradingSignal.Regime.sma_and_slope/3` so the live sector trend_state
+  signals and trading_backtest's replay of them share one computation.
+  """
+  @spec sma_and_slope([Decimal.t()], Decimal.t(), pos_integer()) ::
+          {Decimal.t() | nil, Decimal.t() | nil}
+  def sma_and_slope(prior_closes, %Decimal{}, window) when length(prior_closes) < window,
+    do: {nil, nil}
+
+  def sma_and_slope(prior_closes, %Decimal{} = today_close, window) do
+    today_window = Enum.take(prior_closes, -(window - 1)) ++ [today_close]
+    yesterday_window = Enum.take(prior_closes, -window)
+
+    sma_today = mean(today_window)
+    sma_yesterday = mean(yesterday_window)
+
+    {sma_today, sma_today |> Decimal.sub(sma_yesterday) |> Decimal.round(8)}
+  end
+
+  defp mean(values) do
+    values
+    |> Enum.reduce(Decimal.new(0), &Decimal.add/2)
+    |> Decimal.div(length(values))
+    |> Decimal.round(8)
+  end
+
   ## ---------------------------------------------------------------------
   ## Encoding
   ## ---------------------------------------------------------------------

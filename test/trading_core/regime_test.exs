@@ -131,6 +131,39 @@ defmodule TradingCore.RegimeTest do
     end
   end
 
+  describe "sma_and_slope/3" do
+    defp decimals(range), do: Enum.map(range, &Decimal.new/1)
+
+    test "{nil, nil} with fewer than window prior closes" do
+      assert Regime.sma_and_slope(decimals(101..119), Decimal.new(120), 20) == {nil, nil}
+      assert Regime.sma_and_slope([], Decimal.new(120), 20) == {nil, nil}
+    end
+
+    test "a known 20-close example" do
+      # today window 102..121 -> 111.5; yesterday window 101..120 -> 110.5
+      {sma, slope} = Regime.sma_and_slope(decimals(101..120), Decimal.new(121), 20)
+
+      assert Decimal.equal?(sma, Decimal.new("111.5"))
+      assert Decimal.equal?(slope, Decimal.new("1"))
+    end
+
+    test "uses only the trailing window of a longer history" do
+      # today window 7..26 -> 16.5; yesterday window 6..25 -> 15.5
+      {sma, slope} = Regime.sma_and_slope(decimals(1..25), Decimal.new(26), 20)
+
+      assert Decimal.equal?(sma, Decimal.new("16.5"))
+      assert Decimal.equal?(slope, Decimal.new("1"))
+    end
+
+    test "rounds the SMA and slope to 8 decimal places" do
+      # today window [0, 0, 2] -> 2/3; yesterday window [0, 0, 0] -> 0
+      {sma, slope} = Regime.sma_and_slope(decimals([0, 0, 0]), Decimal.new(2), 3)
+
+      assert Decimal.to_string(sma) == "0.66666667"
+      assert Decimal.to_string(slope) == "0.66666667"
+    end
+  end
+
   describe "ordinal/1" do
     test "vol states" do
       assert Regime.ordinal(:calm) == -1
