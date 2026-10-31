@@ -15,9 +15,11 @@ defmodule TradingCore.MarketHours.UsEquitiesHolidays do
   Does not include early-close (half) days — this only answers "is the
   market fully closed," not "is it closing early."
 
-  Starts at 2023: `holiday?/1` answers `false` for any earlier date, so a
+  Starts at 2018: `holiday?/1` answers `false` for any earlier date, so a
   backtest further back than that would treat its holidays as trading
-  days. Add the earlier years first if one is needed.
+  days. Add the earlier years first if one is needed. (2018 covers
+  trading_backtest's sector signal replays, which start at XLC's launch
+  on 2018-06-19, plus their daily lookback.)
 
   Also lists **unscheduled** full closures the exchanges announced at
   short notice (e.g. a national day of mourning), since a backtest or a
@@ -35,6 +37,71 @@ defmodule TradingCore.MarketHours.UsEquitiesHolidays do
   # Memorial, Labor, Thanksgiving) are already always weekdays by
   # definition and never need this shift.
   @holidays MapSet.new([
+              # 2018–2020 checked against NYSE Group's "2018, 2019 and
+              # 2020 Holiday and Early Closings Calendar" release, and
+              # 2020–2022 against its "2020, 2021 and 2022" release
+              # (Juneteenth 2022 against the 2022–2024 release below),
+              # 2026-10-30.
+              # 2018
+              ~D[2018-01-01],
+              ~D[2018-01-15],
+              ~D[2018-02-19],
+              ~D[2018-03-30],
+              ~D[2018-05-28],
+              ~D[2018-07-04],
+              ~D[2018-09-03],
+              ~D[2018-11-22],
+              # Unscheduled: national day of mourning for President
+              # George H.W. Bush.
+              ~D[2018-12-05],
+              ~D[2018-12-25],
+              # 2019
+              ~D[2019-01-01],
+              ~D[2019-01-21],
+              ~D[2019-02-18],
+              ~D[2019-04-19],
+              ~D[2019-05-27],
+              ~D[2019-07-04],
+              ~D[2019-09-02],
+              ~D[2019-11-28],
+              ~D[2019-12-25],
+              # 2020
+              ~D[2020-01-01],
+              ~D[2020-01-20],
+              ~D[2020-02-17],
+              ~D[2020-04-10],
+              ~D[2020-05-25],
+              # 2020-07-04 is a Saturday -> observed Friday 2020-07-03.
+              ~D[2020-07-03],
+              ~D[2020-09-07],
+              ~D[2020-11-26],
+              ~D[2020-12-25],
+              # 2021 (no Juneteenth closure: first observed in 2022)
+              ~D[2021-01-01],
+              ~D[2021-01-18],
+              ~D[2021-02-15],
+              ~D[2021-04-02],
+              ~D[2021-05-31],
+              # 2021-07-04 is a Sunday -> observed Monday 2021-07-05.
+              ~D[2021-07-05],
+              ~D[2021-09-06],
+              ~D[2021-11-25],
+              # 2021-12-25 is a Saturday -> observed Friday 2021-12-24.
+              # 2021-12-31 stays a trading day (see 2022).
+              ~D[2021-12-24],
+              # 2022. 2022-01-01 is a Saturday; NYSE observes no New
+              # Year's Day holiday (same rule as 2028).
+              ~D[2022-01-17],
+              ~D[2022-02-21],
+              ~D[2022-04-15],
+              ~D[2022-05-30],
+              # 2022-06-19 is a Sunday -> observed Monday 2022-06-20.
+              ~D[2022-06-20],
+              ~D[2022-07-04],
+              ~D[2022-09-05],
+              ~D[2022-11-24],
+              # 2022-12-25 is a Sunday -> observed Monday 2022-12-26.
+              ~D[2022-12-26],
               # 2023 and 2024 checked against NYSE Group's "2022, 2023 and
               # 2024 Holiday and Early Closings Calendar" release
               # (2021-12-27), 2026-10-04.
