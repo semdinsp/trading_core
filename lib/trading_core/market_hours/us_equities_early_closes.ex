@@ -14,11 +14,29 @@ defmodule TradingCore.MarketHours.UsEquitiesEarlyCloses do
   far is 13:00 ET for equities (eligible options run to 13:15; that is
   not modelled here). Extended/late sessions also shorten on these days;
   that is not modelled either — this only moves the core close.
+
+  Starts at 2018, like `UsEquitiesHolidays`: `close_time/1` answers `nil`
+  for any earlier date.
   """
 
   @timezone "America/New_York"
 
   @early_closes %{
+    # 2018–2022 checked against NYSE Group's 2018–2020 and 2020–2022
+    # calendar releases, 2026-10-30. 2020 has no July early close (July 3
+    # is the observed holiday); 2021 and 2022 have only the day after
+    # Thanksgiving (July 3 and December 24 fell on weekends or were
+    # themselves observed holidays).
+    ~D[2018-07-03] => ~T[13:00:00],
+    ~D[2018-11-23] => ~T[13:00:00],
+    ~D[2018-12-24] => ~T[13:00:00],
+    ~D[2019-07-03] => ~T[13:00:00],
+    ~D[2019-11-29] => ~T[13:00:00],
+    ~D[2019-12-24] => ~T[13:00:00],
+    ~D[2020-11-27] => ~T[13:00:00],
+    ~D[2020-12-24] => ~T[13:00:00],
+    ~D[2021-11-26] => ~T[13:00:00],
+    ~D[2022-11-25] => ~T[13:00:00],
     # 2023–2024 checked against NYSE Group's 2022–2024 calendar release
     # (2021-12-27), 2026-10-04. 2023 has no Christmas Eve early close
     # (December 24 was a Sunday).

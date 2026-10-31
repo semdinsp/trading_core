@@ -419,6 +419,64 @@ defmodule TradingCore.MarketHoursTest do
              ]
     end
 
+    test "2018 through 2022 match NYSE's published closures" do
+      closures = fn year ->
+        Date.range(Date.new!(year, 1, 1), Date.new!(year, 12, 31))
+        |> Enum.filter(&MarketHours.holiday?("US_EQUITIES", &1))
+      end
+
+      assert closures.(2018) == [
+               ~D[2018-01-01],
+               ~D[2018-01-15],
+               ~D[2018-02-19],
+               ~D[2018-03-30],
+               ~D[2018-05-28],
+               ~D[2018-07-04],
+               ~D[2018-09-03],
+               ~D[2018-11-22],
+               ~D[2018-12-05],
+               ~D[2018-12-25]
+             ]
+
+      assert closures.(2021) == [
+               ~D[2021-01-01],
+               ~D[2021-01-18],
+               ~D[2021-02-15],
+               ~D[2021-04-02],
+               ~D[2021-05-31],
+               ~D[2021-07-05],
+               ~D[2021-09-06],
+               ~D[2021-11-25],
+               ~D[2021-12-24]
+             ]
+
+      assert closures.(2022) == [
+               ~D[2022-01-17],
+               ~D[2022-02-21],
+               ~D[2022-04-15],
+               ~D[2022-05-30],
+               ~D[2022-06-20],
+               ~D[2022-07-04],
+               ~D[2022-09-05],
+               ~D[2022-11-24],
+               ~D[2022-12-26]
+             ]
+
+      for year <- 2018..2022 do
+        assert Enum.all?(closures.(year), &(Date.day_of_week(&1) in 1..5)), "#{year}"
+      end
+
+      assert length(closures.(2019)) == 9
+      assert length(closures.(2020)) == 9
+      assert MarketHours.holiday?("US_EQUITIES", ~D[2020-07-03])
+
+      # Saturday New Year's Day 2022: the Friday before ends the year, so
+      # it stays a trading day.
+      refute MarketHours.holiday?("US_EQUITIES", ~D[2021-12-31])
+      # Before Juneteenth became an NYSE holiday.
+      refute MarketHours.holiday?("US_EQUITIES", ~D[2021-06-18])
+    end
+
     test "the unscheduled 2025-01-09 closure (President Carter) is listed" do
       assert MarketHours.holiday?("US_EQUITIES", ~D[2025-01-09])
       refute MarketHours.holiday?("US_EQUITIES", ~D[2025-01-08])
@@ -434,6 +492,28 @@ defmodule TradingCore.MarketHoursTest do
 
       # December 24, 2023 was a Sunday: no Christmas Eve early close.
       assert early.(~D[2023-12-22]) == nil
+    end
+
+    test "2018 through 2022 early closes" do
+      early_closes =
+        Date.range(~D[2018-01-01], ~D[2022-12-31])
+        |> Enum.filter(&MarketHours.early_close("US_EQUITIES", &1))
+
+      assert early_closes == [
+               ~D[2018-07-03],
+               ~D[2018-11-23],
+               ~D[2018-12-24],
+               ~D[2019-07-03],
+               ~D[2019-11-29],
+               ~D[2019-12-24],
+               ~D[2020-11-27],
+               ~D[2020-12-24],
+               ~D[2021-11-26],
+               ~D[2022-11-25]
+             ]
+
+      assert MarketHours.early_close("US_EQUITIES", ~D[2018-11-23]) ==
+               {~T[13:00:00], "America/New_York"}
     end
 
     # A deliberate tripwire: this goes red about 400 days before the
