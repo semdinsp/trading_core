@@ -164,6 +164,60 @@ defmodule TradingCore.RegimeTest do
     end
   end
 
+  describe "channel/3" do
+    defp closes(values), do: Enum.map(values, &Decimal.new/1)
+
+    test "breakout: 1 above the high, -1 below the low, 0 inside" do
+      channel = closes(["10", "12", "11", "14", "13"])
+
+      assert Regime.channel(channel, Decimal.new("14.01"), "breakout") == 1
+      assert Regime.channel(channel, Decimal.new("9.99"), "breakout") == -1
+      assert Regime.channel(channel, Decimal.new("12.5"), "breakout") == 0
+    end
+
+    test "breakout: equalling the high or low is not a breakout" do
+      channel = closes(["10", "12", "14"])
+
+      assert Regime.channel(channel, Decimal.new("14"), "breakout") == 0
+      assert Regime.channel(channel, Decimal.new("10"), "breakout") == 0
+    end
+
+    test "position: where live sits between low and high" do
+      channel = closes(["10", "12", "14"])
+
+      assert Decimal.equal?(
+               Regime.channel(channel, Decimal.new("13"), "position"),
+               Decimal.new("0.75")
+             )
+    end
+
+    test "position: clamped to 0..1 outside the channel" do
+      channel = closes(["10", "12", "14"])
+
+      assert Decimal.equal?(
+               Regime.channel(channel, Decimal.new("20"), "position"),
+               Decimal.new(1)
+             )
+
+      assert Decimal.equal?(Regime.channel(channel, Decimal.new("5"), "position"), Decimal.new(0))
+    end
+
+    test "position: nil for a flat channel" do
+      assert Regime.channel(closes(["10", "10", "10"]), Decimal.new("11"), "position") == nil
+    end
+
+    test "position: rounds to 8 decimal places" do
+      # (11 - 10) / (13 - 10) = 1/3; (12 - 10) / 3 = 2/3
+      channel = closes(["10", "13"])
+
+      assert Decimal.to_string(Regime.channel(channel, Decimal.new("11"), "position")) ==
+               "0.33333333"
+
+      assert Decimal.to_string(Regime.channel(channel, Decimal.new("12"), "position")) ==
+               "0.66666667"
+    end
+  end
+
   describe "ordinal/1" do
     test "vol states" do
       assert Regime.ordinal(:calm) == -1
