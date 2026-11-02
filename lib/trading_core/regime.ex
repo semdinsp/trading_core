@@ -351,6 +351,57 @@ defmodule TradingCore.Regime do
     end
   end
 
+  @doc """
+  How many consecutive completed sessions the trend rule has closed in its
+  current call, signed by the call: `+3` = `:up` at the last 3 closes,
+  `-2` = `:down` at the last 2, `0` = `:chop` at the last close. `closes`
+  are daily closes of completed sessions only, oldest first.
+
+  The rule is replayed at each close from the `sma_days + 1`th on:
+  `{sma, slope} = sma_and_slope(prior_sma_days_closes, close, sma_days)`,
+  `call = classify_trend(close, sma, slope)`, then, when a previous call
+  exists, `stable_state(call, previous, close, sma, sma * hysteresis_bps
+  / 10_000)`. The hysteresis carries from close to close; the first
+  window has no previous call. `nil` with no more than `sma_days` closes.
+
+  Moved from `TradingSignal.Signals.TrendState.sessions_in_state/3` so
+  the live signal and trading_backtest's replay of it share one
+  computation.
+  """
+  @spec sessions_in_state([Decimal.t()], pos_integer(), number()) :: integer() | nil
+  def sessions_in_state(closes, sma_days, hysteresis_bps) when length(closes) > sma_days do
+    {calls, _last} =
+      closes
+      |> Enum.chunk_every(sma_days + 1, 1, :discard)
+      |> Enum.map_reduce(nil, fn window, previous ->
+        {prior, [close]} = Enum.split(window, sma_days)
+        call = trend_step(previous, prior, close, sma_days, hysteresis_bps)
+        {call, call}
+      end)
+
+    [last | earlier] = Enum.reverse(calls)
+
+    case last do
+      :chop -> 0
+      _ -> ordinal(last) * (1 + Enum.count(Enum.take_while(earlier, &(&1 == last))))
+    end
+  end
+
+  def sessions_in_state(_closes, _sma_days, _hysteresis_bps), do: nil
+
+  # One trend call: `live` against the SMA of `prior` (exactly `days`
+  # closes, oldest first) plus `live`, held at `previous` unless it crossed
+  # the SMA by more than the hysteresis margin.
+  defp trend_step(previous, prior, live, days, hysteresis_bps) do
+    {sma, slope} = sma_and_slope(prior, live, days)
+    new_trend = classify_trend(live, sma, slope)
+    margin = sma |> Decimal.mult(to_decimal(hysteresis_bps)) |> Decimal.div(10_000)
+
+    if previous == nil,
+      do: new_trend,
+      else: stable_state(new_trend, previous, live, sma, margin)
+  end
+
   ## ---------------------------------------------------------------------
   ## Encoding
   ## ---------------------------------------------------------------------

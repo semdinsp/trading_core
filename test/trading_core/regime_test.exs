@@ -218,6 +218,38 @@ defmodule TradingCore.RegimeTest do
     end
   end
 
+  describe "sessions_in_state/3" do
+    defp decs(xs), do: Enum.map(xs, &Decimal.new(to_string(&1)))
+
+    test "counts the closes in the last call, signed; chop is 0" do
+      flat = List.duplicate(100, 10)
+
+      assert Regime.sessions_in_state(decs(flat ++ [101, 102, 103]), 5, 0) == 3
+      assert Regime.sessions_in_state(decs(flat ++ [101, 102, 103, 90]), 5, 0) == -1
+      assert Regime.sessions_in_state(decs(flat), 5, 0) == 0
+    end
+
+    test "nil with no more than sma_days closes" do
+      assert Regime.sessions_in_state(decs(List.duplicate(100, 5)), 5, 0) == nil
+      assert Regime.sessions_in_state([], 5, 0) == nil
+    end
+
+    test "the hysteresis carries from close to close" do
+      # 101 calls up; 100.95 is still above a rising SMA, and 100.4 is below
+      # the SMA but within the margin, so the up call holds for 3 sessions.
+      closes = decs(List.duplicate(100, 10) ++ [101, 100.95, 100.4])
+
+      assert Regime.sessions_in_state(closes, 5, 0) == 0
+      assert Regime.sessions_in_state(closes, 5, 50) == 3
+    end
+
+    test "accepts a float hysteresis_bps, as live uses 1.5" do
+      closes = decs(List.duplicate(100, 25) ++ [101, 102, 103])
+
+      assert Regime.sessions_in_state(closes, 20, 1.5) == 3
+    end
+  end
+
   describe "ordinal/1" do
     test "vol states" do
       assert Regime.ordinal(:calm) == -1
