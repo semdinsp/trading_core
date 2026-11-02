@@ -256,6 +256,136 @@ defmodule TradingCore.BacktestTimeRulesTest do
     end
   end
 
+  # A 1% stop, a far target and no exit rule; `params` merges over that.
+  defp stop_strategy(params \\ %{}) do
+    strategy(
+      %{},
+      Map.merge(
+        %{
+          "risk_controls" => %{
+            "method" => "percent_of_entry",
+            "stop_loss_percent" => 1,
+            "take_profit_percent" => 50
+          }
+        },
+        params
+      )
+    )
+    |> put_in(["rules", "exit"], nil)
+  end
+
+  # Thursday: enters at 101, stopped out on the 10:05 close of 99.5, then
+  # 101 again; Friday morning at 101.
+  defp stop_out_bars do
+    minutes(@thu, ~T[10:00:00], ~T[10:04:00], 101) ++
+      [bar(@thu, ~T[10:05:00], "99.5")] ++
+      minutes(@thu, ~T[10:06:00], ~T[10:20:00], 101) ++
+      minutes(@fri, ~T[10:00:00], ~T[10:05:00], 101)
+  end
+
+  describe "max_stop_outs_per_day" do
+    test "after N stop-outs, no entry on that symbol until the next ET date" do
+      assert {:ok, [first, second]} =
+               run(stop_strategy(%{"max_stop_outs_per_day" => 1}), stop_out_bars())
+
+      assert first.exit_reason == "stopped_out"
+      assert first.exit_category == "stop_loss"
+      # Without :flatten_at, Thursday's last signal fills at Friday's
+      # first bar; the cap is checked on the fill's date, Friday.
+      assert second.entry_at == et(@fri, ~T[10:00:00])
+    end
+
+    test "below the cap re-entry is unchanged" do
+      assert {:ok, [_first, second]} =
+               run(stop_strategy(%{"max_stop_outs_per_day" => 2}), stop_out_bars())
+
+      assert second.entry_at == et(@thu, ~T[10:07:00])
+
+      assert run(stop_strategy(%{"max_stop_outs_per_day" => 2}), stop_out_bars()) ==
+               run(stop_strategy(), stop_out_bars())
+    end
+
+    test "rule exits don't count" do
+      assert {:ok, [first, second]} =
+               run(strategy(%{}, %{"max_stop_outs_per_day" => 1}), dip_bars())
+
+      assert first.exit_category == "signal_reversal"
+      assert DateTime.diff(second.entry_at, first.exit_at) == 60
+    end
+
+    test "a ratchet stop-out is categorized ratchet and doesn't count" do
+      ratchet =
+        stop_strategy(%{
+          "max_stop_outs_per_day" => 1,
+          "exit_strategy" => %{"method" => "ratchet", "trigger_pct" => 1, "lock_pct" => "0.5"}
+        })
+
+      # Fills at 101; 103 reaches the 1% trigger and locks the stop at
+      # 101.505; the 101 close then stops out above the entry stop.
+      bars =
+        minutes(@thu, ~T[10:00:00], ~T[10:02:00], 101) ++
+          [bar(@thu, ~T[10:03:00], 103)] ++ minutes(@thu, ~T[10:04:00], ~T[10:10:00], 101)
+
+      assert {:ok, [first, second | _]} = run(ratchet, bars)
+      assert first.exit_reason == "stopped_out"
+      assert first.exit_category == "ratchet"
+      assert DateTime.diff(second.entry_at, first.exit_at) == 60
+    end
+  end
+
+  describe "reentry_cooldown_exit_categories" do
+    test "an exit outside the categories doesn't start the cooldown" do
+      params = %{
+        "reentry_cooldown_seconds" => 600,
+        "reentry_cooldown_exit_categories" => ["stop_loss"]
+      }
+
+      assert {:ok, [first, second]} = run(strategy(%{}, params), dip_bars())
+      assert first.exit_category == "signal_reversal"
+      assert DateTime.diff(second.entry_at, first.exit_at) == 60
+    end
+
+    test "an exit in the categories does" do
+      params = %{
+        "reentry_cooldown_seconds" => 600,
+        "reentry_cooldown_exit_categories" => ["stop_loss"]
+      }
+
+      assert {:ok, [first, second | _]} = run(stop_strategy(params), stop_out_bars())
+      assert first.exit_category == "stop_loss"
+      assert DateTime.diff(second.entry_at, first.exit_at) == 600
+    end
+  end
+
+  describe "exit_category" do
+    test "follows trading_system's ExitCategory for each exit reason" do
+      assert {:ok, [run]} =
+               run(
+                 strategy(%{"time_box_exit_et" => "14:00"}),
+                 minutes(@thu, ~T[13:50:00], ~T[14:05:00], 101)
+               )
+
+      assert run.exit_category == "time_box"
+
+      assert {:ok, [run]} =
+               run(
+                 strategy(%{"close_after_hours" => 2}),
+                 minutes(@thu, ~T[10:59:00], ~T[11:40:00], 101)
+               )
+
+      assert run.exit_category == "eod_flatten"
+
+      assert {:ok, [run]} =
+               run(strategy(), minutes(@thu, ~T[15:40:00], ~T[15:59:00], 101), @flatten)
+
+      assert run.exit_category == "eod_flatten"
+
+      assert {:ok, [run]} = run(strategy(), minutes(@thu, ~T[10:00:00], ~T[10:05:00], 101))
+      assert run.exit_reason == "end_of_data"
+      assert run.exit_category == nil
+    end
+  end
+
   describe "malformed rules" do
     test "are rejected with the key" do
       bars = minutes(@fri, ~T[10:00:00], ~T[10:05:00], 101)
@@ -265,6 +395,10 @@ defmodule TradingCore.BacktestTimeRulesTest do
             {%{"entry_delay_minutes" => -1}, %{}, :entry_delay_minutes},
             {%{"close_after_hours" => 0}, %{}, :close_after_hours},
             {%{}, %{"reentry_cooldown_seconds" => "60"}, :reentry_cooldown_seconds},
+            {%{}, %{"reentry_cooldown_exit_categories" => []}, :reentry_cooldown_exit_categories},
+            {%{}, %{"reentry_cooldown_exit_categories" => ["stopped_out"]},
+             :reentry_cooldown_exit_categories},
+            {%{}, %{"max_stop_outs_per_day" => "2"}, :max_stop_outs_per_day},
             {%{}, %{"usage_conditions" => %{"trading_hours" => %{"start" => "15:30"}}},
              :trading_hours},
             {%{},
