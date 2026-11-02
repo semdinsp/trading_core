@@ -44,9 +44,10 @@ defmodule TradingCore.Backtest do
     - `"position_sizing"` — the config `TradingCore.PositionSizing.calculate_qty/2`
       expects, e.g. `%{"method" => "fixed_qty", "qty" => 10}`.
     - Optional time rules, all off when absent: `params["usage_conditions"]["trading_hours"]`,
-      `"entry_delay_minutes"`, `"time_box_exit_et"`, `"close_after_hours"`
-      and `params["reentry_cooldown_seconds"]`. See "Strategy time rules"
-      below.
+      `"entry_delay_minutes"`, `"time_box_exit_et"`, `"close_after_hours"`,
+      `params["reentry_cooldown_seconds"]` (with
+      `params["reentry_cooldown_exit_categories"]`) and
+      `params["max_stop_outs_per_day"]`. See "Strategy time rules" below.
   - `bars_by_symbol` — `%{"AAPL" => [bar, ...], ...}`, one chronologically
     ordered list per symbol. A bar is
     `%{ts: DateTime.t(), open:, high:, low:, close:, volume: Decimal.t()}`.
@@ -226,7 +227,16 @@ defmodule TradingCore.Backtest do
     blocks entries, as live fails closed.
   - `params["reentry_cooldown_seconds"]` — no entry on a symbol until N
     seconds after that symbol's previous run's `exit_at`, whatever its
-    exit reason, as trading_live's `reentry_cooled_down?/2` does.
+    exit reason, as trading_live's `reentry_cooled_down?/2` does. With
+    `params["reentry_cooldown_exit_categories"]` (a non-empty list of
+    `exit_category` values, e.g. `["stop_loss"]`), only an exit in one of
+    those categories starts the cooldown, measured from the latest such
+    exit, as trading_system's discovery applies it.
+  - `params["max_stop_outs_per_day"]` — once a symbol has had N exits with
+    `exit_category: "stop_loss"` on the fill's US/Eastern date, no new
+    entry on it until the next date, as trading_live's
+    `stop_outs_under_cap?/2` does. Ratchet and trailing stop-outs
+    (`"ratchet"`), targets, rule exits and flattens don't count.
   - `"time_box_exit_et"` and `"close_after_hours"` (below) also close the
     entry window: no entry at or after the time box, or at or after
     `open + close_after_hours` (or the session's close, where that
@@ -257,6 +267,16 @@ defmodule TradingCore.Backtest do
     `remaining_close_after_hours/3` rounds the remainder up to whole
     hours instead; this follows trading_live.)
 
+  ### `exit_category`
+
+  Each run also carries `exit_category`, trading_system's
+  `ExitCategory.categorize/2` of its `exit_reason`: `"stopped_out"` is
+  `"stop_loss"`, or `"ratchet"` once an `exit_strategy` ratchet or trail
+  has moved the stop (as trading_live flags it); `"target_hit"` is
+  `"take_profit"`; `"rule_exit"` is `"signal_reversal"`; `"eod_flatten"`
+  and `"close_after_hours"` are `"eod_flatten"`; `"time_box_flatten"` is
+  `"time_box"`; `"end_of_data"` is `nil`.
+
   When more than one of these and `:flatten_at` fall due on the same bar,
   the reason is `"time_box_flatten"`, then `"close_after_hours"`, then
   `"eod_flatten"`. A malformed value is `{:error, {:invalid_time_rule, key}}`.
@@ -273,6 +293,9 @@ defmodule TradingCore.Backtest do
         exit_reason:
           "stopped_out" | "target_hit" | "rule_exit" | "end_of_data" | "eod_flatten"
           | "time_box_flatten" | "close_after_hours",
+        exit_category:
+          "stop_loss" | "ratchet" | "take_profit" | "signal_reversal" | "eod_flatten"
+          | "time_box" | nil,
         stop_method: "percent_of_entry" | "volatility_multiple",
         stop_daily_vol: Decimal.t() | nil,
         entry_stop_loss_price: Decimal.t() | nil,
@@ -598,6 +621,7 @@ defmodule TradingCore.Backtest do
           exit_at: DateTime.t(),
           exit_price: Decimal.t(),
           exit_reason: String.t(),
+          exit_category: String.t() | nil,
           stop_method: String.t(),
           stop_daily_vol: Decimal.t() | nil,
           entry_stop_loss_price: Decimal.t() | nil,
@@ -1221,7 +1245,11 @@ defmodule TradingCore.Backtest do
          {:ok, delay} <- count(Map.get(strategy, "entry_delay_minutes"), :entry_delay_minutes),
          {:ok, close_after} <- budget_seconds(Map.get(strategy, "close_after_hours")),
          {:ok, cooldown} <-
-           count(Map.get(params, "reentry_cooldown_seconds"), :reentry_cooldown_seconds) do
+           count(Map.get(params, "reentry_cooldown_seconds"), :reentry_cooldown_seconds),
+         {:ok, cooldown_categories} <-
+           exit_categories(Map.get(params, "reentry_cooldown_exit_categories")),
+         {:ok, max_stop_outs} <-
+           count(Map.get(params, "max_stop_outs_per_day"), :max_stop_outs_per_day) do
       {:ok,
        %{
          trading_hours: trading_hours,
@@ -1229,7 +1257,9 @@ defmodule TradingCore.Backtest do
          entry_delay_minutes: delay,
          # seconds
          close_after_hours: close_after,
-         reentry_cooldown_seconds: cooldown
+         reentry_cooldown_seconds: cooldown,
+         reentry_cooldown_exit_categories: cooldown_categories,
+         max_stop_outs_per_day: max_stop_outs
        }}
     end
   end
@@ -1239,6 +1269,23 @@ defmodule TradingCore.Backtest do
   defp count(0, _key), do: {:ok, nil}
   defp count(n, _key) when is_integer(n) and n > 0, do: {:ok, n}
   defp count(_other, key), do: {:error, {:invalid_time_rule, key}}
+
+  # trading_system's ExitCategory.categories/0.
+  @exit_categories ~w(
+    take_profit stop_loss signal_reversal ratchet
+    eod_flatten time_box eod_churn_reopen risk_guardian manual
+  )
+
+  defp exit_categories(nil), do: {:ok, nil}
+
+  defp exit_categories([_ | _] = categories) do
+    if Enum.all?(categories, &(&1 in @exit_categories)),
+      do: {:ok, categories},
+      else: {:error, {:invalid_time_rule, :reentry_cooldown_exit_categories}}
+  end
+
+  defp exit_categories(_other),
+    do: {:error, {:invalid_time_rule, :reentry_cooldown_exit_categories}}
 
   # close_after_hours as seconds, rounded as trading_live's
   # CloseAfterHours.budget_seconds/1 does.
@@ -1292,7 +1339,13 @@ defmodule TradingCore.Backtest do
 
     {delay_elapsed? and budget_left? and in_trading_hours?(at, rules.trading_hours) and
        not time_box_due?(at, rules.time_box_exit_et) and
-       cooled_down?(at, rules.reentry_cooldown_seconds, runs), bounds}
+       cooled_down?(
+         at,
+         rules.reentry_cooldown_seconds,
+         rules.reentry_cooldown_exit_categories,
+         runs
+       ) and
+       stop_outs_under_cap?(at, rules.max_stop_outs_per_day, runs), bounds}
   end
 
   # Before open + close_after_hours, as trading_live's
@@ -1332,10 +1385,31 @@ defmodule TradingCore.Backtest do
     Time.compare(local, start) != :lt and Time.compare(local, finish) != :gt
   end
 
-  # runs is newest first, so its head is this symbol's previous exit.
-  defp cooled_down?(_at, nil, _runs), do: true
-  defp cooled_down?(_at, _seconds, []), do: true
-  defp cooled_down?(at, seconds, [last | _]), do: DateTime.diff(at, last.exit_at) >= seconds
+  # runs is newest first: the cooldown runs from the latest exit, or the
+  # latest one in `categories` when those are given.
+  defp cooled_down?(_at, nil, _categories, _runs), do: true
+
+  defp cooled_down?(at, seconds, categories, runs) do
+    case Enum.find(runs, &(categories == nil or &1.exit_category in categories)) do
+      nil -> true
+      last -> DateTime.diff(at, last.exit_at) >= seconds
+    end
+  end
+
+  # Fewer than `cap` stop_loss exits on `at`'s US/Eastern date. runs is
+  # newest first, so that date's exits are at its head.
+  defp stop_outs_under_cap?(_at, nil, _runs), do: true
+
+  defp stop_outs_under_cap?(at, cap, runs) do
+    day = eastern_date(at)
+
+    runs
+    |> Enum.take_while(&(eastern_date(&1.exit_at) == day))
+    |> Enum.count(&(&1.exit_category == "stop_loss"))
+    |> Kernel.<(cap)
+  end
+
+  defp eastern_date(at), do: at |> DateTime.shift_zone!(@eastern) |> DateTime.to_date()
 
   # Stores the close_after_hours deadline on a position maybe_enter just
   # opened, so the exit side only compares timestamps.
@@ -2095,16 +2169,24 @@ defmodule TradingCore.Backtest do
            exit_strategy_config,
            position.state
          ) do
+      # Either step marks the run ratcheted, so a later stop-out is a
+      # "ratchet" exit, as trading_live's put_ratchet_result/5 flags it.
       {:ratchet, new_stop, state_updates} ->
-        %{
-          position
-          | stop_loss_price: new_stop,
-            take_profit_price: nil,
-            state: Map.merge(position.state, state_updates)
-        }
+        position
+        |> Map.merge(%{
+          stop_loss_price: new_stop,
+          take_profit_price: nil,
+          state: Map.merge(position.state, state_updates)
+        })
+        |> Map.put(:ratcheted?, true)
 
       {:trail, new_stop, state_updates} ->
-        %{position | stop_loss_price: new_stop, state: Map.merge(position.state, state_updates)}
+        position
+        |> Map.merge(%{
+          stop_loss_price: new_stop,
+          state: Map.merge(position.state, state_updates)
+        })
+        |> Map.put(:ratcheted?, true)
 
       :no_ratchet ->
         position
@@ -2191,6 +2273,16 @@ defmodule TradingCore.Backtest do
   defp hit_take_profit?(position, current_price, direction),
     do: RiskControls.hit_take_profit?(position.take_profit_price, current_price, direction)
 
+  # trading_system's ExitCategory.categorize/2, for this module's reasons.
+  defp exit_category("stopped_out", true), do: "ratchet"
+  defp exit_category("stopped_out", false), do: "stop_loss"
+  defp exit_category("target_hit", _ratcheted?), do: "take_profit"
+  defp exit_category("rule_exit", _ratcheted?), do: "signal_reversal"
+  defp exit_category("eod_flatten", _ratcheted?), do: "eod_flatten"
+  defp exit_category("close_after_hours", _ratcheted?), do: "eod_flatten"
+  defp exit_category("time_box_flatten", _ratcheted?), do: "time_box"
+  defp exit_category(_end_of_data, _ratcheted?), do: nil
+
   defp force_close_open_position(%{position: nil, runs: runs}, _symbol, _last_bar), do: runs
 
   defp force_close_open_position(%{position: position, runs: runs}, symbol, last_bar) do
@@ -2216,6 +2308,7 @@ defmodule TradingCore.Backtest do
       exit_at: exit_at,
       exit_price: exit_price,
       exit_reason: exit_reason,
+      exit_category: exit_category(exit_reason, Map.get(position, :ratcheted?, false)),
       stop_method: Map.get(position, :stop_method),
       stop_daily_vol: Map.get(position, :stop_daily_vol),
       entry_stop_loss_price: Map.get(position, :entry_stop_loss_price),
