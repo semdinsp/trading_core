@@ -43,6 +43,10 @@ defmodule TradingCore.Backtest do
       `TradingCore.ExitStrategy.check/5`); either/both may be absent.
     - `"position_sizing"` — the config `TradingCore.PositionSizing.calculate_qty/2`
       expects, e.g. `%{"method" => "fixed_qty", "qty" => 10}`.
+    - Optional time rules, all off when absent: `params["usage_conditions"]["trading_hours"]`,
+      `"entry_delay_minutes"`, `"time_box_exit_et"`, `"close_after_hours"`
+      and `params["reentry_cooldown_seconds"]`. See "Strategy time rules"
+      below.
   - `bars_by_symbol` — `%{"AAPL" => [bar, ...], ...}`, one chronologically
     ordered list per symbol. A bar is
     `%{ts: DateTime.t(), open:, high:, low:, close:, volume: Decimal.t()}`.
@@ -199,6 +203,64 @@ defmodule TradingCore.Backtest do
   `market_close` sweep), so `~T[15:55:00]` is a slightly earlier,
   deliberate choice rather than an exact copy of live.
 
+  ## Strategy time rules
+
+  The StrategyVersion time settings live trading honours, replayed the
+  same way. Each is off when absent (`nil`, or `0` for the counts), so a
+  strategy without them backtests exactly as before.
+
+  Entry side, checked at the fill bar's open (the run's `entry_at`, when
+  the order would go in). A signal whose fill falls outside them is
+  ignored; nothing is queued for later:
+
+  - `params["usage_conditions"]["trading_hours"]` —
+    `%{"tz" => "America/New_York", "start" => "15:30", "end" => "15:45"}`.
+    Entries only when the fill's local time in `tz` is within
+    `start..end`, **inclusive at both ends**, as trading_system's
+    `UsageConditions` checks it. Other `usage_conditions` keys are not
+    replayed.
+  - `"entry_delay_minutes"` (top-level) — no entry before the regular
+    session's 09:30 ET open plus N minutes on the fill's date, as
+    trading_system's `entry_delay_elapsed?/4` and trading_live's
+    `StrategyStockMonitor` do. A date with no session (weekend, holiday)
+    blocks entries, as live fails closed.
+  - `params["reentry_cooldown_seconds"]` — no entry on a symbol until N
+    seconds after that symbol's previous run's `exit_at`, whatever its
+    exit reason, as trading_live's `reentry_cooled_down?/2` does.
+  - `"time_box_exit_et"` and `"close_after_hours"` (below) also close the
+    entry window: no entry at or after the time box, or at or after
+    `open + close_after_hours` (or the session's close, where that
+    deadline is capped, since such an entry has no runway), as trading_live's
+    `time_box_window_open?/2` and `CloseAfterHours.entry_window_open?/3`
+    refuse them. Without that, the replay would re-enter right after
+    every time exit and be flattened again a bar later.
+
+  Exit side, flattening at the close of the first bar at or after the
+  deadline, the same way as `:flatten_at`. An `intrabar: true` stop or
+  target hit on that bar still wins:
+
+  - `"time_box_exit_et"` (top-level; also read from `params` when the
+    top-level key is absent) — a `Time` or `"HH:MM"`/`"HH:MM:SS"` string.
+    Flattens once a bar's US/Eastern wall-clock time reaches it, with
+    `exit_reason: "time_box_flatten"`, as trading_system's
+    `list_runs_due_for_time_box_close/1` does. Not moved for half days,
+    so a time box after 13:00 doesn't fire on one and `:flatten_at` is
+    the backstop there.
+  - `"close_after_hours"` (top-level; a positive number of hours, which
+    may be fractional) — a budget counted from the session's 09:30 ET
+    open, not from entry, as trading_live's `CloseAfterHours.deadline/3`
+    computes it: `entry_at` plus whatever of the budget is left at entry
+    (to the second, floored at zero), capped at that session's close. So
+    any entry after the open is due at `open + close_after_hours`.
+    Flattens with `exit_reason: "close_after_hours"`. An entry on a date
+    with no session uses `entry_at + close_after_hours`. (trading_system's
+    `remaining_close_after_hours/3` rounds the remainder up to whole
+    hours instead; this follows trading_live.)
+
+  When more than one of these and `:flatten_at` fall due on the same bar,
+  the reason is `"time_box_flatten"`, then `"close_after_hours"`, then
+  `"eod_flatten"`. A malformed value is `{:error, {:invalid_time_rule, key}}`.
+
   Returns `{:ok, [run]}` where each `run` is a plain map:
 
       %{
@@ -209,7 +271,8 @@ defmodule TradingCore.Backtest do
         exit_at: DateTime.t(),
         exit_price: Decimal.t(),
         exit_reason:
-          "stopped_out" | "target_hit" | "rule_exit" | "end_of_data" | "eod_flatten",
+          "stopped_out" | "target_hit" | "rule_exit" | "end_of_data" | "eod_flatten"
+          | "time_box_flatten" | "close_after_hours",
         stop_method: "percent_of_entry" | "volatility_multiple",
         stop_daily_vol: Decimal.t() | nil,
         entry_stop_loss_price: Decimal.t() | nil,
@@ -561,7 +624,9 @@ defmodule TradingCore.Backtest do
   `{:error, :invalid_sizing_vol}` for an unknown `opts[:sizing_vol]`,
   `{:error, :invalid_trade_from}` for a `:trade_from` that isn't a `Date`,
   `{:error, :sizing_equity_required}` for `"percent_equity"`/`"risk_based"`
-  sizing without a positive `opts[:sizing_equity]`, or a required
+  sizing without a positive `opts[:sizing_equity]`,
+  `{:error, {:invalid_time_rule, key}}` for a malformed strategy time rule
+  (see "Strategy time rules"), or a required
   `position_sizing` context value is missing for every symbol (nothing
   to backtest).
   """
@@ -583,8 +648,10 @@ defmodule TradingCore.Backtest do
          :ok <- validate_flatten_at(Keyword.get(opts, :flatten_at)),
          :ok <- validate_sizing_vol(Keyword.get(opts, :sizing_vol, :stdev)),
          :ok <- validate_sizing_equity(strategy, Keyword.get(opts, :sizing_equity)),
-         :ok <- validate_trade_from(Keyword.get(opts, :trade_from)) do
+         :ok <- validate_trade_from(Keyword.get(opts, :trade_from)),
+         {:ok, time_rules} <- time_rules(strategy) do
       global_series = compute_global_series(signal_specs, bars_by_symbol, literal_series)
+      opts = Keyword.put(opts, :__time_rules__, time_rules)
 
       runs =
         bars_by_symbol
@@ -971,6 +1038,7 @@ defmodule TradingCore.Backtest do
     flatten_at = Keyword.get(opts, :flatten_at)
     intrabar? = Keyword.get(opts, :intrabar, false)
     trade_from = Keyword.get(opts, :trade_from)
+    time_rules = Keyword.fetch!(opts, :__time_rules__)
 
     # Built once per symbol; only volatility_target sizing reads it.
     opts =
@@ -983,6 +1051,8 @@ defmodule TradingCore.Backtest do
       position: nil,
       runs: [],
       sessions: %{},
+      # US/Eastern date => {open, close} | nil, for the time rules
+      bounds: %{},
       # name => {series entries not yet reached, latest value reached}
       global_cursors: Map.new(global_series, fn {name, series} -> {name, {series, nil}} end)
     }
@@ -1003,10 +1073,15 @@ defmodule TradingCore.Backtest do
 
         case acc.position do
           nil ->
+            {entry_time_ok?, bounds} =
+              entry_time_ok?(next_bar, time_rules, acc.runs, acc.bounds)
+
+            acc = %{acc | bounds: bounds}
+
             if tradeable?(bar, trade_from) and
-                 entry_allowed?(bar, next_bar, session, next_session) do
-              maybe_enter(
-                acc,
+                 entry_allowed?(bar, next_bar, session, next_session) and entry_time_ok? do
+              acc
+              |> maybe_enter(
                 symbol,
                 bar,
                 next_bar,
@@ -1019,6 +1094,7 @@ defmodule TradingCore.Backtest do
                 index,
                 opts
               )
+              |> put_close_deadline(time_rules.close_after_hours)
             else
               acc
             end
@@ -1035,7 +1111,12 @@ defmodule TradingCore.Backtest do
               exit_strategy_config,
               direction,
               intrabar?,
-              flatten_now?(bar, next_bar, session, next_session)
+              flatten_reason(
+                bar,
+                position,
+                time_rules,
+                flatten_now?(bar, next_bar, session, next_session)
+              )
             )
         end
       end)
@@ -1124,6 +1205,200 @@ defmodule TradingCore.Backtest do
       DateTime.compare(bar.ts, session.open) == :lt or
       (next_bar != nil and next_session.date != session.date) or
       (next_bar == nil and DateTime.diff(session.cutoff, bar.ts) <= 60)
+  end
+
+  ## -----------------------------------------------------------------------
+  ## Strategy time rules (see moduledoc)
+  ## -----------------------------------------------------------------------
+
+  defp time_rules(strategy) do
+    params = Map.get(strategy, "params") || %{}
+    usage_conditions = Map.get(params, "usage_conditions") || %{}
+    time_box = Map.get(strategy, "time_box_exit_et") || Map.get(params, "time_box_exit_et")
+
+    with {:ok, trading_hours} <- parse_trading_hours(Map.get(usage_conditions, "trading_hours")),
+         {:ok, time_box} <- parse_time_of_day(time_box, :time_box_exit_et),
+         {:ok, delay} <- count(Map.get(strategy, "entry_delay_minutes"), :entry_delay_minutes),
+         {:ok, close_after} <- budget_seconds(Map.get(strategy, "close_after_hours")),
+         {:ok, cooldown} <-
+           count(Map.get(params, "reentry_cooldown_seconds"), :reentry_cooldown_seconds) do
+      {:ok,
+       %{
+         trading_hours: trading_hours,
+         time_box_exit_et: time_box,
+         entry_delay_minutes: delay,
+         # seconds
+         close_after_hours: close_after,
+         reentry_cooldown_seconds: cooldown
+       }}
+    end
+  end
+
+  # nil and 0 are both "off".
+  defp count(nil, _key), do: {:ok, nil}
+  defp count(0, _key), do: {:ok, nil}
+  defp count(n, _key) when is_integer(n) and n > 0, do: {:ok, n}
+  defp count(_other, key), do: {:error, {:invalid_time_rule, key}}
+
+  # close_after_hours as seconds, rounded as trading_live's
+  # CloseAfterHours.budget_seconds/1 does.
+  defp budget_seconds(nil), do: {:ok, nil}
+
+  defp budget_seconds(%Decimal{} = hours) do
+    if Decimal.gt?(hours, 0),
+      do: {:ok, hours |> Decimal.mult(3600) |> Decimal.round(0) |> Decimal.to_integer()},
+      else: {:error, {:invalid_time_rule, :close_after_hours}}
+  end
+
+  defp budget_seconds(hours) when is_number(hours) and hours > 0, do: {:ok, round(hours * 3600)}
+  defp budget_seconds(_other), do: {:error, {:invalid_time_rule, :close_after_hours}}
+
+  defp parse_trading_hours(nil), do: {:ok, nil}
+
+  defp parse_trading_hours(%{"start" => start, "end" => finish, "tz" => tz}) do
+    with {:ok, start} <- parse_time_of_day(start, :trading_hours),
+         {:ok, finish} <- parse_time_of_day(finish, :trading_hours),
+         true <- start != nil and finish != nil,
+         {:ok, _} <- DateTime.shift_zone(~U[2026-01-01 00:00:00Z], tz) do
+      {:ok, %{start: start, end: finish, tz: tz}}
+    else
+      _ -> {:error, {:invalid_time_rule, :trading_hours}}
+    end
+  end
+
+  defp parse_trading_hours(_other), do: {:error, {:invalid_time_rule, :trading_hours}}
+
+  defp parse_time_of_day(nil, _key), do: {:ok, nil}
+  defp parse_time_of_day(%Time{} = time, _key), do: {:ok, time}
+
+  defp parse_time_of_day(string, key) when is_binary(string) do
+    string = if byte_size(string) == 5, do: string <> ":00", else: string
+
+    case Time.from_iso8601(string) do
+      {:ok, time} -> {:ok, time}
+      {:error, _} -> {:error, {:invalid_time_rule, key}}
+    end
+  end
+
+  defp parse_time_of_day(_other, key), do: {:error, {:invalid_time_rule, key}}
+
+  # Entry-side rules, checked at the fill bar's open (the run's entry_at).
+  # No fill bar means no entry anyway.
+  defp entry_time_ok?(nil, _rules, _runs, bounds), do: {true, bounds}
+
+  defp entry_time_ok?(%{ts: at}, rules, runs, bounds) do
+    {delay_elapsed?, bounds} = entry_delay_elapsed?(at, rules.entry_delay_minutes, bounds)
+    {budget_left?, bounds} = close_budget_left?(at, rules.close_after_hours, bounds)
+
+    {delay_elapsed? and budget_left? and in_trading_hours?(at, rules.trading_hours) and
+       not time_box_due?(at, rules.time_box_exit_et) and
+       cooled_down?(at, rules.reentry_cooldown_seconds, runs), bounds}
+  end
+
+  # Before open + close_after_hours, as trading_live's
+  # CloseAfterHours.entry_window_open?/3 checks, and before the close the
+  # deadline is capped at (an entry there would have no runway). No
+  # session leaves it open, as live does.
+  defp close_budget_left?(_at, nil, bounds), do: {true, bounds}
+
+  defp close_budget_left?(at, budget, bounds) do
+    case session_bounds(at, bounds) do
+      {{open, close}, bounds} ->
+        window_end = Enum.min([DateTime.add(open, budget), close], DateTime)
+        {DateTime.compare(at, window_end) == :lt, bounds}
+
+      {nil, bounds} ->
+        {true, bounds}
+    end
+  end
+
+  defp entry_delay_elapsed?(_at, nil, bounds), do: {true, bounds}
+
+  defp entry_delay_elapsed?(at, minutes, bounds) do
+    case session_bounds(at, bounds) do
+      {{open, _close}, bounds} ->
+        {DateTime.compare(at, DateTime.add(open, minutes * 60, :second)) != :lt, bounds}
+
+      # No session that day: blocked, as live fails closed.
+      {nil, bounds} ->
+        {false, bounds}
+    end
+  end
+
+  defp in_trading_hours?(_at, nil), do: true
+
+  defp in_trading_hours?(at, %{start: start, end: finish, tz: tz}) do
+    local = at |> DateTime.shift_zone!(tz) |> DateTime.to_time()
+    Time.compare(local, start) != :lt and Time.compare(local, finish) != :gt
+  end
+
+  # runs is newest first, so its head is this symbol's previous exit.
+  defp cooled_down?(_at, nil, _runs), do: true
+  defp cooled_down?(_at, _seconds, []), do: true
+  defp cooled_down?(at, seconds, [last | _]), do: DateTime.diff(at, last.exit_at) >= seconds
+
+  # Stores the close_after_hours deadline on a position maybe_enter just
+  # opened, so the exit side only compares timestamps.
+  defp put_close_deadline(%{position: nil} = acc, _hours), do: acc
+  defp put_close_deadline(acc, nil), do: acc
+
+  defp put_close_deadline(%{position: position} = acc, budget) do
+    {deadline, bounds} = close_deadline(position.entry_at, budget, acc.bounds)
+    %{acc | position: Map.put(position, :close_deadline, deadline), bounds: bounds}
+  end
+
+  # trading_live's CloseAfterHours.deadline/3: the budget less the session
+  # already elapsed at entry, floored at zero, capped at that session's
+  # close.
+  defp close_deadline(entry_at, budget, bounds) do
+    case session_bounds(entry_at, bounds) do
+      {{open, close}, bounds} ->
+        runway = max(budget - max(DateTime.diff(entry_at, open), 0), 0)
+        due = DateTime.add(entry_at, runway)
+        {if(DateTime.compare(due, close) == :gt, do: close, else: due), bounds}
+
+      {nil, bounds} ->
+        {DateTime.add(entry_at, budget), bounds}
+    end
+  end
+
+  defp flatten_reason(bar, position, rules, flatten_now?) do
+    cond do
+      time_box_due?(bar.ts, rules.time_box_exit_et) -> "time_box_flatten"
+      close_deadline_due?(bar.ts, Map.get(position, :close_deadline)) -> "close_after_hours"
+      flatten_now? -> "eod_flatten"
+      true -> nil
+    end
+  end
+
+  defp time_box_due?(_ts, nil), do: false
+
+  defp time_box_due?(ts, time_box) do
+    local = ts |> DateTime.shift_zone!(@eastern) |> DateTime.to_time()
+    Time.compare(local, time_box) != :lt
+  end
+
+  defp close_deadline_due?(_ts, nil), do: false
+  defp close_deadline_due?(ts, deadline), do: DateTime.compare(ts, deadline) != :lt
+
+  # {open, close} of the regular session on `at`'s US/Eastern date, or nil
+  # on a weekend/holiday; cached per date.
+  defp session_bounds(at, cache) do
+    date = at |> DateTime.shift_zone!(@eastern) |> DateTime.to_date()
+
+    case Map.fetch(cache, date) do
+      {:ok, bounds} ->
+        {bounds, cache}
+
+      :error ->
+        bounds =
+          case RegularSession.bounds(date) do
+            {:ok, open, close} -> {open, close}
+            :error -> nil
+          end
+
+        {bounds, Map.put(cache, date, bounds)}
+    end
   end
 
   defp fresh_state(%{kind: :self_zscore}), do: {[], TradingCore.WelfordAcc.new()}
@@ -1743,7 +2018,7 @@ defmodule TradingCore.Backtest do
          exit_strategy_config,
          direction,
          intrabar?,
-         flatten_now?
+         flatten_reason
        ) do
     {intrabar_hit, position} =
       if intrabar?,
@@ -1757,8 +2032,8 @@ defmodule TradingCore.Backtest do
 
       # An intrabar stop/target on this bar happened before its close, so
       # it wins; otherwise the flatten fills at this bar's close.
-      _ when flatten_now? ->
-        run = close_run(symbol, position, position.direction, bar.close, bar.ts, "eod_flatten")
+      _ when flatten_reason != nil ->
+        run = close_run(symbol, position, position.direction, bar.close, bar.ts, flatten_reason)
         %{acc | position: nil, runs: [run | acc.runs]}
 
       _ ->
