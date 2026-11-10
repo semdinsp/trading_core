@@ -310,4 +310,121 @@ defmodule TradingCore.RegimeTest do
       assert Regime.stable_state(:stressed, :normal, 24.0, 22.0, 1.0) == :stressed
     end
   end
+
+  describe "stable_vol_state/5" do
+    @bands {Decimal.new("16.0"), Decimal.new("19.0")}
+
+    defp vol(previous, vix) do
+      new = Regime.classify_vol_absolute(vix, @bands)
+      Regime.stable_vol_state(new, previous, vix, @bands)
+    end
+
+    test "no memory, or no change, returns new" do
+      assert vol(nil, 16.5) == :normal
+      assert vol(:normal, 17.0) == :normal
+    end
+
+    test "calm <-> normal uses the low edge in both directions" do
+      assert vol(:calm, 16.5) == :calm
+      assert vol(:calm, 17.5) == :normal
+      assert vol(:normal, 15.5) == :normal
+      assert vol(:normal, 14.5) == :calm
+    end
+
+    test "normal <-> stressed uses the high edge in both directions" do
+      assert vol(:normal, 19.5) == :normal
+      assert vol(:normal, 20.5) == :stressed
+      assert vol(:stressed, 18.5) == :stressed
+      assert vol(:stressed, 17.5) == :normal
+    end
+
+    test "a two-step jump uses the edge on new's side" do
+      assert vol(:calm, 19.5) == :calm
+      assert vol(:calm, 20.5) == :stressed
+      assert vol(:stressed, 15.5) == :stressed
+      assert vol(:stressed, 14.5) == :calm
+    end
+
+    test "margin is configurable" do
+      assert Regime.stable_vol_state(:normal, :calm, 16.5, @bands, 0.25) == :normal
+    end
+  end
+
+  describe "stable_trend_state/6" do
+    # SMA 700: 0.1% = 0.7, 0.3% = 2.1; the default price deadband is 1.75.
+    @sma Decimal.new("700")
+
+    defp trend(previous, price_pct, slope, opts \\ []) do
+      price = @sma |> Decimal.mult(Decimal.add(1, Decimal.from_float(price_pct / 100)))
+      new = Regime.classify_trend(price, @sma, slope)
+      Regime.stable_trend_state(new, previous, price, @sma, slope, opts)
+    end
+
+    test "price within 0.25% of the SMA holds; beyond it flips" do
+      # up -> chop on price
+      assert trend(:up, -0.1, 1.0) == :up
+      assert trend(:up, -0.3, 1.0) == :chop
+      # chop -> up / down on price
+      assert trend(:chop, 0.1, 1.0) == :chop
+      assert trend(:chop, 0.3, 1.0) == :up
+      assert trend(:chop, -0.1, -1.0) == :chop
+      assert trend(:chop, -0.3, -1.0) == :down
+      # down -> chop on price
+      assert trend(:down, 0.1, -1.0) == :down
+      assert trend(:down, 0.3, -1.0) == :chop
+    end
+
+    test "slope within 0.10 holds; beyond it flips" do
+      assert trend(:up, 2.0, -0.02) == :up
+      assert trend(:up, 2.0, -0.15) == :chop
+      assert trend(:chop, 2.0, 0.02) == :chop
+      assert trend(:chop, 2.0, 0.15) == :up
+      assert trend(:down, -2.0, 0.02) == :down
+      assert trend(:down, -2.0, 0.15) == :chop
+      assert trend(:chop, -2.0, -0.02) == :chop
+      assert trend(:chop, -2.0, -0.15) == :down
+    end
+
+    test "up -> down only part-way lands on chop" do
+      assert trend(:up, -2.0, -0.05) == :chop
+      assert trend(:up, -2.0, -0.15) == :down
+      assert trend(:down, 2.0, 0.05) == :chop
+      assert trend(:down, 2.0, 0.15) == :up
+    end
+
+    test "from chop, a small move never classifies as the opposite of new" do
+      # new :up (above SMA, positive slope) but both inside the deadband:
+      # biasing toward :down would classify :down; it must hold :chop.
+      assert trend(:chop, 0.1, 0.02) == :chop
+      assert trend(:chop, -0.1, -0.02) == :chop
+    end
+
+    test "margins are configurable" do
+      assert trend(:chop, 0.1, 1.0, price_margin_pct: 0.0005) == :up
+      assert trend(:up, 2.0, -0.02, slope_margin: 0.01) == :chop
+    end
+
+    test "nil handling" do
+      assert Regime.stable_trend_state(nil, :up, 700, 700, 0.1) == nil
+      assert Regime.stable_trend_state(:down, nil, 690, 700, -0.5) == :down
+      assert Regime.stable_trend_state(:down, :up, 690, nil, nil) == :down
+      assert Regime.stable_trend_state(:down, :up, 690, 700, nil) == :down
+      assert Regime.stable_trend_state(:up, :up, 701, 700, 0.5) == :up
+    end
+  end
+
+  describe "trend_in_deadband?/3" do
+    test "true within 0.25% of the SMA, inclusive" do
+      assert Regime.trend_in_deadband?(701, 700)
+      assert Regime.trend_in_deadband?(Decimal.new("701.75"), 700)
+      refute Regime.trend_in_deadband?(Decimal.new("701.76"), 700)
+      refute Regime.trend_in_deadband?(698, 700)
+      assert Regime.trend_in_deadband?(698, 700, price_margin_pct: 0.005)
+    end
+
+    test "nil for missing inputs" do
+      assert Regime.trend_in_deadband?(nil, 700) == nil
+      assert Regime.trend_in_deadband?(700, nil) == nil
+    end
+  end
 end
