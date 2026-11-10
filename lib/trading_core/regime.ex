@@ -110,6 +110,12 @@ defmodule TradingCore.Regime do
   # module never uses float equality).
   @default_slope_eps Decimal.new("0.0")
 
+  # Hysteresis defaults for stable_vol_state/5 and stable_trend_state/6 —
+  # see their docs for where the numbers come from.
+  @default_vol_hysteresis_margin Decimal.new("1.0")
+  @default_price_margin_pct Decimal.new("0.0025")
+  @default_slope_margin Decimal.new("0.10")
+
   ## ---------------------------------------------------------------------
   ## Boundary computation (from history)
   ## ---------------------------------------------------------------------
@@ -509,6 +515,149 @@ defmodule TradingCore.Regime do
     else
       previous_state
     end
+  end
+
+  @doc """
+  Vol-axis hysteresis: `new` (from `classify_vol_absolute/2` against
+  `{low, high}`) unless `vix` sits within `margin` VIX points (default
+  `1.0`) of the edge between `previous` and `new`, in which case
+  `previous` holds. `previous == nil` (no memory yet) returns `new`.
+
+  The edge is chosen by the *unordered* pair of states, never by the
+  direction of travel: calm↔normal is always `low`, normal↔stressed is
+  always `high`. A two-step jump (calm↔stressed, only possible when
+  `previous` is stale) has no single edge, so it uses the edge on
+  `new`'s side, the harder one to cross.
+
+  Moved from trading_signal's `SessionLabel` (and trading_backtest's
+  `RegimeAtEntry` copy) so the live label and its replay share one rule.
+  `margin` must stay well under `high - low`, or one margin could span
+  both edges.
+  """
+  @spec stable_vol_state(
+          vol_state(),
+          vol_state() | nil,
+          Signals.sample(),
+          {Signals.sample(), Signals.sample()},
+          Signals.sample()
+        ) :: vol_state()
+  def stable_vol_state(new, previous, vix, bands, margin \\ @default_vol_hysteresis_margin)
+
+  def stable_vol_state(new, nil, _vix, _bands, _margin), do: new
+  def stable_vol_state(new, new, _vix, _bands, _margin), do: new
+
+  def stable_vol_state(new, previous, vix, {low, high}, margin) do
+    boundary =
+      case {ordinal(previous), ordinal(new)} do
+        {p, n} when {p, n} in [{-1, 0}, {0, -1}] -> low
+        {p, n} when {p, n} in [{0, 1}, {1, 0}] -> high
+        {_p, 1} -> high
+        {_p, _n} -> low
+      end
+
+    stable_state(new, previous, vix, boundary, margin)
+  end
+
+  @doc """
+  Trend-axis hysteresis: a Schmitt trigger on both of `classify_trend/4`'s
+  inputs, so leaving a state takes a clear move in price **or** slope.
+
+  When `new != previous`, the trend is re-classified with the inputs
+  biased toward `previous` by a deadband on each:
+
+      d = ordinal(previous)   # previous :up / :down
+      d = -ordinal(new)       # previous :chop
+      classify_trend(price + d * price_margin_pct * sma, sma, slope + d * slope_margin)
+
+  So from `:up`, `:chop` needs price below `sma * (1 - price_margin_pct)`
+  or slope below `-slope_margin`; from `:chop`, `:up` needs price above
+  `sma * (1 + price_margin_pct)` and slope above `slope_margin`. From
+  `:up` a move only part-way to `:down` lands on `:chop` (and vice versa).
+  From `:chop` the result is only ever `:chop` or `new`: the bias toward
+  `new`'s opposite could otherwise classify as that opposite (e.g. price
+  just above the SMA with a small positive slope biases to `:down`), which
+  would invent a move the reading doesn't support.
+
+  Options:
+
+    * `:price_margin_pct` — deadband on price vs SMA, as a fraction of the
+      SMA. Default `0.0025` (0.25%). A fraction, not dollars, so it scales
+      with the instrument's price.
+    * `:slope_margin` — deadband on the SMA's 1-session slope, in price
+      units per session. Default `0.10` (tuned on SPY's 20-session SMA).
+    * `:slope_eps` — passed through to `classify_trend/4`.
+
+  `nil` handling: `new == nil` returns `nil`; `previous == nil` returns
+  `new`; a missing `sma` or `slope` returns `new || previous`.
+
+  Moved from trading_signal's `SessionLabel` / trading_backtest's
+  `RegimeAtEntry`, which used `stable_state/5` with a fixed $0.10 price
+  margin (~0.013% of SPY) and no slope deadband — together effectively no
+  hysteresis. Defaults from trading_signal's replay of 2026-10-15..11-03:
+  25 trend flips under the old rule, 7 under 0.25% / 0.10.
+  """
+  @spec stable_trend_state(
+          trend_state() | nil,
+          trend_state() | nil,
+          Signals.sample() | nil,
+          Signals.sample() | nil,
+          Signals.sample() | nil,
+          keyword()
+        ) :: trend_state() | nil
+  def stable_trend_state(new, previous, price, sma, slope, opts \\ [])
+
+  def stable_trend_state(nil, _previous, _price, _sma, _slope, _opts), do: nil
+  def stable_trend_state(new, nil, _price, _sma, _slope, _opts), do: new
+
+  def stable_trend_state(new, previous, _price, sma, slope, _opts)
+      when is_nil(sma) or is_nil(slope),
+      do: new || previous
+
+  def stable_trend_state(new, new, _price, _sma, _slope, _opts), do: new
+
+  def stable_trend_state(new, previous, price, sma, slope, opts) do
+    price_margin_pct = opts |> Keyword.get(:price_margin_pct, @default_price_margin_pct)
+    slope_margin = opts |> Keyword.get(:slope_margin, @default_slope_margin)
+
+    d = if previous == :chop, do: -ordinal(new), else: ordinal(previous)
+    sma = to_decimal(sma)
+
+    biased_price =
+      sma
+      |> Decimal.mult(to_decimal(price_margin_pct))
+      |> Decimal.mult(d)
+      |> Decimal.add(to_decimal(price))
+
+    biased_slope =
+      slope_margin |> to_decimal() |> Decimal.mult(d) |> Decimal.add(to_decimal(slope))
+
+    result = classify_trend(biased_price, sma, biased_slope, Keyword.take(opts, [:slope_eps]))
+
+    if previous == :chop and result != new, do: :chop, else: result
+  end
+
+  @doc """
+  Whether `price` is inside `stable_trend_state/6`'s price deadband:
+  `|price - sma| <= price_margin_pct * sma` (`opts[:price_margin_pct]`,
+  default `0.0025`). `nil` when `price` or `sma` is `nil`.
+  """
+  @spec trend_in_deadband?(Signals.sample() | nil, Signals.sample() | nil, keyword()) ::
+          boolean() | nil
+  def trend_in_deadband?(price, sma, opts \\ [])
+  def trend_in_deadband?(price, sma, _opts) when is_nil(price) or is_nil(sma), do: nil
+
+  def trend_in_deadband?(price, sma, opts) do
+    sma = to_decimal(sma)
+
+    margin =
+      Decimal.mult(
+        sma,
+        to_decimal(Keyword.get(opts, :price_margin_pct, @default_price_margin_pct))
+      )
+
+    distance = price |> to_decimal() |> Decimal.sub(sma) |> Decimal.abs()
+
+    Decimal.compare(distance, margin) != :gt
   end
 
   ## ---------------------------------------------------------------------
