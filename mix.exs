@@ -4,7 +4,7 @@ defmodule TradingCore.MixProject do
   def project do
     [
       app: :trading_core,
-      version: "0.4.25",
+      version: "0.4.26",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
